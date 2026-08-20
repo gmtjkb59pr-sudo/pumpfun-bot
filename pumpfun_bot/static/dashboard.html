@@ -1,0 +1,507 @@
+<!DOCTYPE html>
+<html lang="nl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>pump.fun bot — dashboard</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #0B0E14;
+    --surface: #12161F;
+    --surface-2: #171C27;
+    --border: #232937;
+    --text: #E6E9F0;
+    --text-muted: #6B7280;
+    --positive: #3DD68C;
+    --negative: #F0654A;
+    --live-danger: #FF4A4A;
+    --dry-calm: #5B8DEF;
+    --accent: #9B7BFF;
+    --mono: 'IBM Plex Mono', monospace;
+    --sans: 'Inter', sans-serif;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    -webkit-font-smoothing: antialiased;
+  }
+
+  a { color: inherit; }
+
+  .wrap {
+    max-width: 1180px;
+    margin: 0 auto;
+    padding: 20px 24px 60px;
+  }
+
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 4px 0 20px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 20px;
+  }
+
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-family: var(--mono);
+    font-weight: 600;
+    font-size: 15px;
+    letter-spacing: 0.02em;
+  }
+
+  .brand .dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--positive);
+    box-shadow: 0 0 0 0 rgba(61, 214, 140, 0.5);
+    animation: pulse-dot 2s infinite;
+  }
+
+  @keyframes pulse-dot {
+    0%   { box-shadow: 0 0 0 0 rgba(61, 214, 140, 0.55); }
+    70%  { box-shadow: 0 0 0 7px rgba(61, 214, 140, 0); }
+    100% { box-shadow: 0 0 0 0 rgba(61, 214, 140, 0); }
+  }
+
+  .wallet {
+    font-family: var(--mono);
+    font-size: 13px;
+    color: var(--text-muted);
+  }
+
+  .wallet span { color: var(--text); }
+
+  /* --- Hero mode banner: het signature-element. Dit is bewust het grootste
+     element op de pagina, want het onderscheid dry-run/live is de
+     belangrijkste veiligheidsinformatie die deze bot te bieden heeft. --- */
+  .mode-banner {
+    border-radius: 10px;
+    padding: 22px 26px;
+    margin-bottom: 22px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    border: 1px solid transparent;
+  }
+
+  .mode-banner.dry {
+    background: linear-gradient(135deg, rgba(91,141,239,0.14), rgba(91,141,239,0.04));
+    border-color: rgba(91,141,239,0.35);
+  }
+
+  .mode-banner.live {
+    background: linear-gradient(135deg, rgba(255,74,74,0.18), rgba(255,74,74,0.05));
+    border-color: rgba(255,74,74,0.45);
+    animation: live-pulse 2.4s infinite;
+  }
+
+  @keyframes live-pulse {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(255,74,74,0.0); }
+    50%      { box-shadow: 0 0 26px 2px rgba(255,74,74,0.18); }
+  }
+
+  .mode-banner .mode-label {
+    font-family: var(--mono);
+    font-size: 22px;
+    font-weight: 700;
+    letter-spacing: 0.03em;
+  }
+
+  .mode-banner.dry .mode-label { color: var(--dry-calm); }
+  .mode-banner.live .mode-label { color: var(--live-danger); }
+
+  .mode-banner .mode-sub {
+    font-size: 13px;
+    color: var(--text-muted);
+    margin-top: 4px;
+  }
+
+  .mode-banner .mode-icon {
+    font-family: var(--mono);
+    font-size: 12px;
+    padding: 6px 12px;
+    border-radius: 999px;
+    border: 1px solid currentColor;
+  }
+
+  .mode-banner.dry .mode-icon { color: var(--dry-calm); }
+  .mode-banner.live .mode-icon { color: var(--live-danger); }
+
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 14px;
+    margin-bottom: 22px;
+  }
+
+  .stat-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px 18px;
+  }
+
+  .stat-card .label {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-muted);
+    margin-bottom: 8px;
+  }
+
+  .stat-card .value {
+    font-family: var(--mono);
+    font-size: 22px;
+    font-weight: 600;
+  }
+
+  .stat-card .value.positive { color: var(--positive); }
+  .stat-card .value.negative { color: var(--negative); }
+
+  .stat-card .sub {
+    font-size: 11px;
+    color: var(--text-muted);
+    margin-top: 4px;
+    font-family: var(--mono);
+  }
+
+  .columns {
+    display: grid;
+    grid-template-columns: 1.3fr 1fr;
+    gap: 16px;
+  }
+
+  .panel {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    overflow: hidden;
+  }
+
+  .panel-header {
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-muted);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+
+  .panel-header .count {
+    font-family: var(--mono);
+    color: var(--text);
+  }
+
+  .feed {
+    max-height: 480px;
+    overflow-y: auto;
+    padding: 6px 0;
+  }
+
+  .feed-row {
+    font-family: var(--mono);
+    font-size: 12.5px;
+    padding: 8px 16px;
+    border-bottom: 1px solid var(--surface-2);
+    display: flex;
+    gap: 10px;
+    line-height: 1.5;
+  }
+
+  .feed-row:last-child { border-bottom: none; }
+
+  .feed-row .ts {
+    color: var(--text-muted);
+    flex-shrink: 0;
+  }
+
+  .feed-row .msg { word-break: break-word; }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12.5px;
+  }
+
+  th {
+    text-align: left;
+    font-size: 10.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-muted);
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--border);
+    font-weight: 500;
+  }
+
+  td {
+    padding: 9px 14px;
+    border-bottom: 1px solid var(--surface-2);
+    font-family: var(--mono);
+  }
+
+  tr:last-child td { border-bottom: none; }
+
+  .badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 10.5px;
+    font-weight: 600;
+    text-transform: uppercase;
+  }
+
+  .badge.buy { background: rgba(61,214,140,0.15); color: var(--positive); }
+  .badge.sell { background: rgba(240,101,74,0.15); color: var(--negative); }
+  .badge.dry { background: rgba(107,114,128,0.2); color: var(--text-muted); }
+
+  .empty-state {
+    padding: 32px 16px;
+    text-align: center;
+    color: var(--text-muted);
+    font-size: 13px;
+  }
+
+  .strategies-row {
+    display: flex;
+    gap: 8px;
+    margin-top: 14px;
+    flex-wrap: wrap;
+  }
+
+  .strategy-pill {
+    font-family: var(--mono);
+    font-size: 11px;
+    padding: 4px 10px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    color: var(--text-muted);
+  }
+
+  .strategy-pill.on {
+    color: var(--positive);
+    border-color: rgba(61,214,140,0.4);
+  }
+
+  footer {
+    margin-top: 26px;
+    text-align: center;
+    font-size: 11px;
+    color: var(--text-muted);
+    font-family: var(--mono);
+  }
+
+  @media (max-width: 860px) {
+    .stats { grid-template-columns: repeat(2, 1fr); }
+    .columns { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <div class="brand"><span class="dot"></span> PUMP.FUN BOT — DASHBOARD</div>
+    <div class="wallet">wallet: <span id="wallet">—</span></div>
+  </header>
+
+  <div class="mode-banner dry" id="modeBanner">
+    <div>
+      <div class="mode-label" id="modeLabel">LADEN…</div>
+      <div class="mode-sub" id="modeSub">Status wordt opgehaald</div>
+    </div>
+    <div class="mode-icon" id="modeIcon">—</div>
+  </div>
+
+  <div class="stats">
+    <div class="stat-card">
+      <div class="label">Open exposure</div>
+      <div class="value" id="statExposure">—</div>
+      <div class="sub" id="statExposureSub">van limiet</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Dag P&amp;L</div>
+      <div class="value" id="statPnl">—</div>
+      <div class="sub" id="statPnlSub">verlieslimiet: —</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Trades / uur</div>
+      <div class="value" id="statTrades">—</div>
+      <div class="sub" id="statTradesSub">van limiet</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Uptime</div>
+      <div class="value" id="statUptime">—</div>
+      <div class="sub">sinds opstarten</div>
+    </div>
+  </div>
+
+  <div class="strategies-row" id="strategiesRow"></div>
+
+  <div class="columns" style="margin-top: 22px;">
+    <div class="panel">
+      <div class="panel-header">
+        <span>Live feed</span>
+        <span class="count" id="feedCount">0</span>
+      </div>
+      <div class="feed" id="feed">
+        <div class="empty-state">Nog geen activiteit — wacht op events…</div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-header">
+        <span>Recente trades</span>
+        <span class="count" id="tradeCount">0</span>
+      </div>
+      <div id="tradesWrap">
+        <div class="empty-state">Nog geen trades</div>
+      </div>
+    </div>
+  </div>
+
+  <footer>lokaal dashboard · ververst elke 2s · sluiten van dit venster stopt de bot niet</footer>
+</div>
+
+<script>
+  function fmtSol(n) {
+    return (n === null || n === undefined) ? '—' : n.toFixed(4) + ' SOL';
+  }
+
+  function fmtTime(ts) {
+    const d = new Date(ts * 1000);
+    return d.toLocaleTimeString('nl-NL', { hour12: false });
+  }
+
+  function fmtUptime(seconds) {
+    const h = Math.floor(seconds / 3600);
+    const m = Math.floor((seconds % 3600) / 60);
+    const s = Math.floor(seconds % 60);
+    return `${h}u ${m}m ${s}s`;
+  }
+
+  function shortMint(m) {
+    if (!m) return '—';
+    return m.length > 10 ? m.slice(0, 4) + '…' + m.slice(-4) : m;
+  }
+
+  function escapeHtml(str) {
+    const d = document.createElement('div');
+    d.textContent = str;
+    return d.innerHTML;
+  }
+
+  async function refresh() {
+    let data;
+    try {
+      const res = await fetch('/api/status', { cache: 'no-store' });
+      data = await res.json();
+    } catch (e) {
+      document.getElementById('modeLabel').textContent = 'GEEN VERBINDING MET BOT';
+      document.getElementById('modeSub').textContent = 'Draait main.py nog?';
+      return;
+    }
+
+    document.getElementById('wallet').textContent = data.wallet_pubkey
+      ? shortMint(data.wallet_pubkey) : 'nog niet geladen';
+
+    const banner = document.getElementById('modeBanner');
+    const label = document.getElementById('modeLabel');
+    const sub = document.getElementById('modeSub');
+    const icon = document.getElementById('modeIcon');
+    if (data.dry_run) {
+      banner.className = 'mode-banner dry';
+      label.textContent = 'DRY RUN — geen echte orders';
+      sub.textContent = 'De bot simuleert alleen. Er wordt geen echt geld gebruikt.';
+      icon.textContent = 'VEILIG';
+    } else {
+      banner.className = 'mode-banner live';
+      label.textContent = 'LIVE — echt geld actief';
+      sub.textContent = 'De bot plaatst nu echte orders met je wallet.';
+      icon.textContent = 'LIVE';
+    }
+
+    document.getElementById('statExposure').textContent = fmtSol(data.open_exposure_sol);
+    document.getElementById('statExposureSub').textContent =
+      `limiet: ${fmtSol(data.max_sol_total_exposure)}`;
+
+    const pnlEl = document.getElementById('statPnl');
+    pnlEl.textContent = fmtSol(data.realized_pnl_sol);
+    pnlEl.className = 'value ' + (data.realized_pnl_sol > 0 ? 'positive' : data.realized_pnl_sol < 0 ? 'negative' : '');
+    document.getElementById('statPnlSub').textContent =
+      `verlieslimiet: -${fmtSol(data.max_daily_loss_sol)}`;
+
+    document.getElementById('statTrades').textContent = `${data.trades_last_hour}`;
+    document.getElementById('statTradesSub').textContent = `van max ${data.max_trades_per_hour}/uur`;
+
+    document.getElementById('statUptime').textContent = fmtUptime(data.uptime_seconds);
+
+    const stratRow = document.getElementById('strategiesRow');
+    stratRow.innerHTML = '';
+    const names = { sniper: 'Sniper', copytrade: 'Copy-trade', market_maker: 'Market maker' };
+    for (const [key, enabled] of Object.entries(data.strategies_enabled || {})) {
+      const pill = document.createElement('div');
+      pill.className = 'strategy-pill' + (enabled ? ' on' : '');
+      pill.textContent = (names[key] || key) + (enabled ? ' · aan' : ' · uit');
+      stratRow.appendChild(pill);
+    }
+
+    const feedEl = document.getElementById('feed');
+    document.getElementById('feedCount').textContent = data.alerts.length;
+    if (data.alerts.length === 0) {
+      feedEl.innerHTML = '<div class="empty-state">Nog geen activiteit — wacht op events…</div>';
+    } else {
+      feedEl.innerHTML = data.alerts.map(a => `
+        <div class="feed-row">
+          <span class="ts">${fmtTime(a.ts)}</span>
+          <span class="msg">${escapeHtml(a.message)}</span>
+        </div>
+      `).join('');
+    }
+
+    const tradesWrap = document.getElementById('tradesWrap');
+    document.getElementById('tradeCount').textContent = data.trades.length;
+    if (data.trades.length === 0) {
+      tradesWrap.innerHTML = '<div class="empty-state">Nog geen trades</div>';
+    } else {
+      tradesWrap.innerHTML = `
+        <table>
+          <thead>
+            <tr><th>Tijd</th><th>Strategie</th><th>Actie</th><th>Token</th><th>Bedrag</th></tr>
+          </thead>
+          <tbody>
+            ${data.trades.map(t => `
+              <tr>
+                <td>${fmtTime(t.ts)}</td>
+                <td>${escapeHtml(t.strategy)}</td>
+                <td><span class="badge ${t.dry_run ? 'dry' : t.action}">${t.dry_run ? 'dry-run' : t.action}</span></td>
+                <td title="${escapeHtml(t.mint)}">${shortMint(t.mint)}</td>
+                <td>${fmtSol(t.amount_sol)}</td>
+              </tr>
+            `).join('')}
+          </tbody>
+        </table>
+      `;
+    }
+  }
+
+  refresh();
+  setInterval(refresh, 2000);
+</script>
+</body>
+</html>

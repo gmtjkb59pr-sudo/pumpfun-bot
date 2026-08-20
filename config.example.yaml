@@ -1,0 +1,62 @@
+# Kopieer dit bestand naar config.yaml en pas de waarden aan.
+# ZET NOOIT je echte private key hier in git / deel dit bestand nooit met anderen.
+
+wallet:
+  # Beter: laat dit leeg en zet SOLANA_PRIVATE_KEY in een .env bestand (zie .env.example)
+  private_key_env_var: "SOLANA_PRIVATE_KEY"
+
+rpc:
+  http_url: "https://api.mainnet-beta.solana.com"   # gebruik bij voorkeur een betaalde RPC (Helius/QuickNode) voor snelheid
+  ws_url: "wss://api.mainnet-beta.solana.com"
+
+pumpportal:
+  # https://pumpportal.fun/ - community trading API voor pump.fun
+  ws_url: "wss://pumpportal.fun/api/data"
+  trade_api_url: "https://pumpportal.fun/api/trade-local"
+  api_key_env_var: "PUMPPORTAL_API_KEY"   # alleen nodig voor de Lightning API variant
+
+# ALGEMENE VEILIGHEID - deze limieten gelden voor ALLE strategieën
+risk:
+  dry_run: true                 # true = geen echte orders, alleen loggen. Zet zelf bewust op false.
+  max_sol_per_trade: 0.05       # max SOL per enkele trade
+  max_sol_total_exposure: 0.3   # max totaal aan open posities tegelijk
+  max_trades_per_hour: 10
+  max_daily_loss_sol: 0.2       # bot stopt zichzelf als dit verlies bereikt is
+  default_slippage_pct: 10
+  min_liquidity_sol: 5          # negeer tokens met minder liquiditeit dan dit
+
+strategies:
+  sniper:
+    enabled: false
+    # simpele filters om de ergste scams/rugpulls te vermijden (geen garantie!)
+    min_token_age_seconds: 0
+    max_token_age_seconds: 15
+    require_socials: false      # true = alleen tokens met twitter/telegram/website meenemen
+    take_profit_pct: 50
+    stop_loss_pct: 25
+
+  copytrade:
+    enabled: false
+    watched_wallets:
+      - "VUL_HIER_EEN_WALLET_ADRES_IN"
+    mirror_pct: 100             # % van de trade-grootte van de gevolgde wallet die je zelf ook doet
+    max_copy_delay_ms: 3000     # negeer signalen die ouder zijn dan dit
+
+  market_maker:
+    enabled: false
+    target_tokens:
+      - "VUL_HIER_EEN_TOKEN_MINT_ADRES_IN"
+    grid_levels: 5
+    grid_spacing_pct: 2
+    order_size_sol: 0.01
+
+dashboard:
+  enabled: true
+  port: 8765          # open http://localhost:8765 in je browser terwijl de bot draait
+
+alerts:
+  console: true
+  telegram:
+    enabled: false
+    bot_token_env_var: "TELEGRAM_BOT_TOKEN"
+    chat_id: ""
