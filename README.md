@@ -116,6 +116,15 @@ pumpfun_bot/strategies/market_maker.py
   hun publieke voorbeelden; verifieer dit tegen een paar live WebSocket
   berichten voordat je live handelt, want APIs veranderen.
 
+## Testen
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+Dekt vooralsnog de risk-manager (`pumpfun_bot/risk.py`), omdat alle orders
+daar doorheen moeten en het de belangrijkste veiligheidslaag is.
+
 ## Support / feedback
 
 Als iets niet werkt zoals verwacht: lees eerst de logs (ze zijn expres
