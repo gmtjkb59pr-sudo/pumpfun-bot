@@ -753,6 +753,23 @@ class ReconcileWithWalletTests(unittest.TestCase):
     drop tracking for anything the wallet no longer actually holds, and
     surface (without auto-adopting) anything held that isn't tracked."""
 
+    def test_reports_the_untracked_holdings_count_to_bot_state(self):
+        # confirmed live: open_exposure_sol only ever sums _pending, so it
+        # silently missed several real, held mints that were never tracked
+        # opening at all - bot_state needs the real count to surface that gap
+        risk = RiskManager(RiskConfig())
+        client = FakeClient()
+        tracker = OutcomeTracker(ws_url="wss://example.invalid", risk=risk, client=client, dry_run=False)
+
+        async def _fake_fetch(wallet_pubkey, rpc_http_url):
+            return {"LEFTOVER_A", "LEFTOVER_B", "LEFTOVER_C"}
+
+        with patch("pumpfun_bot.outcome_tracker.fetch_wallet_token_mints", _fake_fetch), \
+             patch("pumpfun_bot.outcome_tracker.bot_state") as mock_bot_state:
+            asyncio.run(tracker._reconcile_with_wallet())
+
+        mock_bot_state.set_untracked_holdings_count.assert_called_once_with(3)
+
     def _make_tracker(self):
         risk = RiskManager(RiskConfig())
         risk.register_trade_opened(0.03)

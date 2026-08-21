@@ -18,7 +18,12 @@ from solders.keypair import Keypair
 
 from pumpfun_bot.alerts import Alerter
 from pumpfun_bot.auto_tuner import AutoTuner
-from pumpfun_bot.balance_watch import BalanceFloorReached, watch_balance_floor
+from pumpfun_bot.balance_watch import (
+    BalanceFloorReached,
+    fetch_sol_balance,
+    fetch_sol_usd_price,
+    watch_balance_floor,
+)
 from pumpfun_bot.config import load_config
 from pumpfun_bot.dashboard_server import start_dashboard_server
 from pumpfun_bot.logger_setup import setup_logging
@@ -30,6 +35,25 @@ from pumpfun_bot.strategies.copytrade import CopyTradeStrategy
 from pumpfun_bot.strategies.market_maker import MarketMakerStrategy
 from pumpfun_bot.strategies.sniper import SniperStrategy
 from pumpfun_bot.strategies.social_watch import SocialWatchStrategy
+
+
+REAL_PNL_POLL_INTERVAL_SEC = 30.0
+
+
+async def _track_real_balance_loop(wallet_pubkey: str, rpc_http_url: str) -> None:
+    """Keeps bot_state's real-wallet-vs-session-start P&L up to date, so the
+    dashboard shows what actually happened to the wallet - not the bot's
+    own per-trade fee model (realized_pnl_sol), which doesn't account for
+    real slippage or fees on failed attempts. Confirmed live: the modeled
+    P&L read positive while the real wallet balance dropped far more in the
+    same window - this is the ground truth check for that gap."""
+    while True:
+        balance_sol = await fetch_sol_balance(wallet_pubkey, rpc_http_url)
+        if balance_sol is not None:
+            price_usd = await fetch_sol_usd_price()
+            balance_usd = balance_sol * price_usd if price_usd is not None else None
+            bot_state.update_real_balance(balance_sol, balance_usd)
+        await asyncio.sleep(REAL_PNL_POLL_INTERVAL_SEC)
 
 
 async def main() -> None:
@@ -160,6 +184,23 @@ async def main() -> None:
             cfg.dashboard_port,
         )
 
+    if not cfg.risk.dry_run:
+        # ground-truth baseline for real_pnl_* - best-effort, doesn't block
+        # startup if the lookup fails (real_pnl_* just stays unset until a
+        # later periodic check succeeds)
+        start_balance_sol = await fetch_sol_balance(str(keypair.pubkey()), cfg.rpc_http_url)
+        if start_balance_sol is not None:
+            start_price_usd = await fetch_sol_usd_price()
+            start_balance_usd = (
+                start_balance_sol * start_price_usd if start_price_usd is not None else None
+            )
+            bot_state.set_session_start_balance(start_balance_sol, start_balance_usd)
+            logger.info(
+                "Sessie-startbalans vastgelegd: %.4f SOL (~$%s) - dashboard toont echte "
+                "P&L t.o.v. dit punt, los van het eigen fee-model.",
+                start_balance_sol, f"{start_balance_usd:.2f}" if start_balance_usd else "?",
+            )
+
     await alerter.send("🤖 Pump.fun bot gestart.")
 
     tasks = [
@@ -169,6 +210,11 @@ async def main() -> None:
         asyncio.create_task(market_maker.run()),
         asyncio.create_task(outcome_tracker.run()),
     ]
+
+    if not cfg.risk.dry_run:
+        tasks.append(asyncio.create_task(
+            _track_real_balance_loop(str(keypair.pubkey()), cfg.rpc_http_url)
+        ))
 
     if cfg.sniper.enabled or cfg.social_watch.enabled:
         auto_tuner = AutoTuner(
