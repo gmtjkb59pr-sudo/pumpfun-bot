@@ -914,6 +914,108 @@ class LiveExitTests(unittest.TestCase):
         self.assertAlmostEqual(risk.state.realized_pnl_sol, _net_pnl_sol(0.05, 51.0), places=4)
 
 
+class SellFailurePauseTests(unittest.TestCase):
+    """Real bug found live: a position hit pump.fun's own program throwing
+    'AnchorError ... Error Code: Overflow' (Custom 6024) on every sell
+    attempt - a deterministic on-chain error, not a transient one, so it
+    failed identically 18 times in ~3 minutes before being stopped by hand,
+    burning a real priority fee on every doomed attempt. Nothing capped
+    that retry loop before this - MAX_CONSECUTIVE_SELL_FAILURES must stop
+    auto-retrying once a sell has failed enough times in a row, while still
+    leaving the position tracked so it isn't silently abandoned."""
+
+    def _make_tracker(self, *, client):
+        risk = RiskManager(RiskConfig())
+        risk.register_trade_opened(0.05)
+        tracker = OutcomeTracker(ws_url="wss://example.invalid", risk=risk, client=client, dry_run=False)
+        info = {
+            "entry_ts": time.time() - MIN_SELL_DELAY_SEC - 1,
+            "entry_ref": 100.0, "last_ref": 151.0, "peak_ref": 151.0,
+            "name": "Test Token", "symbol": "TEST", "trade_size_sol": 0.05,
+            "hit": set(), "has_real_update": True,
+        }
+        tracker._pending["MINT"] = info
+        return tracker, risk, info
+
+    def test_pauses_after_max_consecutive_failures(self):
+        from pumpfun_bot.outcome_tracker import MAX_CONSECUTIVE_SELL_FAILURES
+
+        client = FakeClient(should_fail=True)
+        tracker, risk, info = self._make_tracker(client=client)
+
+        for _ in range(MAX_CONSECUTIVE_SELL_FAILURES):
+            asyncio.run(tracker._exit("MINT", dict(tracker._pending["MINT"]), "stale_price", 51.0))
+
+        self.assertEqual(tracker._pending["MINT"]["consecutive_sell_failures"], MAX_CONSECUTIVE_SELL_FAILURES)
+        self.assertTrue(tracker._pending["MINT"]["sell_paused"])
+        # position stays tracked/visible - never silently dropped by this
+        self.assertIn("MINT", tracker._pending)
+
+    def test_stops_attempting_once_paused(self):
+        from pumpfun_bot.outcome_tracker import MAX_CONSECUTIVE_SELL_FAILURES
+
+        client = FakeClient(should_fail=True)
+        tracker, risk, info = self._make_tracker(client=client)
+
+        for _ in range(MAX_CONSECUTIVE_SELL_FAILURES):
+            asyncio.run(tracker._exit("MINT", dict(tracker._pending["MINT"]), "stale_price", 51.0))
+        calls_before = len(client.sell_calls)
+
+        # cooldown bypassed directly - even so, a paused position must
+        # refuse to attempt at all
+        tracker._pending["MINT"]["last_exit_attempt_ts"] = 0
+        allowed = tracker._exit_attempt_allowed(tracker._pending["MINT"])
+
+        self.assertFalse(allowed)
+        self.assertEqual(len(client.sell_calls), calls_before)
+
+    def test_does_not_pause_below_the_threshold(self):
+        from pumpfun_bot.outcome_tracker import MAX_CONSECUTIVE_SELL_FAILURES
+
+        client = FakeClient(should_fail=True)
+        tracker, risk, info = self._make_tracker(client=client)
+
+        for _ in range(MAX_CONSECUTIVE_SELL_FAILURES - 1):
+            asyncio.run(tracker._exit("MINT", dict(tracker._pending["MINT"]), "stale_price", 51.0))
+
+        self.assertFalse(tracker._pending["MINT"].get("sell_paused", False))
+
+    def test_a_deferred_sell_min_sell_delay_does_not_count_as_a_failure(self):
+        # too-soon-since-entry is a deliberate defer (see MIN_SELL_DELAY_SEC),
+        # not a real failure - it must never count toward the pause threshold
+        client = FakeClient(should_fail=False)
+        risk = RiskManager(RiskConfig())
+        risk.register_trade_opened(0.05)
+        tracker = OutcomeTracker(ws_url="wss://example.invalid", risk=risk, client=client, dry_run=False)
+        info = {
+            "entry_ts": time.time(),  # well within MIN_SELL_DELAY_SEC
+            "entry_ref": 100.0, "last_ref": 151.0, "peak_ref": 151.0,
+            "name": "Test Token", "symbol": "TEST", "trade_size_sol": 0.05,
+            "hit": set(), "has_real_update": True,
+        }
+        tracker._pending["MINT"] = info
+
+        closed = asyncio.run(tracker._exit("MINT", dict(info), "stale_price", 51.0))
+
+        self.assertFalse(closed)
+        self.assertEqual(client.sell_calls, [])  # never even attempted
+        self.assertEqual(tracker._pending["MINT"].get("consecutive_sell_failures", 0), 0)
+
+    def test_a_successful_sell_after_failures_closes_normally(self):
+        # not a resume-from-pause scenario (paused stays paused - see
+        # _exit_attempt_allowed) - just confirms failures short of the
+        # threshold don't prevent a later real success from closing cleanly
+        client = FakeClient(should_fail=True)
+        tracker, risk, info = self._make_tracker(client=client)
+        asyncio.run(tracker._exit("MINT", dict(tracker._pending["MINT"]), "stale_price", 51.0))
+        self.assertEqual(tracker._pending["MINT"]["consecutive_sell_failures"], 1)
+
+        client.should_fail = False
+        asyncio.run(tracker._attempt_exit("MINT", dict(tracker._pending["MINT"]), "stale_price", 51.0))
+
+        self.assertNotIn("MINT", tracker._pending)
+
+
 class TrailingStopTests(unittest.TestCase):
     def _make_tracker(
         self, *,

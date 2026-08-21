@@ -91,6 +91,18 @@ STALE_PRICE_TIMEOUT_SEC = 10
 # matches STALE_PRICE_TIMEOUT_SEC so a position isn't force-detected as
 # stale well before a sell attempt could ever actually succeed.
 MIN_SELL_DELAY_SEC = 15
+# after this many consecutive REAL sell failures (not the MIN_SELL_DELAY_SEC
+# defer, which isn't a failure) for the same position, stop auto-retrying and
+# alert instead - confirmed live: a position hit PumpPortal's own program
+# throwing "AnchorError ... Error Code: Overflow" (Custom 6024) on every sell
+# attempt, a deterministic on-chain math error that can never succeed no
+# matter how many times it's retried. Nothing capped that retry loop before -
+# it burned a real priority fee every EXIT_RETRY_COOLDOWN_SEC forever. The
+# position stays tracked and visible (never silently dropped - only wallet
+# reconciliation does that, and only once the wallet genuinely no longer
+# holds it), just no longer auto-retried, so a human can decide how to
+# actually get it out (e.g. a manual swap).
+MAX_CONSECUTIVE_SELL_FAILURES = 5
 # how often to reconcile _pending against real wallet holdings - not just
 # once at startup, since drift can happen any time a position gets closed
 # outside the bot's own exit logic (e.g. a manual sale). Found live: a
@@ -464,12 +476,36 @@ class OutcomeTracker:
     def _exit_attempt_allowed(self, info: dict) -> bool:
         """Marks an attempt as starting now and returns whether enough time
         has passed since the last one - keeps a failing real sell from being
-        retried on every single price tick."""
+        retried on every single price tick. Also refuses once a position has
+        been paused after MAX_CONSECUTIVE_SELL_FAILURES real failures - see
+        that constant's docstring."""
+        if info.get("sell_paused"):
+            return False
         last_attempt = info.get("last_exit_attempt_ts", 0)
         if time.time() - last_attempt < EXIT_RETRY_COOLDOWN_SEC:
             return False
         info["last_exit_attempt_ts"] = time.time()
         return True
+
+    async def _record_sell_failure(self, mint: str) -> int:
+        """Increments and persists the consecutive-real-sell-failure count
+        for a position, pausing further automatic attempts once
+        MAX_CONSECUTIVE_SELL_FAILURES is reached. Operates on the real
+        self._pending entry (not the dict copy _exit() was called with),
+        since that copy is what gets handed around as exit_args and isn't
+        the persisted state. Returns the new count (0 if the position was
+        removed from tracking - e.g. by a concurrent wallet reconcile -
+        before this ran)."""
+        async with self._lock:
+            info = self._pending.get(mint)
+            if info is None:
+                return 0
+            count = info.get("consecutive_sell_failures", 0) + 1
+            info["consecutive_sell_failures"] = count
+            if count >= MAX_CONSECUTIVE_SELL_FAILURES:
+                info["sell_paused"] = True
+            self._persist_pending()
+            return count
 
     async def _attempt_exit(self, mint: str, info: dict, reason: str, pct_change: float) -> None:
         """Calls _exit() and only removes the mint from _pending if it
@@ -520,11 +556,23 @@ class OutcomeTracker:
                     "wordt over %ds opnieuw geprobeerd.",
                     info["symbol"], mint, reason, exc, EXIT_RETRY_COOLDOWN_SEC,
                 )
-                if self.alerter is not None:
-                    await self.alerter.send(
+                failure_count = await self._record_sell_failure(mint)
+                if failure_count >= MAX_CONSECUTIVE_SELL_FAILURES:
+                    message = (
+                        f"⏸️ Automatische verkoop gepauzeerd voor {info['symbol']} ({mint}) - "
+                        f"{failure_count} verkopen op rij mislukt (laatste fout: {exc}). "
+                        f"Waarschijnlijk een blijvende fout die niet opgelost wordt door "
+                        f"opnieuw te proberen. Positie blijft open en getrackt, maar wordt "
+                        f"niet langer automatisch verkocht - controleer handmatig."
+                    )
+                    logger.error(message)
+                else:
+                    message = (
                         f"❌ Sell mislukt voor {info['symbol']} ({reason}): {exc} - "
                         f"positie blijft open, wordt opnieuw geprobeerd."
                     )
+                if self.alerter is not None:
+                    await self.alerter.send(message)
                 return False
 
         if self.risk is not None and info["trade_size_sol"]:
