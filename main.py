@@ -28,6 +28,7 @@ from pumpfun_bot.state import bot_state
 from pumpfun_bot.strategies.copytrade import CopyTradeStrategy
 from pumpfun_bot.strategies.market_maker import MarketMakerStrategy
 from pumpfun_bot.strategies.sniper import SniperStrategy
+from pumpfun_bot.strategies.social_watch import SocialWatchStrategy
 
 
 async def main() -> None:
@@ -92,6 +93,17 @@ async def main() -> None:
         dry_run=cfg.risk.dry_run,
         outcome_tracker=outcome_tracker,
     )
+    social_watch = SocialWatchStrategy(
+        client=PumpPortalClient(cfg.pumpportal_ws_url, cfg.pumpportal_trade_api_url,
+                                 cfg.rpc_http_url, keypair, api_key=cfg.pumpportal_api_key),
+        cfg=cfg.social_watch,
+        risk=risk,
+        alerter=alerter,
+        trade_size_sol=cfg.risk.max_sol_per_trade,
+        slippage_pct=cfg.risk.default_slippage_pct,
+        dry_run=cfg.risk.dry_run,
+        outcome_tracker=outcome_tracker,
+    )
     copytrade = CopyTradeStrategy(
         client=PumpPortalClient(cfg.pumpportal_ws_url, cfg.pumpportal_trade_api_url,
                                  cfg.rpc_http_url, keypair, api_key=cfg.pumpportal_api_key),
@@ -112,7 +124,7 @@ async def main() -> None:
         dry_run=cfg.risk.dry_run,
     )
 
-    enabled = [s.cfg.enabled for s in (sniper, copytrade, market_maker)]
+    enabled = [s.cfg.enabled for s in (sniper, social_watch, copytrade, market_maker)]
     if not any(enabled):
         logger.warning(
             "Geen enkele strategie staat op enabled: true in config.yaml. "
@@ -125,6 +137,7 @@ async def main() -> None:
         wallet_pubkey=str(keypair.pubkey()),
         strategies_enabled={
             "sniper": cfg.sniper.enabled,
+            "social_watch": cfg.social_watch.enabled,
             "copytrade": cfg.copytrade.enabled,
             "market_maker": cfg.market_maker.enabled,
         },
@@ -144,6 +157,7 @@ async def main() -> None:
 
     tasks = [
         asyncio.create_task(sniper.run()),
+        asyncio.create_task(social_watch.run()),
         asyncio.create_task(copytrade.run()),
         asyncio.create_task(market_maker.run()),
         asyncio.create_task(outcome_tracker.run()),

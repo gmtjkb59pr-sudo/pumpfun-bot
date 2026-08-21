@@ -36,6 +36,22 @@ class SniperConfig:
 
 
 @dataclass
+class SocialWatchConfig:
+    """Unlike SniperConfig, which decides instantly off the launch event,
+    this holds off and watches a candidate for watch_window_sec, polling its
+    off-chain metadata every poll_interval_sec, and only buys if socials show
+    up within that window - trading speed for a real, verifiable quality
+    signal, since the launch event itself never carries socials directly."""
+    enabled: bool = False
+    watch_window_sec: int = 60
+    poll_interval_sec: int = 10
+    take_profit_pct: float = 50
+    stop_loss_pct: float = 25
+    trailing_activation_pct: float = 20
+    trailing_stop_pct: float = 15
+
+
+@dataclass
 class CopyTradeConfig:
     enabled: bool = False
     watched_wallets: list = field(default_factory=list)
@@ -62,6 +78,7 @@ class AppConfig:
     pumpportal_api_key: str
     risk: RiskConfig
     sniper: SniperConfig
+    social_watch: SocialWatchConfig
     copytrade: CopyTradeConfig
     market_maker: MarketMakerConfig
     alerts_console: bool
@@ -115,6 +132,17 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         trailing_stop_pct=sniper_raw.get("trailing_stop_pct", 15),
     )
 
+    sw_raw = strat_raw.get("social_watch", {})
+    social_watch = SocialWatchConfig(
+        enabled=sw_raw.get("enabled", False),
+        watch_window_sec=sw_raw.get("watch_window_sec", 60),
+        poll_interval_sec=sw_raw.get("poll_interval_sec", 10),
+        take_profit_pct=sw_raw.get("take_profit_pct", 50),
+        stop_loss_pct=sw_raw.get("stop_loss_pct", 25),
+        trailing_activation_pct=sw_raw.get("trailing_activation_pct", 20),
+        trailing_stop_pct=sw_raw.get("trailing_stop_pct", 15),
+    )
+
     ct_raw = strat_raw.get("copytrade", {})
     copytrade = CopyTradeConfig(
         enabled=ct_raw.get("enabled", False),
@@ -152,6 +180,7 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         pumpportal_api_key=os.environ.get(pp_key_var, ""),
         risk=risk,
         sniper=sniper,
+        social_watch=social_watch,
         copytrade=copytrade,
         market_maker=market_maker,
         alerts_console=alerts_raw.get("console", True),
