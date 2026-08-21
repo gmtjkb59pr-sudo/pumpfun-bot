@@ -119,8 +119,10 @@ class OutcomeTracker:
         self.sell_slippage_pct = sell_slippage_pct
         # resolved at construction time, not import time, so tests (and
         # anything else) can point position_store.DEFAULT_STORE_PATH
-        # elsewhere before any OutcomeTracker is constructed
-        self.position_store_path = position_store_path or position_store.DEFAULT_STORE_PATH
+        # elsewhere before any OutcomeTracker is constructed. Dry-run and
+        # live get separate files (path_for_mode) so a restart can never
+        # load one mode's positions into the other - see position_store.py
+        self.position_store_path = position_store_path or position_store.path_for_mode(dry_run)
         self._pending: dict[str, dict] = {}
         # mints that already exited - kept under passive observation (no
         # P&L/exposure effect, already realized) purely to answer "would

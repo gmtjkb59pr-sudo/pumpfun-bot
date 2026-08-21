@@ -296,6 +296,24 @@ class PositionPersistenceAcrossRestartTests(unittest.TestCase):
         self.addCleanup(lambda: path.unlink(missing_ok=True))
         return path
 
+    def test_a_live_instance_never_resumes_a_dry_run_instance_s_position(self):
+        # real bug this guards against: starting a live session loaded
+        # leftover positions from an earlier dry-run farming session (never
+        # real purchases) and tried to actually sell them - burning real
+        # transaction fees on phantom positions and crowding out real
+        # trading capacity. Neither tracker gets an explicit
+        # position_store_path here - both must resolve their own default
+        # (via position_store.path_for_mode) and never see each other's file.
+        dry_run_tracker = OutcomeTracker(ws_url="wss://example.invalid", dry_run=True)
+        asyncio.run(dry_run_tracker.track(
+            "PHANTOM_MINT", "Simulated Token", "SIM", entry_ref=100.0, trade_size_sol=0.03,
+        ))
+
+        live_tracker = OutcomeTracker(ws_url="wss://example.invalid", dry_run=False)
+        live_tracker.load_pending()
+
+        self.assertNotIn("PHANTOM_MINT", live_tracker._pending)
+
     def test_new_instance_resumes_a_position_the_old_one_opened(self):
         path = self._store_path()
 
