@@ -73,6 +73,13 @@ EXIT_RETRY_COOLDOWN_SEC = 15
 # no real trade event for this mint in this long -> likely dead/rugged, exit
 # well before the full MAX_HOLD_SEC timeout instead of holding a dead token
 STALE_PRICE_TIMEOUT_SEC = 10
+# PumpPortal's own balance index needs this long to catch up with a real buy
+# before it can build an accurate "sell 100%" quote - confirmed directly:
+# selling sooner reliably comes back SellZeroAmount (their indexer still
+# thought our balance was 0), which still costs a real fee to fail. Roughly
+# matches STALE_PRICE_TIMEOUT_SEC so a position isn't force-detected as
+# stale well before a sell attempt could ever actually succeed.
+MIN_SELL_DELAY_SEC = 15
 
 EXIT_EMOJI = {
     "take_profit": "🟢", "stop_loss": "🔴", "trailing_stop": "🟡", "timeout": "⏱️",
@@ -370,6 +377,21 @@ class OutcomeTracker:
                 logger.error(
                     "LIVE modus maar geen trading client ingesteld op de outcome-tracker - "
                     "kan %s niet verkopen. Positie blijft open.", info["symbol"],
+                )
+                return False
+            time_since_entry = time.time() - info["entry_ts"]
+            if time_since_entry < MIN_SELL_DELAY_SEC:
+                # PumpPortal's own balance index needs a moment to catch up
+                # with our buy - a "sell 100%" quote built before that
+                # reliably comes back as SellZeroAmount (confirmed directly
+                # from a failed transaction's logs), which still costs a
+                # real fee to fail. Skip the doomed attempt entirely rather
+                # than submit-and-fail; the caller's retry cooldown already
+                # means we'll try again shortly, once this floor has passed.
+                logger.debug(
+                    "Sell voor %s uitgesteld - pas %.0fs sinds aankoop, "
+                    "PumpPortal's eigen index heeft nog niet bijgewerkt (min %ds).",
+                    info["symbol"], time_since_entry, MIN_SELL_DELAY_SEC,
                 )
                 return False
             try:
