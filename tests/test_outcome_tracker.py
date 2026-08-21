@@ -596,6 +596,25 @@ class MinSellDelayTests(unittest.TestCase):
         self.assertEqual(len(client.sell_calls), 1)
         self.assertNotIn("MINT", tracker._pending)
 
+    def test_a_deferred_attempt_does_not_consume_the_retry_cooldown(self):
+        # confirmed live: roughly half of all real exits took 18-23s to
+        # confirm instead of 1-3s, because the first check (as early as
+        # ~10s post-buy) was too soon for MIN_SELL_DELAY_SEC and _exit()
+        # deferred it - but _exit_attempt_allowed() had already armed
+        # EXIT_RETRY_COOLDOWN_SEC at that moment regardless, forcing a wait
+        # for the full cooldown on top of the remaining MIN_SELL_DELAY_SEC
+        # wait, instead of retrying the instant it actually became eligible
+        tracker, risk, client = self._make_tracker(entry_ts=time.time())
+        info = tracker._pending["MINT"]
+
+        allowed_too_early = tracker._exit_attempt_allowed(info)
+        self.assertFalse(allowed_too_early)
+        self.assertNotIn("last_exit_attempt_ts", info)  # cooldown never armed
+
+        info["entry_ts"] = time.time() - MIN_SELL_DELAY_SEC - 1  # now eligible
+        allowed_now = tracker._exit_attempt_allowed(info)
+        self.assertTrue(allowed_now)  # immediate - no leftover cooldown wait
+
 
 class RunLoopResilienceTests(unittest.TestCase):
     """This loop manages real, live positions - a bug in any single
