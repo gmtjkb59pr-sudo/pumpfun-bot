@@ -873,6 +873,57 @@ class ReconcileWithWalletTests(unittest.TestCase):
         self.assertGreater(tracker._last_wallet_reconcile_ts, time.time() - 1)
 
 
+class LiquidationDispatchTests(unittest.TestCase):
+    """Real bug found live: _reconcile_with_wallet() used to await the
+    liquidation sweep inline - since a failing sell can take up to 30s to
+    time out, and the sweep tries every untracked mint in sequence, this
+    blocked the ENTIRE housekeeping loop (checkpoints, stale-price
+    detection for REAL tracked positions) for as long as the sweep took.
+    A real position's stale-price detection was delayed from the expected
+    ~10-15s to 44s because of exactly this. The sweep must run as a
+    detached background task, never blocking reconciliation itself."""
+
+    class _SlowFailingClient(FakeClient):
+        async def build_and_send_full_sell(self, mint, slippage_pct):
+            await asyncio.sleep(0.2)
+            raise RuntimeError("simulated slow failure")
+
+    def test_reconcile_returns_promptly_even_with_a_slow_liquidation_attempt(self):
+        client = self._SlowFailingClient()
+        tracker = OutcomeTracker(ws_url="wss://example.invalid", client=client, dry_run=False)
+
+        async def _fake_fetch(wallet_pubkey, rpc_http_url):
+            return {"UNTRACKED_MINT"}
+
+        async def _drive():
+            with patch("pumpfun_bot.outcome_tracker.fetch_wallet_token_mints", _fake_fetch):
+                # would time out here if the sweep were awaited inline -
+                # the fake client's sell takes 0.2s, well over this bound
+                await asyncio.wait_for(tracker._reconcile_with_wallet(), timeout=0.05)
+                self.assertIsNotNone(tracker._liquidation_task)
+                self.assertFalse(tracker._liquidation_task.done())
+                await asyncio.wait_for(tracker._liquidation_task, timeout=1.0)  # avoid leaking
+
+        asyncio.run(_drive())
+
+    def test_does_not_start_a_second_sweep_while_one_is_in_flight(self):
+        client = self._SlowFailingClient()
+        tracker = OutcomeTracker(ws_url="wss://example.invalid", client=client, dry_run=False)
+
+        async def _fake_fetch(wallet_pubkey, rpc_http_url):
+            return {"UNTRACKED_MINT"}
+
+        async def _drive():
+            with patch("pumpfun_bot.outcome_tracker.fetch_wallet_token_mints", _fake_fetch):
+                await tracker._reconcile_with_wallet()
+                first_task = tracker._liquidation_task
+                await tracker._reconcile_with_wallet()  # sweep still in flight
+                self.assertIs(tracker._liquidation_task, first_task)
+                await asyncio.wait_for(first_task, timeout=1.0)
+
+        asyncio.run(_drive())
+
+
 class LiquidateUntrackedHoldingsTests(unittest.TestCase):
     """Untracked wallet holdings (leftovers from earlier sessions/bugs, no
     known entry price) are never auto-adopted as real positions - see
