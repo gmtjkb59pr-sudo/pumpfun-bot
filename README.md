@@ -124,10 +124,14 @@ pumpfun_bot/strategies/market_maker.py
 
 ## Bekende beperkingen / TODO
 
-- Sniper heeft nog geen automatische take-profit/stop-loss uitvoering na
-  aankoop (wel geconfigureerd in `config.yaml`, maar de monitoring-loop voor
-  open posities is een `TODO` in `sniper.py`) — nu moet je zelf verkopen of dit
-  zelf uitbreiden.
+- Sniper voert nu automatisch take-profit/stop-loss/timeout uit (zie
+  `pumpfun_bot/outcome_tracker.py`), zowel dry-run als live. In LIVE modus
+  wordt een echte sell verstuurd (100% van de holding) via PumpPortal's
+  Local Trading API; een positie wordt alleen als gesloten beschouwd als die
+  sell daadwerkelijk lukt - bij een mislukte sell blijft de positie open en
+  wordt het opnieuw geprobeerd, zodat het dashboard nooit "verkocht" toont
+  terwijl de wallet de tokens nog vasthoudt. Er is geen partial-exit (altijd
+  100%) en geen trailing stop.
 - Market maker gebruikt een vereenvoudigd prijsmodel; houdt geen rekening met
   de exacte bonding-curve wiskunde van pump.fun.
 - Market maker (en outcome-tracking, zie hierboven) hangen af van PumpPortal's
