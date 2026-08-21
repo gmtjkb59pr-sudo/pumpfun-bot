@@ -96,6 +96,34 @@ class ClosesPositionAtFinalCheckpointTests(unittest.TestCase):
         self.assertAlmostEqual(risk.state.open_exposure_sol, 0.05)
         self.assertAlmostEqual(risk.state.realized_pnl_sol, 0.0)
 
+    def test_live_unmeasured_position_gets_force_sold_not_abandoned(self):
+        # a real held position with no price data and no manual-sell path
+        # anywhere in the bot must not be left stuck open forever - it should
+        # get force-sold blind, with pnl recorded as 0 (genuinely unknown)
+        # rather than guessed
+        risk = RiskManager(RiskConfig())
+        risk.register_trade_opened(0.05)
+        client = FakeClient(signature="blind_sell_sig")
+        tracker = OutcomeTracker(
+            ws_url="wss://example.invalid", risk=risk, client=client, dry_run=False,
+        )
+        tracker._pending["MINT"] = {
+            "entry_ts": time.time() - CHECKPOINTS_SEC[-1] - 1,
+            "entry_ref": 100.0,
+            "last_ref": 100.0,
+            "name": "Test Token",
+            "symbol": "TEST",
+            "trade_size_sol": 0.05,
+            "hit": set(CHECKPOINTS_SEC[:-1]),
+            "has_real_update": False,
+        }
+        asyncio.run(tracker._emit_due_checkpoints())
+
+        self.assertEqual(client.sell_calls, [("MINT", tracker.sell_slippage_pct)])
+        self.assertNotIn("MINT", tracker._pending)
+        self.assertAlmostEqual(risk.state.open_exposure_sol, 0.0)
+        self.assertAlmostEqual(risk.state.realized_pnl_sol, 0.0)
+
 
 class TakeProfitStopLossExitTests(unittest.TestCase):
     def _make_tracker(self, *, take_profit_pct=50.0, stop_loss_pct=25.0, entry_ref=100.0):
