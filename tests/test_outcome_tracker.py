@@ -1,4 +1,5 @@
 import asyncio
+import json
 import tempfile
 import time
 import unittest
@@ -584,25 +585,26 @@ class MinSellDelayTests(unittest.TestCase):
 
 
 class RunLoopResilienceTests(unittest.TestCase):
-    """This loop manages real, live positions - a bug in any single cycle
-    (confirmed live: a TypeError in post-exit checkpoint code) must never
-    crash the whole bot. Before this fix, an unhandled exception here took
-    down the entire asyncio.gather in main.py, abandoning every open
-    position mid-session with no graceful shutdown at all."""
+    """This loop manages real, live positions - a bug in any single
+    connection attempt (confirmed live: a TypeError in post-exit checkpoint
+    code) must never crash the whole bot. Before this fix, an unhandled
+    exception here took down the entire asyncio.gather in main.py,
+    abandoning every open position mid-session with no graceful shutdown at
+    all."""
 
-    def test_a_failing_cycle_does_not_crash_the_run_loop(self):
+    def test_a_failing_connection_does_not_crash_the_run_loop(self):
         tracker = OutcomeTracker(ws_url="wss://example.invalid")
         call_count = 0
 
-        async def _failing_then_ok_cycle():
+        async def _failing_then_ok_connection():
             nonlocal call_count
             call_count += 1
             if call_count == 1:
-                raise RuntimeError("simulated bug in a cycle")
+                raise RuntimeError("simulated bug in a connection cycle")
 
         async def _drive():
-            with patch.object(tracker, "_run_one_cycle", _failing_then_ok_cycle), patch(
-                "pumpfun_bot.outcome_tracker.IDLE_SLEEP_SEC", 0,
+            with patch.object(tracker, "_run_connection", _failing_then_ok_connection), patch(
+                "pumpfun_bot.outcome_tracker.RECONNECT_BACKOFF_SEC", 0,
             ):
                 try:
                     await asyncio.wait_for(tracker.run(), timeout=0.05)
@@ -614,6 +616,133 @@ class RunLoopResilienceTests(unittest.TestCase):
         # proves the loop survived the RuntimeError and kept iterating,
         # rather than the exception propagating out of run() entirely
         self.assertGreaterEqual(call_count, 2)
+
+
+class FakeWebSocket:
+    """Stands in for a websockets connection - only the .send() calls made
+    by _sync_subscription matter for these tests, nothing is actually sent
+    anywhere. Async-iterable but never actually yields a message, so a test
+    driving _run_connection() under asyncio.wait_for() reliably times out
+    instead of raising TypeError for not being iterable."""
+
+    def __init__(self):
+        self.sent: list[dict] = []
+
+    async def send(self, raw: str) -> None:
+        self.sent.append(json.loads(raw))
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        await asyncio.sleep(3600)
+        raise AssertionError("unreachable")
+
+
+class SubscriptionSyncTests(unittest.TestCase):
+    """A single WS connection now stays open for the tracker's whole
+    lifetime instead of reconnecting every cycle (see _run_connection's
+    docstring for why that mattered) - _sync_subscription is what lets a
+    position opened mid-connection start getting price ticks immediately,
+    by adding just the newly-tracked mint to the existing subscription
+    rather than waiting for a reconnect that may not happen for a long
+    time."""
+
+    def test_subscribes_to_newly_tracked_mints(self):
+        tracker = OutcomeTracker(ws_url="wss://example.invalid")
+        ws = FakeWebSocket()
+        asyncio.run(tracker.track("MINT1", "Test", "TEST", entry_ref=100.0, trade_size_sol=0.03))
+
+        asyncio.run(tracker._sync_subscription(ws))
+
+        self.assertEqual(len(ws.sent), 1)
+        self.assertEqual(ws.sent[0]["method"], "subscribeTokenTrade")
+        self.assertEqual(ws.sent[0]["keys"], ["MINT1"])
+        self.assertEqual(tracker._subscribed_mints, {"MINT1"})
+
+    def test_does_not_resend_a_mint_already_subscribed(self):
+        tracker = OutcomeTracker(ws_url="wss://example.invalid")
+        ws = FakeWebSocket()
+        asyncio.run(tracker.track("MINT1", "Test", "TEST", entry_ref=100.0, trade_size_sol=0.03))
+        asyncio.run(tracker._sync_subscription(ws))
+
+        asyncio.run(tracker._sync_subscription(ws))  # nothing new tracked since
+
+        self.assertEqual(len(ws.sent), 1)  # still just the one call
+
+    def test_only_sends_the_newly_tracked_mint_on_a_later_sync(self):
+        tracker = OutcomeTracker(ws_url="wss://example.invalid")
+        ws = FakeWebSocket()
+        asyncio.run(tracker.track("MINT1", "Test", "TEST", entry_ref=100.0, trade_size_sol=0.03))
+        asyncio.run(tracker._sync_subscription(ws))
+
+        asyncio.run(tracker.track("MINT2", "Test2", "TEST2", entry_ref=100.0, trade_size_sol=0.03))
+        asyncio.run(tracker._sync_subscription(ws))
+
+        self.assertEqual(len(ws.sent), 2)
+        self.assertEqual(ws.sent[1]["keys"], ["MINT2"])  # only the new one, not MINT1 again
+        self.assertEqual(tracker._subscribed_mints, {"MINT1", "MINT2"})
+
+    def test_a_fresh_connection_resets_the_subscribed_set(self):
+        # a new WS connection has no existing subscription, even if the
+        # previous connection had already subscribed to these mints - a
+        # stale _subscribed_mints would make _sync_subscription think the
+        # new connection already knows about them and skip resubscribing,
+        # silently going blind on every position after a reconnect
+        tracker = OutcomeTracker(ws_url="wss://example.invalid")
+        tracker._subscribed_mints = {"STALE_FROM_OLD_CONNECTION"}
+        asyncio.run(tracker.track("MINT1", "Test", "TEST", entry_ref=100.0, trade_size_sol=0.03))
+        ws = FakeWebSocket()
+
+        class _Ctx:
+            async def __aenter__(self_inner):
+                return ws
+
+            async def __aexit__(self_inner, *exc):
+                return False
+
+        def _fake_connect(*args, **kwargs):
+            return _Ctx()
+
+        async def _drive():
+            with patch("pumpfun_bot.outcome_tracker.websockets.connect", side_effect=_fake_connect):
+                try:
+                    await asyncio.wait_for(tracker._run_connection(), timeout=0.05)
+                except asyncio.TimeoutError:
+                    pass  # expected - _run_connection blocks on `async for raw in ws`
+
+        asyncio.run(_drive())
+
+        self.assertEqual(tracker._subscribed_mints, {"MINT1"})
+        self.assertEqual(ws.sent[0]["keys"], ["MINT1"])
+
+
+class WsMessageHandlingTests(unittest.TestCase):
+    """_handle_ws_message replaces the per-cycle parsing that used to live
+    inline in the old reconnect-every-cycle _poll_once - same parsing
+    behavior, now driven by a persistent `async for` over one long-lived
+    connection instead of a fresh 8s-window connection every ~11s."""
+
+    def test_a_trade_event_updates_the_tracked_position(self):
+        tracker = OutcomeTracker(ws_url="wss://example.invalid")
+        asyncio.run(tracker.track("MINT", "Test", "TEST", entry_ref=100.0, trade_size_sol=0.03))
+
+        raw = json.dumps({"mint": "MINT", "price": 110.0})
+        asyncio.run(tracker._handle_ws_message(raw))
+
+        self.assertEqual(tracker._pending["MINT"]["last_ref"], 110.0)
+
+    def test_malformed_json_is_ignored_without_raising(self):
+        tracker = OutcomeTracker(ws_url="wss://example.invalid")
+        asyncio.run(tracker._handle_ws_message("not json"))  # must not raise
+
+    def test_funded_key_rejection_sets_the_dashboard_flag(self):
+        tracker = OutcomeTracker(ws_url="wss://example.invalid")
+        raw = json.dumps({"message": "This feed requires a funded API key."})
+
+        asyncio.run(tracker._handle_ws_message(raw))
+
+        self.assertTrue(tracker._warned_no_access)
 
 
 class ReconcileWithWalletTests(unittest.TestCase):
