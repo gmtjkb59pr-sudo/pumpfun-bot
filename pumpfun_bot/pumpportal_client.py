@@ -231,7 +231,7 @@ class PumpPortalClient:
             "method": "sendTransaction",
             "params": [
                 base64.b64encode(raw_tx).decode("utf-8"),
-                {"encoding": "base64", "skipPreflight": False, "maxRetries": 3},
+                {"encoding": "base64", "skipPreflight": True, "maxRetries": 3},
             ],
         }
         async with aiohttp.ClientSession() as session:

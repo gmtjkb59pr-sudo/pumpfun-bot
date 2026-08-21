@@ -64,7 +64,10 @@ IDLE_SLEEP_SEC = 5
 # between attempts, but keep retrying rather than giving up
 EXIT_RETRY_COOLDOWN_SEC = 15
 
-EXIT_EMOJI = {"take_profit": "🟢", "stop_loss": "🔴", "trailing_stop": "🟡", "timeout": "⏱️"}
+EXIT_EMOJI = {
+    "take_profit": "🟢", "stop_loss": "🔴", "trailing_stop": "🟡", "timeout": "⏱️",
+    "timeout_unmeasured": "❔",
+}
 
 
 def is_funded_key_rejection(message: str) -> bool:
@@ -255,7 +258,7 @@ class OutcomeTracker:
         """Returns True if the position is now closed (simulated close, or a
         real sell that actually succeeded). Returns False if a real sell was
         attempted and failed - the caller must leave the position tracked."""
-        pct_change = round(pct_change, 2)
+        pct_change = round(pct_change, 2) if pct_change is not None else None
         tx_signature = ""
 
         if not self.dry_run:
@@ -284,7 +287,14 @@ class OutcomeTracker:
                 return False
 
         if self.risk is not None and info["trade_size_sol"]:
-            pnl_sol = round(info["trade_size_sol"] * (pct_change / 100), 6)
+            # pct_change is None for a blind forced sell (timeout_unmeasured -
+            # never got price data) - pnl is genuinely unknown, so record 0
+            # rather than guessing, but still release the exposure slot since
+            # the position really is closing
+            if pct_change is not None:
+                pnl_sol = round(info["trade_size_sol"] * (pct_change / 100), 6)
+            else:
+                pnl_sol = 0.0
             self.risk.register_trade_closed(info["trade_size_sol"], pnl_sol)
         append_jsonl({
             "type": "exit",
@@ -294,6 +304,7 @@ class OutcomeTracker:
             "symbol": info["symbol"],
             "reason": reason,
             "pct_change": pct_change,
+            "measured": pct_change is not None,
             "trade_size_sol": info["trade_size_sol"],
             "dry_run": self.dry_run,
             "tx_signature": tx_signature,
@@ -301,8 +312,9 @@ class OutcomeTracker:
         if self.alerter is not None:
             emoji = EXIT_EMOJI.get(reason, "")
             prefix = "[DRY RUN] " if self.dry_run else ""
+            pct_str = f"{pct_change:+.1f}%" if pct_change is not None else "onbekend (geen koersdata)"
             await self.alerter.send(
-                f"{prefix}{emoji} Exit ({reason}): {info['name']} ({info['symbol']}) @ {pct_change:+.1f}%"
+                f"{prefix}{emoji} Exit ({reason}): {info['name']} ({info['symbol']}) @ {pct_str}"
             )
 
         # keep passively watching after the exit - doesn't touch risk/P&L
@@ -368,18 +380,22 @@ class OutcomeTracker:
                         # never measured, nothing simulated is actually at
                         # stake - fine to just stop tracking in dry-run
                         finished_mints.append(mint)
-                    elif not info.get("no_data_warned"):
+                    elif self._exit_attempt_allowed(info):
                         # live mode + never measured = we genuinely don't know
-                        # the price, so we can't safely auto-sell blind. Keep
-                        # tracking it (never silently abandon a real held
-                        # position) and warn once instead of repeating forever
-                        info["no_data_warned"] = True
-                        logger.error(
-                            "LIVE positie %s (%s) heeft na %ds nog geen koersdata - "
-                            "kan niet veilig automatisch verkopen. Blijft open, controleer handmatig.",
-                            info["symbol"], mint, MAX_HOLD_SEC,
-                        )
-                        no_data_warnings.append(info["symbol"])
+                        # the price, but selling doesn't require knowing it in
+                        # advance - a real held position with no exit path at
+                        # all is worse than one closed blind, so force the
+                        # sell anyway and record the outcome as unmeasured
+                        # rather than leaving it stuck open forever
+                        if not info.get("no_data_warned"):
+                            info["no_data_warned"] = True
+                            logger.error(
+                                "LIVE positie %s (%s) heeft na %ds nog geen koersdata - "
+                                "forceer verkoop blind, resultaat wordt als 'unmeasured' gelogd.",
+                                info["symbol"], mint, MAX_HOLD_SEC,
+                            )
+                            no_data_warnings.append(info["symbol"])
+                        to_timeout_exit.append((mint, dict(info), "timeout_unmeasured", None))
             for mint in finished_mints:
                 del self._pending[mint]
         for mint, info, reason, pct_change in to_timeout_exit:
