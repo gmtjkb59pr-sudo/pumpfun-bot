@@ -18,6 +18,7 @@ logger = logging.getLogger("pumpfun_bot.risk")
 @dataclass
 class RiskState:
     open_exposure_sol: float = 0.0
+    open_positions_count: int = 0
     realized_pnl_sol: float = 0.0
     trade_timestamps: list = field(default_factory=list)
     day_start_ts: float = field(default_factory=time.time)
@@ -58,6 +59,12 @@ class RiskManager:
                 f"brengen, max is {self.cfg.max_sol_total_exposure}."
             )
 
+        if self.state.open_positions_count >= self.cfg.max_open_positions:
+            return False, (
+                f"Al {self.state.open_positions_count} open posities, max is "
+                f"{self.cfg.max_open_positions}."
+            )
+
         if self._trades_in_last_hour() >= self.cfg.max_trades_per_hour:
             return False, f"Limiet van {self.cfg.max_trades_per_hour} trades/uur bereikt."
 
@@ -76,11 +83,13 @@ class RiskManager:
 
     def register_trade_opened(self, sol_amount: float) -> None:
         self.state.open_exposure_sol += sol_amount
+        self.state.open_positions_count += 1
         self.state.trade_timestamps.append(time.time())
         self._sync_dashboard()
 
     def register_trade_closed(self, sol_amount: float, pnl_sol: float) -> None:
         self.state.open_exposure_sol = max(0.0, self.state.open_exposure_sol - sol_amount)
+        self.state.open_positions_count = max(0, self.state.open_positions_count - 1)
         self.state.realized_pnl_sol += pnl_sol
         logger.info(
             "Trade gesloten: pnl=%.4f SOL | dag totaal pnl=%.4f SOL | open exposure=%.4f SOL",

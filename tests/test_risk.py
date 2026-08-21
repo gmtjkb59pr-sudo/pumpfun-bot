@@ -62,6 +62,29 @@ class RiskManagerCanTradeTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("Liquiditeit", reason)
 
+    def test_rejects_when_max_open_positions_reached(self):
+        risk = make_manager(max_open_positions=5)
+        for _ in range(5):
+            risk.register_trade_opened(0.01)
+        ok, reason = risk.can_trade(0.01)
+        self.assertFalse(ok)
+        self.assertIn("open posities", reason)
+
+    def test_allows_trade_below_max_open_positions(self):
+        risk = make_manager(max_open_positions=5)
+        for _ in range(4):
+            risk.register_trade_opened(0.01)
+        ok, _ = risk.can_trade(0.01)
+        self.assertTrue(ok)
+
+    def test_a_closed_position_frees_up_a_slot(self):
+        risk = make_manager(max_open_positions=5)
+        for _ in range(5):
+            risk.register_trade_opened(0.01)
+        risk.register_trade_closed(0.01, pnl_sol=0.0)
+        ok, _ = risk.can_trade(0.01)
+        self.assertTrue(ok)
+
 
 class RiskManagerStateTests(unittest.TestCase):
     def test_register_trade_opened_increases_exposure(self):
@@ -70,6 +93,12 @@ class RiskManagerStateTests(unittest.TestCase):
         self.assertAlmostEqual(risk.state.open_exposure_sol, 0.03)
         self.assertEqual(len(risk.state.trade_timestamps), 1)
 
+    def test_register_trade_opened_increments_open_positions_count(self):
+        risk = make_manager()
+        risk.register_trade_opened(0.03)
+        risk.register_trade_opened(0.03)
+        self.assertEqual(risk.state.open_positions_count, 2)
+
     def test_register_trade_closed_updates_exposure_and_pnl(self):
         risk = make_manager()
         risk.register_trade_opened(0.03)
@@ -77,10 +106,21 @@ class RiskManagerStateTests(unittest.TestCase):
         self.assertAlmostEqual(risk.state.open_exposure_sol, 0.0)
         self.assertAlmostEqual(risk.state.realized_pnl_sol, -0.01)
 
+    def test_register_trade_closed_decrements_open_positions_count(self):
+        risk = make_manager()
+        risk.register_trade_opened(0.03)
+        risk.register_trade_closed(0.03, pnl_sol=0.0)
+        self.assertEqual(risk.state.open_positions_count, 0)
+
     def test_register_trade_closed_never_drops_exposure_below_zero(self):
         risk = make_manager()
         risk.register_trade_closed(0.03, pnl_sol=0.0)
         self.assertEqual(risk.state.open_exposure_sol, 0.0)
+
+    def test_register_trade_closed_never_drops_position_count_below_zero(self):
+        risk = make_manager()
+        risk.register_trade_closed(0.03, pnl_sol=0.0)
+        self.assertEqual(risk.state.open_positions_count, 0)
 
 
 if __name__ == "__main__":
