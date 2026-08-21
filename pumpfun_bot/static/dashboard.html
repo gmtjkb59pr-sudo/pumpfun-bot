@@ -584,6 +584,8 @@
       .filter(Boolean).join('');
 
     const pnlClass = exits.total_realized_pnl_sol > 0 ? 'positive' : exits.total_realized_pnl_sol < 0 ? 'negative' : '';
+    const netPnl = exits.total_realized_pnl_sol_after_fees;
+    const netPnlClass = netPnl > 0 ? 'positive' : netPnl < 0 ? 'negative' : '';
 
     // "vs realized" at 15 min after the exit: positive = holding longer
     // would have made MORE than the exit strategy actually realized
@@ -604,9 +606,20 @@
       </div>` : '';
 
     wrap.innerHTML = `
-      <div style="padding: 14px 16px; border-bottom: 1px solid var(--border);">
-        <span style="font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.08em;">Totaal gerealiseerd (simulated)</span><br>
-        <span class="value ${pnlClass}" style="font-size: 22px;">${exits.total_realized_pnl_sol > 0 ? '+' : ''}${exits.total_realized_pnl_sol.toFixed(4)} SOL</span>
+      <div style="padding: 14px 16px; border-bottom: 1px solid var(--border); display: flex; gap: 28px; flex-wrap: wrap;">
+        <div>
+          <span style="font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.08em;">Bruto (koersbeweging)</span><br>
+          <span class="value ${pnlClass}" style="font-size: 22px;">${exits.total_realized_pnl_sol > 0 ? '+' : ''}${exits.total_realized_pnl_sol.toFixed(4)} SOL</span>
+        </div>
+        <div>
+          <span style="font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.08em;">Netto (na pump.fun 1.25% + PumpPortal 0.5% per trade)</span><br>
+          <span class="value ${netPnlClass}" style="font-size: 22px;">${netPnl > 0 ? '+' : ''}${netPnl.toFixed(4)} SOL</span>
+        </div>
+      </div>
+      <div class="empty-state" style="text-align: left; padding: 8px 16px; border-bottom: 1px solid var(--border);">
+        Fees zijn echte, opgezochte tarieven (pump.fun bonding-curve fee + PumpPortal Local API fee).
+        <strong>Slippage is niet meegerekend</strong> — daar bestaat geen vast gepubliceerd tarief voor,
+        dus het netto-cijfer is nog steeds een bovengrens, geen exacte kostprijs.
       </div>
       <div class="table-scroll">
         <table>

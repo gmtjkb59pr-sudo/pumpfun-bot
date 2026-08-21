@@ -17,6 +17,7 @@ import json
 import statistics
 from pathlib import Path
 
+from .fees import net_pct_change_after_fees
 from .outcome_tracker import CHECKPOINTS_SEC
 
 
@@ -49,7 +50,13 @@ def compute_stats(log_path: str | Path) -> dict:
             "total_outcomes": 0,
             "total_unmeasured": 0,
             "by_checkpoint": {},
-            "exits": {"total": 0, "total_realized_pnl_sol": 0.0, "by_reason": {}},
+            "exits": {
+                "total": 0,
+                "total_realized_pnl_sol": 0.0,
+                "total_realized_pnl_sol_after_fees": 0.0,
+                "by_reason": {},
+                "by_reason_after_fees": {},
+            },
         }
 
     trade_meta_by_mint: dict[str, dict] = {}
@@ -106,16 +113,25 @@ def compute_stats(log_path: str | Path) -> dict:
             "by_liquidity": {k: _summarize(v) for k, v in liquidity_vals.items()},
         }
 
+    # "gross" = raw price movement, same number the rest of this file has
+    # always shown. "net" = gross with pump.fun's 1.25%/trade + PumpPortal's
+    # 0.5%/trade round-trip fee deducted (see fees.py for sources) - still
+    # missing slippage, which has no fixed published rate to apply.
     exits_by_reason: dict[str, list[float]] = {}
+    exits_by_reason_net: dict[str, list[float]] = {}
     total_realized_pnl_sol = 0.0
+    total_realized_pnl_sol_after_fees = 0.0
     for exit_record in exits:
         reason = exit_record.get("reason", "unknown")
         pct = exit_record.get("pct_change")
+        trade_size = exit_record.get("trade_size_sol") or 0.0
         if pct is not None:
             exits_by_reason.setdefault(reason, []).append(pct)
-        trade_size = exit_record.get("trade_size_sol") or 0.0
-        if pct is not None and trade_size:
-            total_realized_pnl_sol += trade_size * (pct / 100)
+            net_pct = net_pct_change_after_fees(pct)
+            exits_by_reason_net.setdefault(reason, []).append(net_pct)
+            if trade_size:
+                total_realized_pnl_sol += trade_size * (pct / 100)
+                total_realized_pnl_sol_after_fees += trade_size * (net_pct / 100)
 
     # vs_realized_pct: positive = holding past the exit would have made MORE
     # than the exit strategy actually realized (exiting was premature);
@@ -141,7 +157,9 @@ def compute_stats(log_path: str | Path) -> dict:
         "exits": {
             "total": len(exits),
             "total_realized_pnl_sol": round(total_realized_pnl_sol, 6),
+            "total_realized_pnl_sol_after_fees": round(total_realized_pnl_sol_after_fees, 6),
             "by_reason": {k: _summarize(v) for k, v in exits_by_reason.items()},
+            "by_reason_after_fees": {k: _summarize(v) for k, v in exits_by_reason_net.items()},
         },
         "counterfactual_hold": counterfactual_by_checkpoint,
     }
