@@ -22,6 +22,12 @@ class RiskConfig:
     default_slippage_pct: float = 10
     min_liquidity_sol: float = 5
     max_open_positions: int = 1000  # effectively unlimited unless set lower
+    # hard kill-switch, not a per-trade limit: once the wallet's real SOL
+    # balance (converted to USD via a live price) drops below this, the
+    # whole bot stops - user-requested "stop before it gets to zero" floor.
+    # 0 = disabled (default) so existing configs without this field never
+    # unexpectedly enable a shutdown.
+    min_wallet_balance_usd: float = 0
 
 
 @dataclass
@@ -123,6 +129,7 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         default_slippage_pct=risk_raw.get("default_slippage_pct", 10),
         min_liquidity_sol=risk_raw.get("min_liquidity_sol", 5),
         max_open_positions=risk_raw.get("max_open_positions", 1000),
+        min_wallet_balance_usd=risk_raw.get("min_wallet_balance_usd", 0),
     )
 
     strat_raw = raw.get("strategies", {})
