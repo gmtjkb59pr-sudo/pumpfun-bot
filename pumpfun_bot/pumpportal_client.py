@@ -25,12 +25,30 @@ from solders.transaction import VersionedTransaction
 logger = logging.getLogger("pumpfun_bot.pumpportal")
 
 
+def authenticated_ws_url(ws_url: str, api_key: str) -> str:
+    # subscribeTokenTrade/subscribeAccountTrade need the key on the connection
+    # URL itself (?api-key=...), not in a message - see
+    # https://pumpportal.fun/data-api/real-time
+    if not api_key:
+        return ws_url
+    separator = "&" if "?" in ws_url else "?"
+    return f"{ws_url}{separator}api-key={api_key}"
+
+
 class PumpPortalClient:
-    def __init__(self, ws_url: str, trade_api_url: str, rpc_http_url: str, keypair: Keypair):
+    def __init__(
+        self,
+        ws_url: str,
+        trade_api_url: str,
+        rpc_http_url: str,
+        keypair: Keypair,
+        api_key: str = "",
+    ):
         self.ws_url = ws_url
         self.trade_api_url = trade_api_url
         self.rpc_http_url = rpc_http_url
         self.keypair = keypair
+        self.api_key = api_key
 
     # ---------- Data feed (WebSocket) ----------
 
@@ -60,7 +78,8 @@ class PumpPortalClient:
         if keys:
             payload["keys"] = keys
 
-        async for websocket in websockets.connect(self.ws_url, ping_interval=20):
+        ws_url = authenticated_ws_url(self.ws_url, self.api_key)
+        async for websocket in websockets.connect(ws_url, ping_interval=20):
             try:
                 await websocket.send(json.dumps(payload))
                 logger.info("WS verbonden en geabonneerd op %s", subscribe_method)

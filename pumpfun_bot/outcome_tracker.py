@@ -20,6 +20,7 @@ import websockets
 
 from .activity_log import append_jsonl
 from .price_ref import extract_price_ref
+from .pumpportal_client import authenticated_ws_url
 
 logger = logging.getLogger("pumpfun_bot.outcome_tracker")
 
@@ -29,8 +30,9 @@ IDLE_SLEEP_SEC = 5
 
 
 class OutcomeTracker:
-    def __init__(self, ws_url: str):
+    def __init__(self, ws_url: str, api_key: str = ""):
         self.ws_url = ws_url
+        self.api_key = api_key
         self._pending: dict[str, dict] = {}
         self._lock = asyncio.Lock()
         self._warned_no_access = False
@@ -68,7 +70,8 @@ class OutcomeTracker:
 
     async def _poll_once(self, mints: list[str]) -> None:
         try:
-            async with websockets.connect(self.ws_url, ping_interval=20) as ws:
+            ws_url = authenticated_ws_url(self.ws_url, self.api_key)
+            async with websockets.connect(ws_url, ping_interval=20) as ws:
                 await ws.send(json.dumps({"method": "subscribeTokenTrade", "keys": mints}))
                 deadline = time.time() + POLL_WINDOW_SEC
                 while True:
