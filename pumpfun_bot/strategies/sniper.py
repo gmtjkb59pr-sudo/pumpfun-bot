@@ -104,13 +104,18 @@ class SniperStrategy:
                     slippage_pct=self.slippage_pct,
                 )
                 self.risk.register_trade_opened(self.trade_size_sol)
+                has_socials = any(event.get(k) for k in ("twitter", "telegram", "website"))
                 bot_state.log_trade(
                     "sniper", "buy", mint, self.trade_size_sol,
                     dry_run=False, tx_signature=result["signature"],
+                    meta={"liquidity_sol": liquidity_sol, "has_socials": has_socials},
                 )
                 await self.alerter.send(f"✅ Gekocht: {symbol} | tx: {result['signature']}")
-                # TODO: hier zou je take-profit / stop-loss monitoring willen starten
-                # voor deze positie, bv. met asyncio.create_task(self._monitor_position(...))
+                if self.outcome_tracker is not None:
+                    await self.outcome_tracker.track(
+                        mint, name, symbol, extract_price_ref(event),
+                        trade_size_sol=self.trade_size_sol,
+                    )
             except Exception as exc:  # noqa: BLE001
                 logger.exception("Snipe buy mislukt voor %s: %s", mint, exc)
                 await self.alerter.send(f"❌ Snipe mislukt voor {symbol}: {exc}")

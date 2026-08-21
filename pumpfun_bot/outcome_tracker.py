@@ -1,9 +1,18 @@
 """
-Follows up on simulated buys with an actual exit strategy - take-profit,
-stop-loss, or a timeout - instead of just watching price drift forever.
-This is what makes the bot's simulated P&L mean something: measuring raw
-buy-and-hold price movement doesn't tell you whether a strategy is
-profitable, because real trading is entries AND exits.
+Follows up on buys with an actual exit strategy - take-profit, stop-loss,
+or a timeout - instead of just watching price drift forever. This is what
+makes the bot's P&L mean something: measuring raw buy-and-hold price
+movement doesn't tell you whether a strategy is profitable, because real
+trading is entries AND exits.
+
+In dry_run mode (the default), exits are simulated exactly as before - no
+network calls, no real trade. When dry_run is False, an exit sends a real
+build_and_send_full_sell() through the trading client, and a position is
+ONLY ever marked closed (P&L registered, tracking stopped) if that sell
+actually succeeds. A failed real sell leaves the position exactly as it
+was - still open, still tracked, retried on the next signal - specifically
+so the bot's own bookkeeping can never say "sold" while the wallet still
+holds the tokens.
 
 Also still records informational price-drift checkpoints (60s/300s/900s)
 for tokens that haven't exited yet, for the dashboard's Learning Stats
@@ -41,6 +50,9 @@ CHECKPOINTS_SEC = (60, 300, 900)
 MAX_HOLD_SEC = CHECKPOINTS_SEC[-1]
 POLL_WINDOW_SEC = 20
 IDLE_SLEEP_SEC = 5
+# don't hammer a failing real sell on every single price tick - back off
+# between attempts, but keep retrying rather than giving up
+EXIT_RETRY_COOLDOWN_SEC = 15
 
 EXIT_EMOJI = {"take_profit": "🟢", "stop_loss": "🔴", "timeout": "⏱️"}
 
@@ -61,6 +73,9 @@ class OutcomeTracker:
         alerter: Alerter | None = None,
         take_profit_pct: float = 50.0,
         stop_loss_pct: float = 25.0,
+        client=None,
+        dry_run: bool = True,
+        sell_slippage_pct: float = 10.0,
     ):
         self.ws_url = ws_url
         self.api_key = api_key
@@ -71,6 +86,11 @@ class OutcomeTracker:
         self.alerter = alerter
         self.take_profit_pct = take_profit_pct
         self.stop_loss_pct = stop_loss_pct
+        # PumpPortalClient used to send a real sell when dry_run is False -
+        # required for live exits, unused (and unneeded) in dry-run
+        self.client = client
+        self.dry_run = dry_run
+        self.sell_slippage_pct = sell_slippage_pct
         self._pending: dict[str, dict] = {}
         # mints that already exited - kept under passive observation (no
         # P&L/exposure effect, already realized) purely to answer "would
@@ -169,22 +189,71 @@ class OutcomeTracker:
                 info["last_ref"] = ref
                 info["has_real_update"] = True
                 pct_change = ((ref - info["entry_ref"]) / info["entry_ref"]) * 100
+                triggered_reason = None
                 if pct_change >= self.take_profit_pct:
-                    exit_args = (mint, dict(info), "take_profit", pct_change)
+                    triggered_reason = "take_profit"
                 elif pct_change <= -self.stop_loss_pct:
-                    exit_args = (mint, dict(info), "stop_loss", pct_change)
-                if exit_args:
-                    del self._pending[mint]
+                    triggered_reason = "stop_loss"
+                if triggered_reason and self._exit_attempt_allowed(info):
+                    exit_args = (mint, dict(info), triggered_reason, pct_change)
 
             post = self._post_exit.get(mint)
             if post is not None:
                 post["last_ref"] = ref
                 post["has_real_update"] = True
         if exit_args:
-            await self._exit(*exit_args)
+            await self._attempt_exit(*exit_args)
 
-    async def _exit(self, mint: str, info: dict, reason: str, pct_change: float) -> None:
+    def _exit_attempt_allowed(self, info: dict) -> bool:
+        """Marks an attempt as starting now and returns whether enough time
+        has passed since the last one - keeps a failing real sell from being
+        retried on every single price tick."""
+        last_attempt = info.get("last_exit_attempt_ts", 0)
+        if time.time() - last_attempt < EXIT_RETRY_COOLDOWN_SEC:
+            return False
+        info["last_exit_attempt_ts"] = time.time()
+        return True
+
+    async def _attempt_exit(self, mint: str, info: dict, reason: str, pct_change: float) -> None:
+        """Calls _exit() and only removes the mint from _pending if it
+        actually closed - a failed real sell leaves it exactly as it was."""
+        closed = await self._exit(mint, info, reason, pct_change)
+        if closed:
+            async with self._lock:
+                self._pending.pop(mint, None)
+
+    async def _exit(self, mint: str, info: dict, reason: str, pct_change: float) -> bool:
+        """Returns True if the position is now closed (simulated close, or a
+        real sell that actually succeeded). Returns False if a real sell was
+        attempted and failed - the caller must leave the position tracked."""
         pct_change = round(pct_change, 2)
+        tx_signature = ""
+
+        if not self.dry_run:
+            if self.client is None:
+                logger.error(
+                    "LIVE modus maar geen trading client ingesteld op de outcome-tracker - "
+                    "kan %s niet verkopen. Positie blijft open.", info["symbol"],
+                )
+                return False
+            try:
+                result = await self.client.build_and_send_full_sell(
+                    mint=mint, slippage_pct=self.sell_slippage_pct,
+                )
+                tx_signature = result["signature"]
+            except Exception as exc:  # noqa: BLE001
+                logger.exception(
+                    "ECHTE sell mislukt voor %s (%s, reden=%s): %s - positie blijft open, "
+                    "wordt over %ds opnieuw geprobeerd.",
+                    info["symbol"], mint, reason, exc, EXIT_RETRY_COOLDOWN_SEC,
+                )
+                if self.alerter is not None:
+                    await self.alerter.send(
+                        f"❌ Sell mislukt voor {info['symbol']} ({reason}): {exc} - "
+                        f"positie blijft open, wordt opnieuw geprobeerd."
+                    )
+                return False
+
         if self.risk is not None and info["trade_size_sol"]:
             pnl_sol = round(info["trade_size_sol"] * (pct_change / 100), 6)
             self.risk.register_trade_closed(info["trade_size_sol"], pnl_sol)
@@ -197,11 +266,14 @@ class OutcomeTracker:
             "reason": reason,
             "pct_change": pct_change,
             "trade_size_sol": info["trade_size_sol"],
+            "dry_run": self.dry_run,
+            "tx_signature": tx_signature,
         })
         if self.alerter is not None:
             emoji = EXIT_EMOJI.get(reason, "")
+            prefix = "[DRY RUN] " if self.dry_run else ""
             await self.alerter.send(
-                f"{emoji} Exit ({reason}): {info['name']} ({info['symbol']}) @ {pct_change:+.1f}%"
+                f"{prefix}{emoji} Exit ({reason}): {info['name']} ({info['symbol']}) @ {pct_change:+.1f}%"
             )
 
         # keep passively watching after the exit - doesn't touch risk/P&L
@@ -220,10 +292,12 @@ class OutcomeTracker:
                 "hit": set(),
                 "has_real_update": False,
             }
+        return True
 
     async def _emit_due_checkpoints(self) -> None:
         now = time.time()
         to_timeout_exit = []
+        no_data_warnings = []
         async with self._lock:
             finished_mints = []
             for mint, info in self._pending.items():
@@ -255,16 +329,38 @@ class OutcomeTracker:
                     })
                     info["hit"].add(cp)
                 if age >= MAX_HOLD_SEC:
-                    finished_mints.append(mint)
                     if info["has_real_update"]:
-                        pct_change = round(
-                            ((info["last_ref"] - info["entry_ref"]) / info["entry_ref"]) * 100, 2
+                        if self._exit_attempt_allowed(info):
+                            pct_change = round(
+                                ((info["last_ref"] - info["entry_ref"]) / info["entry_ref"]) * 100, 2
+                            )
+                            to_timeout_exit.append((mint, dict(info), "timeout", pct_change))
+                    elif self.dry_run:
+                        # never measured, nothing simulated is actually at
+                        # stake - fine to just stop tracking in dry-run
+                        finished_mints.append(mint)
+                    elif not info.get("no_data_warned"):
+                        # live mode + never measured = we genuinely don't know
+                        # the price, so we can't safely auto-sell blind. Keep
+                        # tracking it (never silently abandon a real held
+                        # position) and warn once instead of repeating forever
+                        info["no_data_warned"] = True
+                        logger.error(
+                            "LIVE positie %s (%s) heeft na %ds nog geen koersdata - "
+                            "kan niet veilig automatisch verkopen. Blijft open, controleer handmatig.",
+                            info["symbol"], mint, MAX_HOLD_SEC,
                         )
-                        to_timeout_exit.append((mint, dict(info), "timeout", pct_change))
+                        no_data_warnings.append(info["symbol"])
             for mint in finished_mints:
                 del self._pending[mint]
         for mint, info, reason, pct_change in to_timeout_exit:
-            await self._exit(mint, info, reason, pct_change)
+            await self._attempt_exit(mint, info, reason, pct_change)
+        if self.alerter is not None:
+            for symbol in no_data_warnings:
+                await self.alerter.send(
+                    f"⚠️ Geen koersdata voor {symbol} na {MAX_HOLD_SEC}s - "
+                    f"kan niet automatisch verkopen, controleer deze positie handmatig."
+                )
 
     async def _emit_post_exit_checkpoints(self) -> None:
         """For mints that already exited, records - at the same 60/300/900s

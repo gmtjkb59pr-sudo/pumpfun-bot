@@ -112,6 +112,13 @@ class PumpPortalClient:
         Vraagt een ongesigneerde transactie op bij PumpPortal, signeert lokaal met
         onze eigen keypair, en stuurt hem naar de Solana RPC. Private key verlaat
         nooit dit process.
+
+        amount_sol is altijd SOL-gedenomineerd (denominatedInSol: true) - voor
+        buys "koop voor X SOL", voor sells "verkoop tokens ter waarde van X SOL".
+        Voor een volledige exit (verkoop 100% van de holding) gebruik je
+        build_and_send_full_sell() - "amount: X SOL" bij een sell verkoopt NIET
+        per se de hele positie, alleen tokens ter waarde van X SOL tegen de
+        actuele prijs.
         """
         body = {
             "publicKey": str(self.keypair.pubkey()),
@@ -123,7 +130,37 @@ class PumpPortalClient:
             "priorityFee": priority_fee_sol,
             "pool": pool,
         }
+        sig = await self._sign_and_send(body)
+        return {"signature": sig, "action": action, "mint": mint, "amount_sol": amount_sol}
 
+    async def build_and_send_full_sell(
+        self,
+        mint: str,
+        slippage_pct: float,
+        priority_fee_sol: float = 0.0005,
+        pool: str = "pump",
+    ) -> dict:
+        """
+        Verkoopt 100% van wat deze wallet aan `mint` in bezit heeft - voor een
+        volledige exit (take-profit/stop-loss/timeout), niet een gedeeltelijke
+        SOL-gedenomineerde sell. Gebruikt amount: "100%" met
+        denominatedInSol: "false", zoals PumpPortal's Local Trading API docs
+        beschrijven (https://pumpportal.fun/local-trading-api/trading-api).
+        """
+        body = {
+            "publicKey": str(self.keypair.pubkey()),
+            "action": "sell",
+            "mint": mint,
+            "amount": "100%",
+            "denominatedInSol": "false",
+            "slippage": slippage_pct,
+            "priorityFee": priority_fee_sol,
+            "pool": pool,
+        }
+        sig = await self._sign_and_send(body)
+        return {"signature": sig, "action": "sell", "mint": mint, "amount": "100%"}
+
+    async def _sign_and_send(self, body: dict) -> str:
         async with aiohttp.ClientSession() as session:
             async with session.post(self.trade_api_url, json=body, timeout=15) as resp:
                 if resp.status != 200:
@@ -136,7 +173,7 @@ class PumpPortalClient:
 
         sig = await self._send_raw_transaction(bytes(signed_tx))
         logger.info("Transactie verstuurd: %s", sig)
-        return {"signature": sig, "action": action, "mint": mint, "amount_sol": amount_sol}
+        return sig
 
     async def _send_raw_transaction(self, raw_tx: bytes) -> str:
         payload = {

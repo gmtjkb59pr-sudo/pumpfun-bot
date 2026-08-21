@@ -73,6 +73,9 @@ async def main() -> None:
         alerter=alerter,
         take_profit_pct=cfg.sniper.take_profit_pct,
         stop_loss_pct=cfg.sniper.stop_loss_pct,
+        client=client,
+        dry_run=cfg.risk.dry_run,
+        sell_slippage_pct=cfg.risk.default_slippage_pct,
     )
 
     sniper = SniperStrategy(

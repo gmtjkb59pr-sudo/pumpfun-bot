@@ -7,6 +7,21 @@ from pumpfun_bot.outcome_tracker import CHECKPOINTS_SEC, OutcomeTracker, is_fund
 from pumpfun_bot.risk import RiskManager
 
 
+class FakeClient:
+    """Stands in for PumpPortalClient - no real network calls."""
+
+    def __init__(self, *, should_fail=False, signature="fake_sig"):
+        self.should_fail = should_fail
+        self.signature = signature
+        self.sell_calls = []
+
+    async def build_and_send_full_sell(self, mint, slippage_pct):
+        self.sell_calls.append((mint, slippage_pct))
+        if self.should_fail:
+            raise RuntimeError("simulated RPC failure")
+        return {"signature": self.signature, "action": "sell", "mint": mint, "amount": "100%"}
+
+
 class IsFundedKeyRejectionTests(unittest.TestCase):
     def test_detects_the_actual_rejection_message(self):
         message = (
@@ -184,6 +199,79 @@ class PostExitCheckpointTests(unittest.TestCase):
         self.assertEqual(len(checks), 1)
         self.assertIsNone(checks[0]["vs_realized_pct"])
         self.assertFalse(checks[0]["measured"])
+
+
+class LiveExitTests(unittest.TestCase):
+    def _make_tracker(self, *, client, dry_run, entry_ref=100.0, take_profit_pct=50.0):
+        risk = RiskManager(RiskConfig())
+        risk.register_trade_opened(0.05)
+        tracker = OutcomeTracker(
+            ws_url="wss://example.invalid", risk=risk, client=client, dry_run=dry_run,
+            take_profit_pct=take_profit_pct,
+        )
+        tracker._pending["MINT"] = {
+            "entry_ts": time.time(),
+            "entry_ref": entry_ref,
+            "last_ref": entry_ref,
+            "name": "Test Token",
+            "symbol": "TEST",
+            "trade_size_sol": 0.05,
+            "hit": set(),
+            "has_real_update": False,
+        }
+        return tracker, risk
+
+    def test_successful_real_sell_closes_position(self):
+        client = FakeClient(should_fail=False, signature="abc123")
+        tracker, risk = self._make_tracker(client=client, dry_run=False, entry_ref=100.0)
+
+        asyncio.run(tracker._handle_price_update("MINT", 151.0))  # +51%, crosses TP
+
+        self.assertEqual(len(client.sell_calls), 1)
+        self.assertEqual(client.sell_calls[0][0], "MINT")
+        self.assertNotIn("MINT", tracker._pending)
+        self.assertAlmostEqual(risk.state.open_exposure_sol, 0.0)
+        self.assertAlmostEqual(risk.state.realized_pnl_sol, 0.05 * 0.51, places=4)
+
+    def test_failed_real_sell_leaves_position_open(self):
+        client = FakeClient(should_fail=True)
+        tracker, risk = self._make_tracker(client=client, dry_run=False, entry_ref=100.0)
+
+        asyncio.run(tracker._handle_price_update("MINT", 151.0))  # +51%, crosses TP
+
+        self.assertEqual(len(client.sell_calls), 1)
+        # position must still be tracked - the wallet still genuinely holds it
+        self.assertIn("MINT", tracker._pending)
+        self.assertNotIn("MINT", tracker._post_exit)
+        self.assertAlmostEqual(risk.state.open_exposure_sol, 0.05)  # never closed
+        self.assertAlmostEqual(risk.state.realized_pnl_sol, 0.0)
+
+    def test_failed_sell_does_not_retry_within_cooldown(self):
+        client = FakeClient(should_fail=True)
+        tracker, risk = self._make_tracker(client=client, dry_run=False, entry_ref=100.0)
+
+        asyncio.run(tracker._handle_price_update("MINT", 151.0))
+        asyncio.run(tracker._handle_price_update("MINT", 152.0))  # still above TP, right after
+
+        self.assertEqual(len(client.sell_calls), 1)  # second attempt was suppressed by cooldown
+
+    def test_live_without_client_does_not_close_or_crash(self):
+        tracker, risk = self._make_tracker(client=None, dry_run=False, entry_ref=100.0)
+
+        asyncio.run(tracker._handle_price_update("MINT", 151.0))
+
+        self.assertIn("MINT", tracker._pending)
+        self.assertAlmostEqual(risk.state.realized_pnl_sol, 0.0)
+
+    def test_dry_run_never_calls_the_client(self):
+        client = FakeClient(should_fail=False)
+        tracker, risk = self._make_tracker(client=client, dry_run=True, entry_ref=100.0)
+
+        asyncio.run(tracker._handle_price_update("MINT", 151.0))
+
+        self.assertEqual(client.sell_calls, [])
+        self.assertNotIn("MINT", tracker._pending)
+        self.assertAlmostEqual(risk.state.realized_pnl_sol, 0.05 * 0.51, places=4)
 
 
 if __name__ == "__main__":
