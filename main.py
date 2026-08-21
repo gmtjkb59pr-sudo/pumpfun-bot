@@ -55,6 +55,7 @@ async def main() -> None:
         trade_api_url=cfg.pumpportal_trade_api_url,
         rpc_http_url=cfg.rpc_http_url,
         keypair=keypair,
+        api_key=cfg.pumpportal_api_key,
     )
     risk = RiskManager(cfg.risk)
     alerter = Alerter(
@@ -64,11 +65,13 @@ async def main() -> None:
         chat_id=cfg.telegram_chat_id,
     )
 
-    outcome_tracker = OutcomeTracker(ws_url=cfg.pumpportal_ws_url)
+    outcome_tracker = OutcomeTracker(
+        ws_url=cfg.pumpportal_ws_url, api_key=cfg.pumpportal_api_key, risk=risk
+    )
 
     sniper = SniperStrategy(
         client=PumpPortalClient(cfg.pumpportal_ws_url, cfg.pumpportal_trade_api_url,
-                                 cfg.rpc_http_url, keypair),
+                                 cfg.rpc_http_url, keypair, api_key=cfg.pumpportal_api_key),
         cfg=cfg.sniper,
         risk=risk,
         alerter=alerter,
@@ -79,7 +82,7 @@ async def main() -> None:
     )
     copytrade = CopyTradeStrategy(
         client=PumpPortalClient(cfg.pumpportal_ws_url, cfg.pumpportal_trade_api_url,
-                                 cfg.rpc_http_url, keypair),
+                                 cfg.rpc_http_url, keypair, api_key=cfg.pumpportal_api_key),
         cfg=cfg.copytrade,
         risk=risk,
         alerter=alerter,
@@ -89,7 +92,7 @@ async def main() -> None:
     )
     market_maker = MarketMakerStrategy(
         client=PumpPortalClient(cfg.pumpportal_ws_url, cfg.pumpportal_trade_api_url,
-                                 cfg.rpc_http_url, keypair),
+                                 cfg.rpc_http_url, keypair, api_key=cfg.pumpportal_api_key),
         cfg=cfg.market_maker,
         risk=risk,
         alerter=alerter,

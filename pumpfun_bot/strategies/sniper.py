@@ -91,7 +91,8 @@ class SniperStrategy:
                 )
                 if self.outcome_tracker is not None:
                     await self.outcome_tracker.track(
-                        mint, name, symbol, extract_price_ref(event)
+                        mint, name, symbol, extract_price_ref(event),
+                        trade_size_sol=self.trade_size_sol,
                     )
                 continue
 

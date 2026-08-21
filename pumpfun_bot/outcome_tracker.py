@@ -20,6 +20,8 @@ import websockets
 
 from .activity_log import append_jsonl
 from .price_ref import extract_price_ref
+from .pumpportal_client import authenticated_ws_url
+from .risk import RiskManager
 
 logger = logging.getLogger("pumpfun_bot.outcome_tracker")
 
@@ -28,14 +30,28 @@ POLL_WINDOW_SEC = 20
 IDLE_SLEEP_SEC = 5
 
 
+def is_funded_key_rejection(message: str) -> bool:
+    """PumpPortal replies with a bare {"message": ...} for both subscribe
+    confirmations ("Successfully subscribed...") and the funded-API-key
+    rejection - only the latter should be surfaced as a warning."""
+    return "funded" in message.lower()
+
+
 class OutcomeTracker:
-    def __init__(self, ws_url: str):
+    def __init__(self, ws_url: str, api_key: str = "", risk: RiskManager | None = None):
         self.ws_url = ws_url
+        self.api_key = api_key
+        # closes the simulated position (feeds P&L back into the risk
+        # manager/dashboard) once a tracked mint reaches its final checkpoint
+        # with real measured data - optional so tests/simple usage don't need one
+        self.risk = risk
         self._pending: dict[str, dict] = {}
         self._lock = asyncio.Lock()
         self._warned_no_access = False
 
-    async def track(self, mint: str, name: str, symbol: str, entry_ref: float | None) -> None:
+    async def track(
+        self, mint: str, name: str, symbol: str, entry_ref: float | None, trade_size_sol: float = 0.0
+    ) -> None:
         if entry_ref is None:
             logger.debug("Geen price-ref beschikbaar voor %s, sla outcome-tracking over.", mint)
             return
@@ -46,6 +62,7 @@ class OutcomeTracker:
                 "last_ref": entry_ref,
                 "name": name,
                 "symbol": symbol,
+                "trade_size_sol": trade_size_sol,
                 "hit": set(),
                 # only set once we've actually seen a trade event for this mint -
                 # without this, a rejected/empty subscription would silently look
@@ -68,7 +85,8 @@ class OutcomeTracker:
 
     async def _poll_once(self, mints: list[str]) -> None:
         try:
-            async with websockets.connect(self.ws_url, ping_interval=20) as ws:
+            ws_url = authenticated_ws_url(self.ws_url, self.api_key)
+            async with websockets.connect(ws_url, ping_interval=20) as ws:
                 await ws.send(json.dumps({"method": "subscribeTokenTrade", "keys": mints}))
                 deadline = time.time() + POLL_WINDOW_SEC
                 while True:
@@ -86,17 +104,14 @@ class OutcomeTracker:
 
                     mint = data.get("mint")
                     if mint is None:
-                        # PumpPortal rejects subscribeTokenTrade without a
-                        # funded API key and replies with a bare {"message": ...}
-                        # instead of a mint-keyed event - surface that once
-                        # instead of silently treating it as "no price change"
-                        if not self._warned_no_access and "message" in data:
+                        message = data.get("message", "")
+                        if not self._warned_no_access and is_funded_key_rejection(message):
                             self._warned_no_access = True
                             logger.warning(
                                 "PumpPortal wees subscribeTokenTrade af: %s "
                                 "-> outcome-tracking levert geen echte data zonder "
                                 "een funded PUMPPORTAL_API_KEY.",
-                                data["message"],
+                                message,
                             )
                         continue
 
@@ -140,6 +155,19 @@ class OutcomeTracker:
                         "measured": info["has_real_update"],
                     })
                     info["hit"].add(cp)
+
+                    # at the final checkpoint, close the simulated position so
+                    # the result shows up in the dashboard's P&L/exposure -
+                    # only when we actually measured something real; an
+                    # unmeasured mint is left open rather than faking a result
+                    if (
+                        cp == CHECKPOINTS_SEC[-1]
+                        and info["has_real_update"]
+                        and self.risk is not None
+                        and info["trade_size_sol"]
+                    ):
+                        pnl_sol = round(info["trade_size_sol"] * (pct_change / 100), 6)
+                        self.risk.register_trade_closed(info["trade_size_sol"], pnl_sol)
                 if len(info["hit"]) == len(CHECKPOINTS_SEC):
                     finished_mints.append(mint)
             for mint in finished_mints:
