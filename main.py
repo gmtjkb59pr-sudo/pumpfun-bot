@@ -18,6 +18,7 @@ from solders.keypair import Keypair
 
 from pumpfun_bot.alerts import Alerter
 from pumpfun_bot.auto_tuner import AutoTuner
+from pumpfun_bot.balance_watch import BalanceFloorReached, watch_balance_floor
 from pumpfun_bot.config import load_config
 from pumpfun_bot.dashboard_server import start_dashboard_server
 from pumpfun_bot.logger_setup import setup_logging
@@ -180,7 +181,33 @@ async def main() -> None:
         )
         tasks.append(asyncio.create_task(auto_tuner.run()))
 
-    await asyncio.gather(*tasks)
+    balance_floor_task = None
+    if not cfg.risk.dry_run and cfg.risk.min_wallet_balance_usd > 0:
+        logger.info(
+            "Balance-floor kill-switch actief: bot stopt zichzelf als de wallet onder "
+            "$%.2f zakt.", cfg.risk.min_wallet_balance_usd,
+        )
+        balance_floor_task = asyncio.create_task(
+            watch_balance_floor(
+                wallet_pubkey=str(keypair.pubkey()),
+                rpc_http_url=cfg.rpc_http_url,
+                min_balance_usd=cfg.risk.min_wallet_balance_usd,
+                alerter=alerter,
+            )
+        )
+        tasks.append(balance_floor_task)
+
+    try:
+        await asyncio.gather(*tasks)
+    except BalanceFloorReached:
+        # user-requested hard stop, not a bug - cancel everything else so
+        # the process actually exits instead of leaving orphaned tasks
+        # (buys/sells) running after the "stopped" alert already went out
+        for task in tasks:
+            if task is not balance_floor_task:
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise SystemExit(1) from None
 
 
 if __name__ == "__main__":

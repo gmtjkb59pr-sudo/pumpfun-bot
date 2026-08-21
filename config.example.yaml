@@ -25,6 +25,10 @@ risk:
   default_slippage_pct: 10
   min_liquidity_sol: 5          # negeer tokens met minder liquiditeit dan dit
   max_open_positions: 1000      # bot koopt niets nieuws zolang dit aantal posities al open staat
+  # hard kill-switch (niet hetzelfde als max_daily_loss_sol): stopt de HELE
+  # bot zodra de echte wallet-balans (SOL omgerekend naar USD via een live
+  # koers) hieronder zakt. 0 = uitgeschakeld (standaard).
+  min_wallet_balance_usd: 0
 
 strategies:
   sniper:
