@@ -764,17 +764,55 @@ class ReconcileWithWalletTests(unittest.TestCase):
         }
         return tracker, risk
 
+    def test_a_single_miss_does_not_drop_the_position(self):
+        # confirmed live: a genuinely still-held position (verified directly
+        # on-chain) was missing from one fetch_wallet_token_mints() call and
+        # present again the very next cycle, nothing bought/sold in between
+        # - a single miss must never be enough to abandon a real position
+        tracker, risk = self._make_tracker()
+
+        async def _fake_fetch(wallet_pubkey, rpc_http_url):
+            return set()  # wallet appears to hold nothing (one incomplete read)
+
+        with patch("pumpfun_bot.outcome_tracker.fetch_wallet_token_mints", _fake_fetch):
+            asyncio.run(tracker._reconcile_with_wallet())
+
+        self.assertIn("SOLD_MINT", tracker._pending)
+        self.assertEqual(tracker._pending["SOLD_MINT"]["wallet_miss_streak"], 1)
+        self.assertAlmostEqual(risk.state.open_exposure_sol, 0.03)  # not released yet
+
     def test_drops_a_position_the_wallet_no_longer_holds(self):
+        from pumpfun_bot.outcome_tracker import WALLET_MISS_CONFIRMATION_COUNT
+
         tracker, risk = self._make_tracker()
 
         async def _fake_fetch(wallet_pubkey, rpc_http_url):
             return set()  # wallet holds nothing
 
         with patch("pumpfun_bot.outcome_tracker.fetch_wallet_token_mints", _fake_fetch):
-            asyncio.run(tracker._reconcile_with_wallet())
+            for _ in range(WALLET_MISS_CONFIRMATION_COUNT):
+                asyncio.run(tracker._reconcile_with_wallet())
 
         self.assertNotIn("SOLD_MINT", tracker._pending)
         self.assertAlmostEqual(risk.state.open_exposure_sol, 0.0)  # slot released
+
+    def test_a_miss_streak_resets_once_the_position_is_seen_again(self):
+        tracker, risk = self._make_tracker()
+
+        async def _missing(wallet_pubkey, rpc_http_url):
+            return set()
+
+        async def _present(wallet_pubkey, rpc_http_url):
+            return {"SOLD_MINT"}
+
+        with patch("pumpfun_bot.outcome_tracker.fetch_wallet_token_mints", _missing):
+            asyncio.run(tracker._reconcile_with_wallet())
+        self.assertEqual(tracker._pending["SOLD_MINT"]["wallet_miss_streak"], 1)
+
+        with patch("pumpfun_bot.outcome_tracker.fetch_wallet_token_mints", _present):
+            asyncio.run(tracker._reconcile_with_wallet())
+        self.assertEqual(tracker._pending["SOLD_MINT"]["wallet_miss_streak"], 0)
+        self.assertIn("SOLD_MINT", tracker._pending)
 
     def test_keeps_a_position_the_wallet_still_holds(self):
         tracker, risk = self._make_tracker()
