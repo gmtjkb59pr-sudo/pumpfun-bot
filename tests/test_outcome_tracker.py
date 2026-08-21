@@ -141,6 +141,42 @@ class PerPositionThresholdTests(unittest.TestCase):
         self.assertGreater(risk.state.realized_pnl_sol, 0.0)
 
 
+class OpenPositionCountTests(unittest.TestCase):
+    """max_open_positions must reflect what's actually held, not a separate
+    counter that can drift - e.g. if track() ever returns early (no price
+    ref available), a naive "increment on every buy" counter would
+    permanently believe a slot is taken even though nothing is being
+    tracked/managed there, and real space would never re-open."""
+
+    def test_reflects_real_tracked_positions(self):
+        tracker = OutcomeTracker(ws_url="wss://example.invalid")
+        self.assertEqual(tracker.open_position_count(), 0)
+        asyncio.run(tracker.track("MINT1", "Test", "TEST", entry_ref=100.0, trade_size_sol=0.03))
+        self.assertEqual(tracker.open_position_count(), 1)
+        asyncio.run(tracker.track("MINT2", "Test2", "TEST2", entry_ref=100.0, trade_size_sol=0.03))
+        self.assertEqual(tracker.open_position_count(), 2)
+
+    def test_does_not_count_a_track_call_that_returned_early(self):
+        # entry_ref=None is a real, documented early-return case in track() -
+        # nothing gets added to _pending, so open_position_count() must not
+        # count it either, unlike a separately-incremented "buys attempted"
+        # counter would
+        tracker = OutcomeTracker(ws_url="wss://example.invalid")
+        asyncio.run(tracker.track("MINT1", "Test", "TEST", entry_ref=None, trade_size_sol=0.03))
+        self.assertEqual(tracker.open_position_count(), 0)
+
+    def test_decreases_after_a_position_closes(self):
+        risk = RiskManager(RiskConfig())
+        risk.register_trade_opened(0.05)
+        tracker = OutcomeTracker(
+            ws_url="wss://example.invalid", risk=risk, take_profit_pct=50.0,
+        )
+        asyncio.run(tracker.track("MINT", "Test", "TEST", entry_ref=100.0, trade_size_sol=0.05))
+        self.assertEqual(tracker.open_position_count(), 1)
+        asyncio.run(tracker._handle_price_update("MINT", 151.0))  # +51%, take-profit
+        self.assertEqual(tracker.open_position_count(), 0)
+
+
 class SharedTrackerCollisionTests(unittest.TestCase):
     """Two strategies (sniper, social_watch) share one OutcomeTracker keyed
     only by mint - if both ever bought the same mint, the second track()

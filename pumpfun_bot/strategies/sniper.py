@@ -110,7 +110,12 @@ class SniperStrategy:
                 continue
 
             liquidity_sol = event.get("vSolInBondingCurve")
-            ok, reason = self.risk.can_trade(self.trade_size_sol, liquidity_sol)
+            open_positions_count = (
+                self.outcome_tracker.open_position_count() if self.outcome_tracker is not None else None
+            )
+            ok, reason = self.risk.can_trade(
+                self.trade_size_sol, liquidity_sol, open_positions_count=open_positions_count,
+            )
             if not ok:
                 logger.info("Sniper: trade geblokkeerd door risk manager: %s", reason)
                 continue
