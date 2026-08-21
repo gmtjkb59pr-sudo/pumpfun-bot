@@ -60,14 +60,19 @@ logger = logging.getLogger("pumpfun_bot.outcome_tracker")
 
 CHECKPOINTS_SEC = (60, 300, 900)
 MAX_HOLD_SEC = CHECKPOINTS_SEC[-1]
-POLL_WINDOW_SEC = 20
-IDLE_SLEEP_SEC = 5
+# checkpoints (including the stale-price check) only get evaluated once per
+# poll cycle, i.e. roughly every POLL_WINDOW_SEC + IDLE_SLEEP_SEC - shortened
+# so a low STALE_PRICE_TIMEOUT_SEC actually gets detected close to on time,
+# instead of the threshold being real but the check itself only running
+# every ~20-25s regardless of what it's set to
+POLL_WINDOW_SEC = 8
+IDLE_SLEEP_SEC = 3
 # don't hammer a failing real sell on every single price tick - back off
 # between attempts, but keep retrying rather than giving up
 EXIT_RETRY_COOLDOWN_SEC = 15
 # no real trade event for this mint in this long -> likely dead/rugged, exit
 # well before the full MAX_HOLD_SEC timeout instead of holding a dead token
-STALE_PRICE_TIMEOUT_SEC = 120
+STALE_PRICE_TIMEOUT_SEC = 10
 
 EXIT_EMOJI = {
     "take_profit": "🟢", "stop_loss": "🔴", "trailing_stop": "🟡", "timeout": "⏱️",

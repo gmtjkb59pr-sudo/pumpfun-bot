@@ -677,8 +677,9 @@ class StalePriceExitTests(unittest.TestCase):
         risk = RiskManager(RiskConfig())
         risk.register_trade_opened(0.05)
         tracker = OutcomeTracker(ws_url="wss://example.invalid", risk=risk, dry_run=True)
+        recent = time.time() - min(1, STALE_PRICE_TIMEOUT_SEC / 2)
         tracker._pending["MINT"] = {
-            "entry_ts": time.time() - 10,
+            "entry_ts": recent,
             "entry_ref": 100.0,
             "last_ref": 112.0,
             "name": "Test Token",
@@ -686,7 +687,7 @@ class StalePriceExitTests(unittest.TestCase):
             "trade_size_sol": 0.05,
             "hit": set(),
             "has_real_update": True,
-            "last_update_ts": time.time() - 10,  # recent, well under the threshold
+            "last_update_ts": recent,  # well under the threshold, whatever it's set to
         }
         asyncio.run(tracker._emit_due_checkpoints())
 
