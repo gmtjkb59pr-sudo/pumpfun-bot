@@ -95,7 +95,7 @@ class RecordHolderCountTests(unittest.TestCase):
     def test_logs_a_holder_count_record_on_success(self):
         response = _FakeResponse({"result": [{"pubkey": "A"}, {"pubkey": "B"}]})
         with _patched(response):
-            asyncio.run(record_holder_count("MINT", "https://example.invalid/rpc"))
+            asyncio.run(record_holder_count("MINT", "https://example.invalid/rpc", delay_sec=0))
 
         records = self._read_log()
         self.assertEqual(len(records), 1)
@@ -106,7 +106,7 @@ class RecordHolderCountTests(unittest.TestCase):
     def test_logs_nothing_when_the_lookup_fails(self):
         response = _FakeResponse({"error": {"code": -32000, "message": "boom"}})
         with _patched(response):
-            asyncio.run(record_holder_count("MINT", "https://example.invalid/rpc"))
+            asyncio.run(record_holder_count("MINT", "https://example.invalid/rpc", delay_sec=0))
 
         self.assertEqual(self._read_log(), [])
 
