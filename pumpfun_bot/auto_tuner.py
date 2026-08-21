@@ -25,6 +25,7 @@ import time
 from .activity_log import DATA_LOG_PATH, append_jsonl
 from .alerts import Alerter
 from .config import SniperConfig
+from .holder_count_tuning import decide_min_holder_count
 from .risk import RiskManager
 from .stats import compute_stats
 
@@ -158,6 +159,7 @@ class AutoTuner:
         risk: RiskManager,
         alerter: Alerter,
         outcome_tracker=None,
+        social_watch_cfg=None,
         log_path=DATA_LOG_PATH,
         interval_sec: int = CHECK_INTERVAL_SEC,
         checkpoint_sec: int = DEFAULT_CHECKPOINT_SEC,
@@ -168,6 +170,10 @@ class AutoTuner:
         # optional so entry-filter tuning still works without it - only the
         # take-profit adjustment needs a live OutcomeTracker to mutate
         self.outcome_tracker = outcome_tracker
+        # optional - only social_watch's min_holder_count tuning needs this,
+        # since that field only exists on SocialWatchConfig (see
+        # holder_count_tuning.py for why this can't apply to sniper at all)
+        self.social_watch_cfg = social_watch_cfg
         self.log_path = log_path
         self.interval_sec = interval_sec
         self.checkpoint_sec = checkpoint_sec
@@ -186,6 +192,11 @@ class AutoTuner:
                 changes += decide_exit_adjustments(
                     stats, current_take_profit_pct=self.outcome_tracker.take_profit_pct
                 )
+            if self.social_watch_cfg is not None:
+                changes += decide_min_holder_count(
+                    self.log_path,
+                    current_min_holder_count=self.social_watch_cfg.min_holder_count,
+                )
             for change in changes:
                 await self._apply(change)
 
@@ -197,6 +208,8 @@ class AutoTuner:
             self.risk.cfg.min_liquidity_sol = change["to"]
         elif field == "take_profit_pct" and self.outcome_tracker is not None:
             self.outcome_tracker.take_profit_pct = change["to"]
+        elif field == "min_holder_count" and self.social_watch_cfg is not None:
+            self.social_watch_cfg.min_holder_count = change["to"]
         else:
             logger.warning("Onbekend auto-tune veld genegeerd: %s", field)
             return

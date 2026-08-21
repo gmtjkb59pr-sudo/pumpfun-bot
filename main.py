@@ -163,13 +163,14 @@ async def main() -> None:
         asyncio.create_task(outcome_tracker.run()),
     ]
 
-    if cfg.sniper.enabled:
+    if cfg.sniper.enabled or cfg.social_watch.enabled:
         auto_tuner = AutoTuner(
-            sniper_cfg=cfg.sniper, risk=risk, alerter=alerter, outcome_tracker=outcome_tracker
+            sniper_cfg=cfg.sniper, risk=risk, alerter=alerter, outcome_tracker=outcome_tracker,
+            social_watch_cfg=cfg.social_watch,
         )
         logger.info(
-            "Auto-tuner gestart: past sniper-filters aan op basis van outcome-stats "
-            "(alleen strenger, nooit losser, zie pumpfun_bot/auto_tuner.py)."
+            "Auto-tuner gestart: past sniper/social_watch-filters aan op basis van "
+            "outcome-stats (alleen strenger, nooit losser, zie pumpfun_bot/auto_tuner.py)."
         )
         tasks.append(asyncio.create_task(auto_tuner.run()))
 

@@ -49,6 +49,10 @@ class SocialWatchConfig:
     stop_loss_pct: float = 25
     trailing_activation_pct: float = 20
     trailing_stop_pct: float = 15
+    # 0 = no filter. Only auto_tuner.py raises this (tighten-only, gated on
+    # real sample size + margin) once there's evidence for a real threshold -
+    # never hand-set this without evidence, see holder_count_tuning.py
+    min_holder_count: int = 0
 
 
 @dataclass
@@ -141,6 +145,7 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         stop_loss_pct=sw_raw.get("stop_loss_pct", 25),
         trailing_activation_pct=sw_raw.get("trailing_activation_pct", 20),
         trailing_stop_pct=sw_raw.get("trailing_stop_pct", 15),
+        min_holder_count=sw_raw.get("min_holder_count", 0),
     )
 
     ct_raw = strat_raw.get("copytrade", {})
