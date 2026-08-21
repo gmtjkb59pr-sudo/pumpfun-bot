@@ -639,8 +639,22 @@ class OutcomeTracker:
         has passed since the last one - keeps a failing real sell from being
         retried on every single price tick. Also refuses once a position has
         been paused after MAX_CONSECUTIVE_SELL_FAILURES real failures - see
-        that constant's docstring."""
+        that constant's docstring.
+
+        Deliberately checks MIN_SELL_DELAY_SEC BEFORE consuming the retry
+        cooldown below, not after. Confirmed live: about half of all real
+        exits took 18-23s to actually confirm, vs. 1-3s for the rest -
+        because the FIRST attempt (right when a token was detected as dead,
+        as early as ~10s post-buy) was still too soon for MIN_SELL_DELAY_SEC,
+        so _exit() deferred it - but the cooldown timestamp below was
+        already consumed at that moment regardless. The bot then had to
+        wait out the FULL EXIT_RETRY_COOLDOWN_SEC from that deferred, never-
+        actually-attempted check, instead of retrying the moment
+        MIN_SELL_DELAY_SEC itself elapsed - adding up to ~10s of pure dead
+        time to a real, already-decided sell for no benefit."""
         if info.get("sell_paused"):
+            return False
+        if not self.dry_run and time.time() - info["entry_ts"] < MIN_SELL_DELAY_SEC:
             return False
         last_attempt = info.get("last_exit_attempt_ts", 0)
         if time.time() - last_attempt < EXIT_RETRY_COOLDOWN_SEC:
