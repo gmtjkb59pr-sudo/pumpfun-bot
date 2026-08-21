@@ -15,6 +15,7 @@ import time
 
 from ..alerts import Alerter
 from ..config import SocialWatchConfig
+from ..holder_count import INDEXING_DELAY_SEC as HOLDER_COUNT_INDEXING_DELAY_SEC
 from ..holder_count import fetch_holder_count
 from ..outcome_tracker import OutcomeTracker
 from ..price_ref import extract_price_ref
@@ -113,7 +114,7 @@ class SocialWatchStrategy:
                 if mint not in self._watching:
                     continue
                 self._watching.pop(mint, None)
-            await self._buy(mint, info["event"])
+            await self._buy(mint, info["event"], info["added_ts"])
 
     async def _fetch_fresh_ref(self, mint: str) -> float | None:
         """A candidate can sit on the watchlist for up to watch_window_sec -
@@ -134,7 +135,7 @@ class SocialWatchStrategy:
         except asyncio.TimeoutError:
             return None
 
-    async def _buy(self, mint: str, event: dict) -> None:
+    async def _buy(self, mint: str, event: dict, added_ts: float) -> None:
         name = event.get("name", "?")
         symbol = event.get("symbol", "?")
         liquidity_sol = event.get("vSolInBondingCurve")
@@ -152,12 +153,22 @@ class SocialWatchStrategy:
             logger.info("Social-watch: trade geblokkeerd door risk manager: %s", reason)
             return
 
+        # a candidate can get bought on the very FIRST poll cycle if socials
+        # were already present at launch - that can be well under
+        # HOLDER_COUNT_INDEXING_DELAY_SEC after the token's own creation,
+        # too soon for getProgramAccounts' index to have caught up (same lag
+        # confirmed for sniper, just measured from token launch here instead
+        # of our own buy). Top up to that minimum before trusting the count -
+        # confirmed by re-checking a live "0 holders" read minutes later and
+        # finding real holders that were always there, just not indexed yet.
+        elapsed_since_launch = time.time() - added_ts
+        remaining_delay = HOLDER_COUNT_INDEXING_DELAY_SEC - elapsed_since_launch
+        if remaining_delay > 0:
+            await asyncio.sleep(remaining_delay)
+
         # unlike sniper's instant buy, social_watch already tolerates real
         # delay - fetch these synchronously so the values are accurate AT
-        # the decision point, instead of a delayed best-effort background
-        # log (holder count checked immediately after a buy always reads 0,
-        # see holder_count.py's INDEXING_DELAY_SEC - by now, watch_window_sec
-        # has already given the indexer time to catch up)
+        # the decision point, instead of a delayed best-effort background log
         entry_ref, holder_count = await asyncio.gather(
             self._fetch_fresh_ref(mint),
             fetch_holder_count(mint, self.client.rpc_http_url),
