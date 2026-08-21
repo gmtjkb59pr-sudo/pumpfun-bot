@@ -493,6 +493,31 @@ class PostExitCheckpointTests(unittest.TestCase):
         self.assertEqual(record["pct_change_if_held_from_entry"], 80.0)
         self.assertEqual(record["vs_realized_pct"], 30.0)
 
+    def test_does_not_crash_when_the_original_exit_was_unmeasured(self):
+        # real crash found live: a position force-exited blind
+        # (timeout_unmeasured/stale_price_unmeasured, realized_pct_change=
+        # None) later started getting real post-exit price ticks - computing
+        # vs_realized_pct then tried float - None and crashed the entire
+        # bot (an unhandled exception here brings down the whole
+        # asyncio.gather in main.py, abandoning every open position)
+        import pumpfun_bot.outcome_tracker as outcome_tracker_module
+
+        captured = []
+        original_append = outcome_tracker_module.append_jsonl
+        outcome_tracker_module.append_jsonl = captured.append
+        try:
+            tracker = self._make_tracker_with_post_exit(has_real_update=True, last_ref=180.0)
+            tracker._post_exit["MINT"]["realized_pct_change"] = None
+            tracker._post_exit["MINT"]["reason"] = "stale_price_unmeasured"
+            asyncio.run(tracker._emit_post_exit_checkpoints())  # must not raise
+        finally:
+            outcome_tracker_module.append_jsonl = original_append
+
+        checks = [r for r in captured if r["type"] == "post_exit_check"]
+        self.assertEqual(len(checks), 1)
+        self.assertEqual(checks[0]["pct_change_if_held_from_entry"], 80.0)
+        self.assertIsNone(checks[0]["vs_realized_pct"])
+
     def test_leaves_unmeasured_flag_when_no_real_update(self):
         import pumpfun_bot.outcome_tracker as outcome_tracker_module
 
@@ -556,6 +581,39 @@ class MinSellDelayTests(unittest.TestCase):
 
         self.assertEqual(len(client.sell_calls), 1)
         self.assertNotIn("MINT", tracker._pending)
+
+
+class RunLoopResilienceTests(unittest.TestCase):
+    """This loop manages real, live positions - a bug in any single cycle
+    (confirmed live: a TypeError in post-exit checkpoint code) must never
+    crash the whole bot. Before this fix, an unhandled exception here took
+    down the entire asyncio.gather in main.py, abandoning every open
+    position mid-session with no graceful shutdown at all."""
+
+    def test_a_failing_cycle_does_not_crash_the_run_loop(self):
+        tracker = OutcomeTracker(ws_url="wss://example.invalid")
+        call_count = 0
+
+        async def _failing_then_ok_cycle():
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise RuntimeError("simulated bug in a cycle")
+
+        async def _drive():
+            with patch.object(tracker, "_run_one_cycle", _failing_then_ok_cycle), patch(
+                "pumpfun_bot.outcome_tracker.IDLE_SLEEP_SEC", 0,
+            ):
+                try:
+                    await asyncio.wait_for(tracker.run(), timeout=0.05)
+                except asyncio.TimeoutError:
+                    pass  # expected - run() never returns on its own
+
+        asyncio.run(_drive())
+
+        # proves the loop survived the RuntimeError and kept iterating,
+        # rather than the exception propagating out of run() entirely
+        self.assertGreaterEqual(call_count, 2)
 
 
 class ReconcileWithWalletTests(unittest.TestCase):
