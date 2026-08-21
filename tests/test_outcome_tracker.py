@@ -12,6 +12,7 @@ from pumpfun_bot.config import RiskConfig
 from pumpfun_bot.fees import ROUND_TRIP_PRIORITY_FEE_SOL, net_pct_change_after_fees
 from pumpfun_bot.outcome_tracker import (
     CHECKPOINTS_SEC,
+    MAX_CONSECUTIVE_SELL_FAILURES,
     MIN_SELL_DELAY_SEC,
     STALE_PRICE_TIMEOUT_SEC,
     OutcomeTracker,
@@ -987,6 +988,101 @@ class LiquidateUntrackedHoldingsTests(unittest.TestCase):
         asyncio.run(tracker._liquidate_untracked_holdings({"UNTRACKED_MINT"}))  # immediately again
 
         self.assertEqual(len(client.sell_calls), 1)  # second attempt suppressed by cooldown
+
+
+def _read_sell_paused_mints() -> list[str]:
+    mints = []
+    with open(activity_log.DATA_LOG_PATH) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            d = json.loads(line)
+            if d.get("type") == "sell_paused":
+                mints.append(d.get("mint"))
+    return mints
+
+
+class SellPausedReputationSignalTests(unittest.TestCase):
+    """A stuck position never produces a real "exit" record, so
+    wallet_reputation.py's launcher-blocking logic would never see it at
+    all without this - a launcher whose tokens keep becoming genuinely
+    unsellable is arguably a worse signal than one whose tokens just lose
+    money, so it needs its own event (see wallet_reputation.py's
+    MIN_UNSELLABLE_SAMPLES)."""
+
+    def setUp(self):
+        # the module-level redirected log file is shared across the whole
+        # test module - reading it back here (unlike every other test in
+        # this file, which only ever writes) needs per-test isolation, or
+        # entries from unrelated earlier tests would leak into these reads
+        self._module_log_path = activity_log.DATA_LOG_PATH
+        self._test_log_file = tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False)
+        self._test_log_file.close()
+        activity_log.DATA_LOG_PATH = Path(self._test_log_file.name)
+
+    def tearDown(self):
+        activity_log.DATA_LOG_PATH = self._module_log_path
+        Path(self._test_log_file.name).unlink(missing_ok=True)
+
+    def test_logs_sell_paused_for_a_paused_position_still_confirmed_held(self):
+        tracker = OutcomeTracker(ws_url="wss://example.invalid", client=FakeClient(), dry_run=False)
+        tracker._pending["MINT"] = {
+            "entry_ts": time.time(), "entry_ref": 100.0, "last_ref": 100.0, "peak_ref": 100.0,
+            "name": "Stuck Token", "symbol": "STUCK", "trade_size_sol": 0.03,
+            "hit": set(), "has_real_update": False, "sell_paused": True,
+        }
+
+        async def _fake_fetch(wallet_pubkey, rpc_http_url):
+            return {"MINT"}  # still genuinely held, not a timeout false alarm
+
+        with patch("pumpfun_bot.outcome_tracker.fetch_wallet_token_mints", _fake_fetch):
+            asyncio.run(tracker._reconcile_with_wallet())
+
+        self.assertEqual(_read_sell_paused_mints(), ["MINT"])
+
+    def test_does_not_log_twice_for_the_same_position(self):
+        tracker = OutcomeTracker(ws_url="wss://example.invalid", client=FakeClient(), dry_run=False)
+        tracker._pending["MINT"] = {
+            "entry_ts": time.time(), "entry_ref": 100.0, "last_ref": 100.0, "peak_ref": 100.0,
+            "name": "Stuck Token", "symbol": "STUCK", "trade_size_sol": 0.03,
+            "hit": set(), "has_real_update": False, "sell_paused": True,
+        }
+
+        async def _fake_fetch(wallet_pubkey, rpc_http_url):
+            return {"MINT"}
+
+        with patch("pumpfun_bot.outcome_tracker.fetch_wallet_token_mints", _fake_fetch):
+            asyncio.run(tracker._reconcile_with_wallet())
+            asyncio.run(tracker._reconcile_with_wallet())
+
+        self.assertEqual(_read_sell_paused_mints(), ["MINT"])  # only once, not twice
+
+    def test_does_not_log_a_position_that_is_not_paused(self):
+        tracker = OutcomeTracker(ws_url="wss://example.invalid", client=FakeClient(), dry_run=False)
+        tracker._pending["MINT"] = {
+            "entry_ts": time.time(), "entry_ref": 100.0, "last_ref": 100.0, "peak_ref": 100.0,
+            "name": "Normal Token", "symbol": "NORMAL", "trade_size_sol": 0.03,
+            "hit": set(), "has_real_update": False,
+        }
+
+        async def _fake_fetch(wallet_pubkey, rpc_http_url):
+            return {"MINT"}
+
+        with patch("pumpfun_bot.outcome_tracker.fetch_wallet_token_mints", _fake_fetch):
+            asyncio.run(tracker._reconcile_with_wallet())
+
+        self.assertEqual(_read_sell_paused_mints(), [])
+
+    def test_untracked_liquidation_pause_also_logs_the_signal(self):
+        client = FakeClient(should_fail=True)
+        tracker = OutcomeTracker(ws_url="wss://example.invalid", client=client, dry_run=False)
+
+        for _ in range(MAX_CONSECUTIVE_SELL_FAILURES):
+            asyncio.run(tracker._liquidate_untracked_holdings({"UNTRACKED_MINT"}))
+            tracker._untracked_liquidation["UNTRACKED_MINT"]["last_attempt_ts"] = 0
+
+        self.assertEqual(_read_sell_paused_mints(), ["UNTRACKED_MINT"])
 
 
 class LiveExitTests(unittest.TestCase):

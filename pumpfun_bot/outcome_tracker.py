@@ -458,6 +458,26 @@ class OutcomeTracker:
             if self.alerter is not None:
                 await self.alerter.send(message)
 
+        # a sell_paused position that's STILL confirmed held here (not
+        # dropped above as actually-already-sold) is a real, structurally
+        # broken sell, not a confirmation-timeout false alarm - confirmed
+        # live: several paused positions turned out to have already sold
+        # fine (a slow confirmation, not a real failure) and self-resolved
+        # via the stale-drop above; only what survives BOTH the failure cap
+        # AND this on-chain re-check is trustworthy enough to hold against
+        # the launcher wallet's reputation (see wallet_reputation.py).
+        # reputation_logged avoids re-logging the same mint every cycle.
+        newly_confirmed_unsellable = []
+        async with self._lock:
+            for mint, info in self._pending.items():
+                if info.get("sell_paused") and mint in held and not info.get("reputation_logged"):
+                    info["reputation_logged"] = True
+                    newly_confirmed_unsellable.append(mint)
+            if newly_confirmed_unsellable:
+                self._persist_pending()
+        for mint in newly_confirmed_unsellable:
+            append_jsonl({"type": "sell_paused", "ts": time.time(), "mint": mint})
+
         if untracked:
             message = (
                 f"⚠️ {len(untracked)} token(s) in de wallet worden niet gevolgd - "
@@ -525,6 +545,11 @@ class OutcomeTracker:
                 state["consecutive_failures"] += 1
                 if state["consecutive_failures"] >= MAX_CONSECUTIVE_SELL_FAILURES:
                     state["paused"] = True
+                    # already confirmed held (it's only in `untracked` because
+                    # _reconcile_with_wallet found it in the wallet) and now
+                    # confirmed unsellable - same reputation signal as a
+                    # tracked position hitting this, see that code path
+                    append_jsonl({"type": "sell_paused", "ts": time.time(), "mint": mint})
                     message = (
                         f"⏸️ Kon niet-getrackte holding {mint} niet liquideren na "
                         f"{state['consecutive_failures']} pogingen (laatste fout: {exc}) - "
