@@ -21,6 +21,7 @@ import websockets
 from .activity_log import append_jsonl
 from .price_ref import extract_price_ref
 from .pumpportal_client import authenticated_ws_url
+from .risk import RiskManager
 
 logger = logging.getLogger("pumpfun_bot.outcome_tracker")
 
@@ -37,14 +38,20 @@ def is_funded_key_rejection(message: str) -> bool:
 
 
 class OutcomeTracker:
-    def __init__(self, ws_url: str, api_key: str = ""):
+    def __init__(self, ws_url: str, api_key: str = "", risk: RiskManager | None = None):
         self.ws_url = ws_url
         self.api_key = api_key
+        # closes the simulated position (feeds P&L back into the risk
+        # manager/dashboard) once a tracked mint reaches its final checkpoint
+        # with real measured data - optional so tests/simple usage don't need one
+        self.risk = risk
         self._pending: dict[str, dict] = {}
         self._lock = asyncio.Lock()
         self._warned_no_access = False
 
-    async def track(self, mint: str, name: str, symbol: str, entry_ref: float | None) -> None:
+    async def track(
+        self, mint: str, name: str, symbol: str, entry_ref: float | None, trade_size_sol: float = 0.0
+    ) -> None:
         if entry_ref is None:
             logger.debug("Geen price-ref beschikbaar voor %s, sla outcome-tracking over.", mint)
             return
@@ -55,6 +62,7 @@ class OutcomeTracker:
                 "last_ref": entry_ref,
                 "name": name,
                 "symbol": symbol,
+                "trade_size_sol": trade_size_sol,
                 "hit": set(),
                 # only set once we've actually seen a trade event for this mint -
                 # without this, a rejected/empty subscription would silently look
@@ -147,6 +155,19 @@ class OutcomeTracker:
                         "measured": info["has_real_update"],
                     })
                     info["hit"].add(cp)
+
+                    # at the final checkpoint, close the simulated position so
+                    # the result shows up in the dashboard's P&L/exposure -
+                    # only when we actually measured something real; an
+                    # unmeasured mint is left open rather than faking a result
+                    if (
+                        cp == CHECKPOINTS_SEC[-1]
+                        and info["has_real_update"]
+                        and self.risk is not None
+                        and info["trade_size_sol"]
+                    ):
+                        pnl_sol = round(info["trade_size_sol"] * (pct_change / 100), 6)
+                        self.risk.register_trade_closed(info["trade_size_sol"], pnl_sol)
                 if len(info["hit"]) == len(CHECKPOINTS_SEC):
                     finished_mints.append(mint)
             for mint in finished_mints:

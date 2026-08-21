@@ -65,7 +65,9 @@ async def main() -> None:
         chat_id=cfg.telegram_chat_id,
     )
 
-    outcome_tracker = OutcomeTracker(ws_url=cfg.pumpportal_ws_url, api_key=cfg.pumpportal_api_key)
+    outcome_tracker = OutcomeTracker(
+        ws_url=cfg.pumpportal_ws_url, api_key=cfg.pumpportal_api_key, risk=risk
+    )
 
     sniper = SniperStrategy(
         client=PumpPortalClient(cfg.pumpportal_ws_url, cfg.pumpportal_trade_api_url,
