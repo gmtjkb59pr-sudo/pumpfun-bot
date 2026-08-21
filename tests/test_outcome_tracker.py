@@ -873,6 +873,71 @@ class ReconcileWithWalletTests(unittest.TestCase):
         self.assertGreater(tracker._last_wallet_reconcile_ts, time.time() - 1)
 
 
+class LiquidateUntrackedHoldingsTests(unittest.TestCase):
+    """Untracked wallet holdings (leftovers from earlier sessions/bugs, no
+    known entry price) are never auto-adopted as real positions - see
+    _reconcile_with_wallet's docstring - but sitting there forever as
+    unmanaged capital isn't useful either. _liquidate_untracked_holdings is
+    a best-effort "convert back to SOL" cleanup pass, deliberately separate
+    from risk/exposure since these were never counted as open exposure."""
+
+    def test_successful_liquidation_removes_tracking_state_and_logs(self):
+        client = FakeClient(should_fail=False, signature="liq_sig")
+        tracker = OutcomeTracker(ws_url="wss://example.invalid", client=client, dry_run=False)
+
+        asyncio.run(tracker._liquidate_untracked_holdings({"UNTRACKED_MINT"}))
+
+        self.assertEqual(len(client.sell_calls), 1)
+        self.assertEqual(client.sell_calls[0][0], "UNTRACKED_MINT")
+        self.assertNotIn("UNTRACKED_MINT", tracker._untracked_liquidation)
+
+    def test_never_touches_risk_or_exposure(self):
+        # these were never counted as open exposure to begin with - a
+        # successful (or failed) liquidation must not change it either way
+        risk = RiskManager(RiskConfig())
+        client = FakeClient(should_fail=False)
+        tracker = OutcomeTracker(ws_url="wss://example.invalid", risk=risk, client=client, dry_run=False)
+
+        asyncio.run(tracker._liquidate_untracked_holdings({"UNTRACKED_MINT"}))
+
+        self.assertAlmostEqual(risk.state.open_exposure_sol, 0.0)
+        self.assertAlmostEqual(risk.state.realized_pnl_sol, 0.0)
+
+    def test_dry_run_never_attempts_liquidation(self):
+        client = FakeClient(should_fail=False)
+        tracker = OutcomeTracker(ws_url="wss://example.invalid", client=client, dry_run=True)
+
+        asyncio.run(tracker._liquidate_untracked_holdings({"UNTRACKED_MINT"}))
+
+        self.assertEqual(client.sell_calls, [])
+
+    def test_failed_liquidation_is_retried_up_to_the_cap_then_paused(self):
+        from pumpfun_bot.outcome_tracker import MAX_CONSECUTIVE_SELL_FAILURES
+
+        client = FakeClient(should_fail=True)
+        tracker = OutcomeTracker(ws_url="wss://example.invalid", client=client, dry_run=False)
+
+        for _ in range(MAX_CONSECUTIVE_SELL_FAILURES):
+            asyncio.run(tracker._liquidate_untracked_holdings({"UNTRACKED_MINT"}))
+            tracker._untracked_liquidation["UNTRACKED_MINT"]["last_attempt_ts"] = 0  # bypass cooldown
+
+        self.assertTrue(tracker._untracked_liquidation["UNTRACKED_MINT"]["paused"])
+        calls_before = len(client.sell_calls)
+
+        asyncio.run(tracker._liquidate_untracked_holdings({"UNTRACKED_MINT"}))
+
+        self.assertEqual(len(client.sell_calls), calls_before)  # paused, no further attempts
+
+    def test_respects_the_retry_cooldown(self):
+        client = FakeClient(should_fail=True)
+        tracker = OutcomeTracker(ws_url="wss://example.invalid", client=client, dry_run=False)
+
+        asyncio.run(tracker._liquidate_untracked_holdings({"UNTRACKED_MINT"}))
+        asyncio.run(tracker._liquidate_untracked_holdings({"UNTRACKED_MINT"}))  # immediately again
+
+        self.assertEqual(len(client.sell_calls), 1)  # second attempt suppressed by cooldown
+
+
 class LiveExitTests(unittest.TestCase):
     def _make_tracker(self, *, client, dry_run, entry_ref=100.0, take_profit_pct=50.0):
         risk = RiskManager(RiskConfig())
