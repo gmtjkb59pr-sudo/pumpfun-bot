@@ -51,6 +51,30 @@ class ComputeWalletStatsTests(unittest.TestCase):
     def test_missing_file_returns_empty(self):
         self.assertEqual(compute_wallet_stats("/no/such/file.jsonl"), {})
 
+    def test_tracks_unsellable_count_from_sell_paused_events(self):
+        # a stuck position never produces an "exit" record at all - the
+        # only evidence it ever existed is the sell_paused event, joined
+        # back to the launcher the same way exits are
+        path = _write_log([
+            {"type": "trade", "action": "buy", "mint": "M1", "meta": {"creator": "WALLET_A"}},
+            {"type": "sell_paused", "mint": "M1"},
+        ])
+        self.addCleanup(lambda: Path(path).unlink(missing_ok=True))
+
+        stats = compute_wallet_stats(path)
+
+        self.assertEqual(stats["WALLET_A"]["unsellable_count"], 1)
+        self.assertEqual(stats["WALLET_A"]["count"], 0)  # no real exit outcome
+        self.assertIsNone(stats["WALLET_A"]["median_pct_change"])
+
+    def test_sell_paused_without_a_resolvable_creator_is_ignored(self):
+        path = _write_log([
+            {"type": "sell_paused", "mint": "M1"},  # no matching buy record at all
+        ])
+        self.addCleanup(lambda: Path(path).unlink(missing_ok=True))
+
+        self.assertEqual(compute_wallet_stats(path), {})
+
 
 class BlockedWalletsTests(unittest.TestCase):
     def _log_with_repeated_losses(self, wallet: str, count: int, pct_change: float) -> str:
@@ -78,6 +102,26 @@ class BlockedWalletsTests(unittest.TestCase):
         self.addCleanup(lambda: Path(path).unlink(missing_ok=True))
 
         self.assertEqual(blocked_wallets(path, min_samples=3), set())
+
+    def test_blocks_a_wallet_with_a_single_confirmed_unsellable_token(self):
+        # deliberately a much lower bar than the median-loss path (min_samples
+        # doesn't apply here) - see MIN_UNSELLABLE_SAMPLES's docstring for why
+        path = _write_log([
+            {"type": "trade", "action": "buy", "mint": "M1", "meta": {"creator": "STUCK_LAUNCHER"}},
+            {"type": "sell_paused", "mint": "M1"},
+        ])
+        self.addCleanup(lambda: Path(path).unlink(missing_ok=True))
+
+        self.assertEqual(blocked_wallets(path), {"STUCK_LAUNCHER"})
+
+    def test_does_not_block_below_the_unsellable_threshold_when_raised(self):
+        path = _write_log([
+            {"type": "trade", "action": "buy", "mint": "M1", "meta": {"creator": "WALLET_A"}},
+            {"type": "sell_paused", "mint": "M1"},
+        ])
+        self.addCleanup(lambda: Path(path).unlink(missing_ok=True))
+
+        self.assertEqual(blocked_wallets(path, min_unsellable_samples=2), set())
 
 
 if __name__ == "__main__":
