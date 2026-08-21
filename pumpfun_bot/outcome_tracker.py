@@ -407,7 +407,7 @@ class OutcomeTracker:
                                 "'unmeasured' gelogd.",
                                 info["symbol"], mint, STALE_PRICE_TIMEOUT_SEC,
                             )
-                            no_data_warnings.append(info["symbol"])
+                            no_data_warnings.append((info["symbol"], STALE_PRICE_TIMEOUT_SEC))
                         to_timeout_exit.append((mint, dict(info), "stale_price_unmeasured", None))
                     continue
 
@@ -436,17 +436,17 @@ class OutcomeTracker:
                                 "forceer verkoop blind, resultaat wordt als 'unmeasured' gelogd.",
                                 info["symbol"], mint, MAX_HOLD_SEC,
                             )
-                            no_data_warnings.append(info["symbol"])
+                            no_data_warnings.append((info["symbol"], MAX_HOLD_SEC))
                         to_timeout_exit.append((mint, dict(info), "timeout_unmeasured", None))
             for mint in finished_mints:
                 del self._pending[mint]
         for mint, info, reason, pct_change in to_timeout_exit:
             await self._attempt_exit(mint, info, reason, pct_change)
         if self.alerter is not None:
-            for symbol in no_data_warnings:
+            for symbol, after_sec in no_data_warnings:
                 await self.alerter.send(
-                    f"⚠️ Geen koersdata voor {symbol} na {MAX_HOLD_SEC}s - "
-                    f"kan niet automatisch verkopen, controleer deze positie handmatig."
+                    f"⚠️ Geen koersdata voor {symbol} na {after_sec}s - "
+                    f"forceer automatische verkoop blind (resultaat onbekend)."
                 )
 
     async def _emit_post_exit_checkpoints(self) -> None:
