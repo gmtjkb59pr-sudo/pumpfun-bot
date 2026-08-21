@@ -42,6 +42,48 @@ LIQUIDITY_BUCKET_THRESHOLDS = {
     "20+ SOL": 20.0,
 }
 
+EXIT_MIN_SAMPLES = 15
+EXIT_MARGIN_PCT = 10.0
+MIN_TAKE_PROFIT_PCT = 10.0  # sanity floor - never auto-tune below this
+
+
+def decide_exit_adjustments(stats: dict, current_take_profit_pct: float) -> list[dict]:
+    """Only tunes take_profit_pct, and only downward (lock in gains sooner).
+
+    Stop-loss can't be safely auto-tuned from this data: once a position
+    exits on stop-loss we stop watching it, so there's no way to know
+    whether a tighter stop would have avoided a bigger loss or cut off a
+    recovery - that would need tracking price after a hypothetical earlier
+    exit, which isn't built. Take-profit is different: timeout exits (still
+    open at 15 min) tell us directly what gains were actually achievable
+    without ever hitting the current target, which is a real signal.
+    """
+    changes: list[dict] = []
+    timeout = ((stats.get("exits") or {}).get("by_reason") or {}).get("timeout") or {}
+    count = timeout.get("count") or 0
+    median = timeout.get("median_pct_change")
+    win_rate = timeout.get("win_rate_pct")
+
+    if (
+        count >= EXIT_MIN_SAMPLES
+        and median is not None
+        and win_rate is not None
+        and win_rate >= 60.0
+        and MIN_TAKE_PROFIT_PCT <= median <= current_take_profit_pct - EXIT_MARGIN_PCT
+    ):
+        new_take_profit = round(median, 1)
+        changes.append({
+            "field": "take_profit_pct",
+            "from": current_take_profit_pct,
+            "to": new_take_profit,
+            "reason": (
+                f"timeout-exits: {median}% mediaan winst (N={count}, win_rate={win_rate}%) "
+                f"blijft ruim onder huidige take_profit_pct ({current_take_profit_pct}%) - "
+                f"win eerder vast in plaats van te wachten op een doel dat zelden geraakt wordt"
+            ),
+        })
+    return changes
+
 
 def decide_adjustments(
     stats: dict,
@@ -115,6 +157,7 @@ class AutoTuner:
         sniper_cfg: SniperConfig,
         risk: RiskManager,
         alerter: Alerter,
+        outcome_tracker=None,
         log_path=DATA_LOG_PATH,
         interval_sec: int = CHECK_INTERVAL_SEC,
         checkpoint_sec: int = DEFAULT_CHECKPOINT_SEC,
@@ -122,6 +165,9 @@ class AutoTuner:
         self.sniper_cfg = sniper_cfg
         self.risk = risk
         self.alerter = alerter
+        # optional so entry-filter tuning still works without it - only the
+        # take-profit adjustment needs a live OutcomeTracker to mutate
+        self.outcome_tracker = outcome_tracker
         self.log_path = log_path
         self.interval_sec = interval_sec
         self.checkpoint_sec = checkpoint_sec
@@ -136,6 +182,10 @@ class AutoTuner:
                 current_require_socials=self.sniper_cfg.require_socials,
                 checkpoint_sec=self.checkpoint_sec,
             )
+            if self.outcome_tracker is not None:
+                changes += decide_exit_adjustments(
+                    stats, current_take_profit_pct=self.outcome_tracker.take_profit_pct
+                )
             for change in changes:
                 await self._apply(change)
 
@@ -145,6 +195,8 @@ class AutoTuner:
             self.sniper_cfg.require_socials = change["to"]
         elif field == "min_liquidity_sol":
             self.risk.cfg.min_liquidity_sol = change["to"]
+        elif field == "take_profit_pct" and self.outcome_tracker is not None:
+            self.outcome_tracker.take_profit_pct = change["to"]
         else:
             logger.warning("Onbekend auto-tune veld genegeerd: %s", field)
             return

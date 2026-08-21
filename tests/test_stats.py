@@ -138,6 +138,35 @@ class ComputeStatsTests(unittest.TestCase):
         self.assertEqual(stats["exits"]["by_reason"]["stop_loss"]["count"], 1)
         self.assertEqual(stats["exits"]["by_reason"]["stop_loss"]["win_rate_pct"], 0.0)
 
+    def test_aggregates_counterfactual_hold_by_reason_and_checkpoint(self):
+        log_path = write_log([
+            # holding would have beaten the take-profit exit by 30pp
+            {
+                "type": "post_exit_check", "mint": "A", "exit_reason": "take_profit",
+                "checkpoint_sec_after_exit": 900, "vs_realized_pct": 30.0,
+            },
+            # the stop-loss exit was the right call - holding would have been worse
+            {
+                "type": "post_exit_check", "mint": "B", "exit_reason": "stop_loss",
+                "checkpoint_sec_after_exit": 900, "vs_realized_pct": -15.0,
+            },
+            # unmeasured post-exit checks must not count as a 0pp data point
+            {
+                "type": "post_exit_check", "mint": "C", "exit_reason": "take_profit",
+                "checkpoint_sec_after_exit": 900, "vs_realized_pct": None,
+            },
+        ])
+        try:
+            stats = compute_stats(log_path)
+        finally:
+            log_path.unlink()
+
+        cf900 = stats["counterfactual_hold"]["900"]
+        self.assertEqual(cf900["take_profit"]["count"], 1)
+        self.assertEqual(cf900["take_profit"]["median_pct_change"], 30.0)
+        self.assertEqual(cf900["stop_loss"]["count"], 1)
+        self.assertEqual(cf900["stop_loss"]["median_pct_change"], -15.0)
+
 
 if __name__ == "__main__":
     unittest.main()

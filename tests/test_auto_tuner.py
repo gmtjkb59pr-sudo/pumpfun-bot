@@ -1,6 +1,6 @@
 import unittest
 
-from pumpfun_bot.auto_tuner import MIN_SAMPLES, decide_adjustments
+from pumpfun_bot.auto_tuner import EXIT_MIN_SAMPLES, MIN_SAMPLES, decide_adjustments, decide_exit_adjustments
 
 
 def make_bucket(count, median_pct_change):
@@ -109,6 +109,51 @@ class DecideAdjustmentsTests(unittest.TestCase):
         changes = decide_adjustments(stats, current_min_liquidity_sol=0, current_require_socials=False)
         fields = {c["field"] for c in changes}
         self.assertEqual(fields, {"require_socials", "min_liquidity_sol"})
+
+
+def make_exit_stats(timeout_count, timeout_median, timeout_win_rate):
+    return {
+        "exits": {
+            "by_reason": {
+                "timeout": {
+                    "count": timeout_count,
+                    "median_pct_change": timeout_median,
+                    "win_rate_pct": timeout_win_rate,
+                }
+            }
+        }
+    }
+
+
+class DecideExitAdjustmentsTests(unittest.TestCase):
+    def test_no_change_below_min_samples(self):
+        stats = make_exit_stats(EXIT_MIN_SAMPLES - 1, 30.0, 80.0)
+        changes = decide_exit_adjustments(stats, current_take_profit_pct=50.0)
+        self.assertEqual(changes, [])
+
+    def test_no_change_when_win_rate_too_low(self):
+        stats = make_exit_stats(EXIT_MIN_SAMPLES, 30.0, 55.0)
+        changes = decide_exit_adjustments(stats, current_take_profit_pct=50.0)
+        self.assertEqual(changes, [])
+
+    def test_no_change_when_median_too_close_to_current_target(self):
+        # only 5pp below 50 - below the EXIT_MARGIN_PCT of 10
+        stats = make_exit_stats(EXIT_MIN_SAMPLES, 45.0, 80.0)
+        changes = decide_exit_adjustments(stats, current_take_profit_pct=50.0)
+        self.assertEqual(changes, [])
+
+    def test_lowers_take_profit_when_evidence_is_strong(self):
+        stats = make_exit_stats(EXIT_MIN_SAMPLES, 25.0, 70.0)
+        changes = decide_exit_adjustments(stats, current_take_profit_pct=50.0)
+        self.assertEqual(len(changes), 1)
+        self.assertEqual(changes[0]["field"], "take_profit_pct")
+        self.assertEqual(changes[0]["from"], 50.0)
+        self.assertEqual(changes[0]["to"], 25.0)
+
+    def test_never_proposes_below_sanity_floor(self):
+        stats = make_exit_stats(EXIT_MIN_SAMPLES, 5.0, 90.0)  # below MIN_TAKE_PROFIT_PCT
+        changes = decide_exit_adjustments(stats, current_take_profit_pct=50.0)
+        self.assertEqual(changes, [])
 
 
 if __name__ == "__main__":

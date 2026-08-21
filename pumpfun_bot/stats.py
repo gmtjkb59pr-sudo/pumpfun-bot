@@ -55,6 +55,7 @@ def compute_stats(log_path: str | Path) -> dict:
     trade_meta_by_mint: dict[str, dict] = {}
     outcomes = []
     exits = []
+    post_exit_checks = []
     unmeasured_count = 0
 
     with open(log_path, "r", encoding="utf-8") as f:
@@ -76,6 +77,9 @@ def compute_stats(log_path: str | Path) -> dict:
                     outcomes.append(record)
             elif record.get("type") == "exit":
                 exits.append(record)
+            elif record.get("type") == "post_exit_check":
+                if record.get("vs_realized_pct") is not None:
+                    post_exit_checks.append(record)
 
     by_checkpoint: dict[str, dict] = {}
     for cp in CHECKPOINTS_SEC:
@@ -113,6 +117,22 @@ def compute_stats(log_path: str | Path) -> dict:
         if pct is not None and trade_size:
             total_realized_pnl_sol += trade_size * (pct / 100)
 
+    # vs_realized_pct: positive = holding past the exit would have made MORE
+    # than the exit strategy actually realized (exiting was premature);
+    # negative = exiting was the right call. Broken down by exit reason and
+    # how long after the exit we're looking, same (60/300/900s) cadence.
+    counterfactual_by_checkpoint: dict[str, dict] = {}
+    for cp in CHECKPOINTS_SEC:
+        by_reason_vals: dict[str, list[float]] = {}
+        for check in post_exit_checks:
+            if check.get("checkpoint_sec_after_exit") != cp:
+                continue
+            reason = check.get("exit_reason", "unknown")
+            by_reason_vals.setdefault(reason, []).append(check["vs_realized_pct"])
+        counterfactual_by_checkpoint[str(cp)] = {
+            reason: _summarize(vals) for reason, vals in by_reason_vals.items()
+        }
+
     return {
         "total_trades": len(trade_meta_by_mint),
         "total_outcomes": len(outcomes),
@@ -123,4 +143,5 @@ def compute_stats(log_path: str | Path) -> dict:
             "total_realized_pnl_sol": round(total_realized_pnl_sol, 6),
             "by_reason": {k: _summarize(v) for k, v in exits_by_reason.items()},
         },
+        "counterfactual_hold": counterfactual_by_checkpoint,
     }

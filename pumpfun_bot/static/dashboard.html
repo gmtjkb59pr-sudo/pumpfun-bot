@@ -568,7 +568,7 @@
     `;
   }
 
-  function renderExits(exits) {
+  function renderExits(exits, counterfactualHold) {
     const countEl = document.getElementById('exitsCount');
     const wrap = document.getElementById('exitsWrap');
     countEl.textContent = `${exits.total} exits`;
@@ -584,6 +584,25 @@
       .filter(Boolean).join('');
 
     const pnlClass = exits.total_realized_pnl_sol > 0 ? 'positive' : exits.total_realized_pnl_sol < 0 ? 'negative' : '';
+
+    // "vs realized" at 15 min after the exit: positive = holding longer
+    // would have made MORE than the exit strategy actually realized
+    // (exiting was premature); negative = exiting was the right call
+    const cf900 = (counterfactualHold || {})['900'] || {};
+    const cfRows = ['take_profit', 'stop_loss', 'timeout']
+      .map(r => fmtRow(reasonLabels[r] || r, cf900[r]))
+      .filter(Boolean).join('');
+    const cfSection = cfRows ? `
+      <div style="padding: 10px 16px; border-top: 1px solid var(--border); font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.08em;">
+        Zou vasthouden beter geweest zijn? (15 min na exit, vs. wat gerealiseerd werd)
+      </div>
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th>Exit-reden</th><th>Mediaan verschil</th><th>Gemiddeld verschil</th><th>% beter met holden</th><th>N</th></tr></thead>
+          <tbody>${cfRows}</tbody>
+        </table>
+      </div>` : '';
+
     wrap.innerHTML = `
       <div style="padding: 14px 16px; border-bottom: 1px solid var(--border);">
         <span style="font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.08em;">Totaal gerealiseerd (simulated)</span><br>
@@ -595,6 +614,7 @@
           <tbody>${rows}</tbody>
         </table>
       </div>
+      ${cfSection}
     `;
   }
 
@@ -607,7 +627,7 @@
       return;
     }
 
-    if (stats.exits) renderExits(stats.exits);
+    if (stats.exits) renderExits(stats.exits, stats.counterfactual_hold);
 
     document.getElementById('statsOutcomeCount').textContent = `${stats.total_outcomes} gemeten`;
     const wrap = document.getElementById('statsWrap');
