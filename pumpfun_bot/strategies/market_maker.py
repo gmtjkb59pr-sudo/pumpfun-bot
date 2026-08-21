@@ -93,6 +93,8 @@ class MarketMakerStrategy:
 
                 if self.dry_run:
                     logger.info("[DRY RUN] Grid %s: %s %s SOL van %s", i, action, amount, mint)
+                    if action == "buy":
+                        self.risk.register_trade_opened(amount)
                     bot_state.log_trade("market_maker", action, mint, amount, dry_run=True)
                     continue
 

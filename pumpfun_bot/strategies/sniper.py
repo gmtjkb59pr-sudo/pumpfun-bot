@@ -79,6 +79,7 @@ class SniperStrategy:
 
             if self.dry_run:
                 logger.info("[DRY RUN] Zou kopen: %s SOL van %s", self.trade_size_sol, mint)
+                self.risk.register_trade_opened(self.trade_size_sol)
                 bot_state.log_trade("sniper", "buy", mint, self.trade_size_sol, dry_run=True)
                 continue
 
