@@ -1,9 +1,19 @@
 """
 Follows up on buys with an actual exit strategy - take-profit, stop-loss,
-or a timeout - instead of just watching price drift forever. This is what
-makes the bot's P&L mean something: measuring raw buy-and-hold price
-movement doesn't tell you whether a strategy is profitable, because real
-trading is entries AND exits.
+a trailing stop, or a timeout - instead of just watching price drift
+forever. This is what makes the bot's P&L mean something: measuring raw
+buy-and-hold price movement doesn't tell you whether a strategy is
+profitable, because real trading is entries AND exits.
+
+The trailing stop exists because live data showed most positions (~59%)
+never hit take-profit or stop-loss at all - they just time out after 15
+minutes, and that bucket loses money on median. Many of those had pumped
+partway before fading back down; a fixed take-profit target that's never
+reached gives back the whole move. The trailing stop arms once a position
+is up trailing_activation_pct from entry, then exits if price falls
+trailing_stop_pct from its peak since entry - locking in part of a move
+that didn't reach the take-profit target, instead of riding it to a
+timeout loss.
 
 In dry_run mode (the default), exits are simulated exactly as before - no
 network calls, no real trade. When dry_run is False, an exit sends a real
@@ -54,7 +64,7 @@ IDLE_SLEEP_SEC = 5
 # between attempts, but keep retrying rather than giving up
 EXIT_RETRY_COOLDOWN_SEC = 15
 
-EXIT_EMOJI = {"take_profit": "🟢", "stop_loss": "🔴", "timeout": "⏱️"}
+EXIT_EMOJI = {"take_profit": "🟢", "stop_loss": "🔴", "trailing_stop": "🟡", "timeout": "⏱️"}
 
 
 def is_funded_key_rejection(message: str) -> bool:
@@ -73,6 +83,8 @@ class OutcomeTracker:
         alerter: Alerter | None = None,
         take_profit_pct: float = 50.0,
         stop_loss_pct: float = 25.0,
+        trailing_activation_pct: float = 20.0,
+        trailing_stop_pct: float = 15.0,
         client=None,
         dry_run: bool = True,
         sell_slippage_pct: float = 10.0,
@@ -86,6 +98,11 @@ class OutcomeTracker:
         self.alerter = alerter
         self.take_profit_pct = take_profit_pct
         self.stop_loss_pct = stop_loss_pct
+        # trailing stop arms once a position is up trailing_activation_pct
+        # from entry, then exits if price falls trailing_stop_pct from its
+        # peak since entry - see module docstring for why this exists
+        self.trailing_activation_pct = trailing_activation_pct
+        self.trailing_stop_pct = trailing_stop_pct
         # PumpPortalClient used to send a real sell when dry_run is False -
         # required for live exits, unused (and unneeded) in dry-run
         self.client = client
@@ -110,6 +127,7 @@ class OutcomeTracker:
                 "entry_ts": time.time(),
                 "entry_ref": entry_ref,
                 "last_ref": entry_ref,
+                "peak_ref": entry_ref,
                 "name": name,
                 "symbol": symbol,
                 "trade_size_sol": trade_size_sol,
@@ -180,20 +198,31 @@ class OutcomeTracker:
 
     async def _handle_price_update(self, mint: str, ref: float) -> None:
         """Records the new price and exits the position immediately if it
-        crosses take-profit or stop-loss. Separated from _poll_once so this
-        decision logic can be exercised directly in tests."""
+        crosses take-profit, stop-loss, or the trailing stop. Separated from
+        _poll_once so this decision logic can be exercised directly in
+        tests."""
         exit_args = None
         async with self._lock:
             info = self._pending.get(mint)
             if info is not None:
                 info["last_ref"] = ref
                 info["has_real_update"] = True
+                if ref > info["peak_ref"]:
+                    info["peak_ref"] = ref
                 pct_change = ((ref - info["entry_ref"]) / info["entry_ref"]) * 100
+                peak_pct_change = ((info["peak_ref"] - info["entry_ref"]) / info["entry_ref"]) * 100
+                drawdown_from_peak_pct = ((ref - info["peak_ref"]) / info["peak_ref"]) * 100
+
                 triggered_reason = None
                 if pct_change >= self.take_profit_pct:
                     triggered_reason = "take_profit"
                 elif pct_change <= -self.stop_loss_pct:
                     triggered_reason = "stop_loss"
+                elif (
+                    peak_pct_change >= self.trailing_activation_pct
+                    and drawdown_from_peak_pct <= -self.trailing_stop_pct
+                ):
+                    triggered_reason = "trailing_stop"
                 if triggered_reason and self._exit_attempt_allowed(info):
                     exit_args = (mint, dict(info), triggered_reason, pct_change)
 

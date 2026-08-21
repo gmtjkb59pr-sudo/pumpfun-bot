@@ -31,6 +31,8 @@ class SniperConfig:
     require_socials: bool = False
     take_profit_pct: float = 50
     stop_loss_pct: float = 25
+    trailing_activation_pct: float = 20
+    trailing_stop_pct: float = 15
 
 
 @dataclass
@@ -109,6 +111,8 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         require_socials=sniper_raw.get("require_socials", False),
         take_profit_pct=sniper_raw.get("take_profit_pct", 50),
         stop_loss_pct=sniper_raw.get("stop_loss_pct", 25),
+        trailing_activation_pct=sniper_raw.get("trailing_activation_pct", 20),
+        trailing_stop_pct=sniper_raw.get("trailing_stop_pct", 15),
     )
 
     ct_raw = strat_raw.get("copytrade", {})
