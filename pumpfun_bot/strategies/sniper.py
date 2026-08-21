@@ -12,6 +12,7 @@ import time
 from ..activity_log import DATA_LOG_PATH
 from ..alerts import Alerter
 from ..config import SniperConfig
+from ..holder_count import record_holder_count
 from ..outcome_tracker import OutcomeTracker
 from ..price_ref import extract_price_ref
 from ..pumpportal_client import PumpPortalClient
@@ -126,6 +127,7 @@ class SniperStrategy:
                     "sniper", "buy", mint, self.trade_size_sol, dry_run=True,
                     meta={"liquidity_sol": liquidity_sol, "has_socials": has_socials, "creator": creator},
                 )
+                asyncio.create_task(record_holder_count(mint, self.client.rpc_http_url))
                 if self.outcome_tracker is not None:
                     await self.outcome_tracker.track(
                         mint, name, symbol, extract_price_ref(event),
@@ -147,6 +149,7 @@ class SniperStrategy:
                     dry_run=False, tx_signature=result["signature"],
                     meta={"liquidity_sol": liquidity_sol, "has_socials": has_socials, "creator": creator},
                 )
+                asyncio.create_task(record_holder_count(mint, self.client.rpc_http_url))
                 await self.alerter.send(f"✅ Gekocht: {symbol} | tx: {result['signature']}")
                 if self.outcome_tracker is not None:
                     await self.outcome_tracker.track(

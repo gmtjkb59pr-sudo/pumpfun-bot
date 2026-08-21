@@ -15,6 +15,7 @@ class FakeClient:
         self._trade_events = trade_events if trade_events is not None else []
         self.should_fail_buy = should_fail_buy
         self.buy_calls = []
+        self.rpc_http_url = "https://example.invalid/rpc"
 
     async def stream_token_trades(self, mints):
         for event in self._trade_events:
@@ -128,8 +129,13 @@ class PollOnceTests(unittest.TestCase):
         async def _fake_has_socials(uri):
             return True
 
+        async def _noop_record_holder_count(mint, rpc_http_url):
+            return None
+
         with patch(
             "pumpfun_bot.strategies.social_watch.fetch_has_socials", _fake_has_socials,
+        ), patch(
+            "pumpfun_bot.strategies.social_watch.record_holder_count", _noop_record_holder_count,
         ):
             asyncio.run(strategy._poll_once())
 
