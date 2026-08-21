@@ -7,7 +7,12 @@ from pathlib import Path
 import pumpfun_bot.activity_log as activity_log
 from pumpfun_bot.config import RiskConfig
 from pumpfun_bot.fees import ROUND_TRIP_PRIORITY_FEE_SOL, net_pct_change_after_fees
-from pumpfun_bot.outcome_tracker import CHECKPOINTS_SEC, OutcomeTracker, is_funded_key_rejection
+from pumpfun_bot.outcome_tracker import (
+    CHECKPOINTS_SEC,
+    STALE_PRICE_TIMEOUT_SEC,
+    OutcomeTracker,
+    is_funded_key_rejection,
+)
 from pumpfun_bot.risk import RiskManager
 
 
@@ -406,6 +411,74 @@ class TrailingStopTests(unittest.TestCase):
 
         self.assertNotIn("MINT", tracker._pending)
         self.assertAlmostEqual(risk.state.realized_pnl_sol, _net_pnl_sol(0.05, 51.0), places=4)
+
+
+class StalePriceExitTests(unittest.TestCase):
+    def test_exits_with_last_known_price_after_going_quiet(self):
+        # got real ticks early on, then nothing for STALE_PRICE_TIMEOUT_SEC -
+        # likely dead/rugged, shouldn't wait for the full MAX_HOLD_SEC timeout
+        risk = RiskManager(RiskConfig())
+        risk.register_trade_opened(0.05)
+        tracker = OutcomeTracker(ws_url="wss://example.invalid", risk=risk, dry_run=True)
+        tracker._pending["MINT"] = {
+            "entry_ts": time.time() - STALE_PRICE_TIMEOUT_SEC - 1,
+            "entry_ref": 100.0,
+            "last_ref": 112.0,  # last real tick was +12%
+            "name": "Test Token",
+            "symbol": "TEST",
+            "trade_size_sol": 0.05,
+            "hit": set(),
+            "has_real_update": True,
+            "last_update_ts": time.time() - STALE_PRICE_TIMEOUT_SEC - 1,
+        }
+        asyncio.run(tracker._emit_due_checkpoints())
+
+        self.assertNotIn("MINT", tracker._pending)
+        self.assertAlmostEqual(risk.state.realized_pnl_sol, _net_pnl_sol(0.05, 12.0), places=4)
+
+    def test_does_not_exit_before_stale_threshold(self):
+        risk = RiskManager(RiskConfig())
+        risk.register_trade_opened(0.05)
+        tracker = OutcomeTracker(ws_url="wss://example.invalid", risk=risk, dry_run=True)
+        tracker._pending["MINT"] = {
+            "entry_ts": time.time() - 10,
+            "entry_ref": 100.0,
+            "last_ref": 112.0,
+            "name": "Test Token",
+            "symbol": "TEST",
+            "trade_size_sol": 0.05,
+            "hit": set(),
+            "has_real_update": True,
+            "last_update_ts": time.time() - 10,  # recent, well under the threshold
+        }
+        asyncio.run(tracker._emit_due_checkpoints())
+
+        self.assertIn("MINT", tracker._pending)
+        self.assertAlmostEqual(risk.state.realized_pnl_sol, 0.0)
+
+    def test_live_never_measured_position_force_sold_after_stale_threshold(self):
+        risk = RiskManager(RiskConfig())
+        risk.register_trade_opened(0.05)
+        client = FakeClient(signature="stale_blind_sell_sig")
+        tracker = OutcomeTracker(
+            ws_url="wss://example.invalid", risk=risk, client=client, dry_run=False,
+        )
+        tracker._pending["MINT"] = {
+            "entry_ts": time.time() - STALE_PRICE_TIMEOUT_SEC - 1,
+            "entry_ref": 100.0,
+            "last_ref": 100.0,
+            "name": "Test Token",
+            "symbol": "TEST",
+            "trade_size_sol": 0.05,
+            "hit": set(),
+            "has_real_update": False,
+            "last_update_ts": time.time() - STALE_PRICE_TIMEOUT_SEC - 1,
+        }
+        asyncio.run(tracker._emit_due_checkpoints())
+
+        self.assertEqual(client.sell_calls, [("MINT", tracker.sell_slippage_pct)])
+        self.assertNotIn("MINT", tracker._pending)
+        self.assertAlmostEqual(risk.state.realized_pnl_sol, -ROUND_TRIP_PRIORITY_FEE_SOL)
 
 
 if __name__ == "__main__":
