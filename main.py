@@ -20,9 +20,11 @@ from pumpfun_bot.alerts import Alerter
 from pumpfun_bot.auto_tuner import AutoTuner
 from pumpfun_bot.balance_watch import (
     BalanceFloorReached,
+    MaxRealLossReached,
     fetch_sol_balance,
     fetch_sol_usd_price,
     watch_balance_floor,
+    watch_max_real_loss,
 )
 from pumpfun_bot.config import load_config
 from pumpfun_bot.dashboard_server import start_dashboard_server
@@ -227,31 +229,39 @@ async def main() -> None:
         )
         tasks.append(asyncio.create_task(auto_tuner.run()))
 
-    balance_floor_task = None
     if not cfg.risk.dry_run and cfg.risk.min_wallet_balance_usd > 0:
         logger.info(
             "Balance-floor kill-switch actief: bot stopt zichzelf als de wallet onder "
             "$%.2f zakt.", cfg.risk.min_wallet_balance_usd,
         )
-        balance_floor_task = asyncio.create_task(
+        tasks.append(asyncio.create_task(
             watch_balance_floor(
                 wallet_pubkey=str(keypair.pubkey()),
                 rpc_http_url=cfg.rpc_http_url,
                 min_balance_usd=cfg.risk.min_wallet_balance_usd,
                 alerter=alerter,
             )
+        ))
+
+    if not cfg.risk.dry_run and cfg.risk.max_real_loss_usd > 0:
+        logger.info(
+            "Max-verlies kill-switch actief: bot stopt zichzelf als het ECHTE verlies "
+            "deze sessie $%.2f bereikt.", cfg.risk.max_real_loss_usd,
         )
-        tasks.append(balance_floor_task)
+        tasks.append(asyncio.create_task(
+            watch_max_real_loss(max_loss_usd=cfg.risk.max_real_loss_usd, alerter=alerter)
+        ))
 
     try:
         await asyncio.gather(*tasks)
-    except BalanceFloorReached:
+    except (BalanceFloorReached, MaxRealLossReached):
         # user-requested hard stop, not a bug - cancel everything else so
         # the process actually exits instead of leaving orphaned tasks
-        # (buys/sells) running after the "stopped" alert already went out
+        # (buys/sells) running after the "stopped" alert already went out.
+        # cancel() on an already-finished task (e.g. whichever one raised)
+        # is a documented no-op, so no need to track which one it was.
         for task in tasks:
-            if task is not balance_floor_task:
-                task.cancel()
+            task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         raise SystemExit(1) from None
 

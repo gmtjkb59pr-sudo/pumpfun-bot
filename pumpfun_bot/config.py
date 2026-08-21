@@ -28,6 +28,11 @@ class RiskConfig:
     # 0 = disabled (default) so existing configs without this field never
     # unexpectedly enable a shutdown.
     min_wallet_balance_usd: float = 0
+    # second hard kill-switch, distinct from the floor above: stops the bot
+    # once the REAL (ground-truth wallet, not the fee-model estimate)
+    # session loss reaches this many dollars - user-requested "stop after
+    # losing $X", not "stop once the wallet is down to $Y". 0 = disabled.
+    max_real_loss_usd: float = 0
 
 
 @dataclass
@@ -130,6 +135,7 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         min_liquidity_sol=risk_raw.get("min_liquidity_sol", 5),
         max_open_positions=risk_raw.get("max_open_positions", 1000),
         min_wallet_balance_usd=risk_raw.get("min_wallet_balance_usd", 0),
+        max_real_loss_usd=risk_raw.get("max_real_loss_usd", 0),
     )
 
     strat_raw = raw.get("strategies", {})
