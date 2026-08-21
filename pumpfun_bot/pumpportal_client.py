@@ -236,11 +236,22 @@ class PumpPortalClient:
             return None
 
     async def _confirm_transaction(
-        self, signature: str, timeout_sec: float = 30.0, poll_interval_sec: float = 0.5
+        self, signature: str, timeout_sec: float = 15.0, poll_interval_sec: float = 0.5
     ) -> None:
         """Polls until the transaction actually lands (or definitively
         failed) on-chain. Raises RuntimeError if it reverted, or if it never
-        confirms within timeout_sec - never silently assume success."""
+        confirms within timeout_sec - never silently assume success.
+
+        Lowered from 30s -> 15s: user-requested after live sessions showed
+        a struggling sell attempt (indexing lag, network congestion) could
+        take the full 30s before even starting its 15s retry cooldown,
+        making a dead token's exit feel slow even after it was correctly
+        detected as dead within ~10-15s. Trade-off, not a free win: a
+        transaction that's genuinely still confirming past 15s (rare, but
+        real) now gets classified "failed" and retried sooner, risking a
+        duplicate attempt/fee for something that may have actually landed -
+        acceptable given the user explicitly chose faster reaction over
+        that small extra margin."""
         payload = {
             "jsonrpc": "2.0",
             "id": 1,
