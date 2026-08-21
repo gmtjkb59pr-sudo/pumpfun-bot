@@ -14,6 +14,23 @@ from .state import bot_state
 
 logger = logging.getLogger("pumpfun_bot.risk")
 
+# circuit breaker: repeated buy failures (not sells - a failing sell already
+# has its own retry/reconciliation safety net, and blocking sells would be
+# the one thing this must never do) mean something systemic is likely wrong
+# (RPC issues, wallet out of fee money, PumpPortal down) - pausing new buys
+# and testing the waters before resuming beats blindly spending real SOL on
+# a broken pipeline. Classic closed -> open -> half-open -> closed pattern:
+# only ever narrows what gets bought (a failed test just keeps it paused
+# longer), same tighten-only spirit as everything else self-adjusting here.
+CIRCUIT_BREAKER_FAILURE_THRESHOLD = 5
+CIRCUIT_BREAKER_WINDOW_SEC = 300
+CIRCUIT_BREAKER_COOLDOWN_SEC = 120
+# if the caller never reports back after a half-open test buy was allowed
+# through (e.g. an unrelated crash between can_trade() and
+# report_buy_result()), don't stay stuck half-open forever, blocking every
+# future trade - treat it as a failed test and go back to a full cooldown
+CIRCUIT_BREAKER_HALF_OPEN_TIMEOUT_SEC = 30
+
 
 @dataclass
 class RiskState:
@@ -21,12 +38,19 @@ class RiskState:
     realized_pnl_sol: float = 0.0
     trade_timestamps: list = field(default_factory=list)
     day_start_ts: float = field(default_factory=time.time)
+    buy_failure_timestamps: list = field(default_factory=list)
+    circuit_breaker_state: str = "closed"  # closed | open | half_open
+    circuit_breaker_opened_at: float = 0.0
 
 
 class RiskManager:
-    def __init__(self, cfg: RiskConfig):
+    def __init__(self, cfg: RiskConfig, alerter=None):
         self.cfg = cfg
         self.state = RiskState()
+        # optional so tests/simple usage don't need one - only used to
+        # announce circuit breaker trips/recoveries, nothing else here sends
+        # alerts
+        self.alerter = alerter
 
     def _reset_day_if_needed(self) -> None:
         if time.time() - self.state.day_start_ts > 86400:
@@ -89,7 +113,101 @@ class RiskManager:
                 f"Liquiditeit ({liquidity_sol} SOL) onder minimum ({self.cfg.min_liquidity_sol})."
             )
 
+        # checked LAST, deliberately - a half-open breaker allows exactly
+        # one buy through as a test, and this transition only fires once
+        # every OTHER check above has already passed. If it were checked
+        # earlier, a candidate that trips the half-open test but then fails
+        # a later check (e.g. liquidity) would never actually attempt a buy,
+        # so report_buy_result() would never be called, and the breaker
+        # would stay stuck in half_open forever - deadlocked, blocking
+        # every future trade including genuinely fine ones.
+        breaker_ok, breaker_reason = self._check_circuit_breaker()
+        if not breaker_ok:
+            return False, breaker_reason
+
         return True, "ok"
+
+    def _check_circuit_breaker(self) -> tuple[bool, str]:
+        state = self.state
+        now = time.time()
+
+        if state.circuit_breaker_state == "closed":
+            return True, "ok"
+
+        if state.circuit_breaker_state == "half_open":
+            if now - state.circuit_breaker_opened_at >= CIRCUIT_BREAKER_HALF_OPEN_TIMEOUT_SEC:
+                # test buy never reported back - don't stay stuck forever
+                logger.warning(
+                    "Circuit breaker: half-open test kreeg nooit een resultaat - "
+                    "opnieuw open, volledige cooldown."
+                )
+                state.circuit_breaker_state = "open"
+                state.circuit_breaker_opened_at = now
+                return False, "Circuit breaker open - vorige test-buy geen resultaat, wacht opnieuw."
+            # a test is already in flight - block everything else until it resolves
+            return False, "Circuit breaker half-open - wacht op resultaat van test-buy."
+
+        # state == "open"
+        if now - state.circuit_breaker_opened_at >= CIRCUIT_BREAKER_COOLDOWN_SEC:
+            state.circuit_breaker_state = "half_open"
+            state.circuit_breaker_opened_at = now  # reused as "half-open since" for the timeout above
+            logger.warning("Circuit breaker: cooldown voorbij, probeert 1 test-buy (half-open).")
+            return True, "ok"
+        remaining = CIRCUIT_BREAKER_COOLDOWN_SEC - (now - state.circuit_breaker_opened_at)
+        return False, (
+            f"Circuit breaker open - {len(state.buy_failure_timestamps)} mislukte buys "
+            f"recent, wacht nog {remaining:.0f}s."
+        )
+
+    async def report_buy_result(self, success: bool) -> None:
+        """Call after every LIVE buy attempt (not dry-run - nothing there
+        can actually fail this way). Feeds the circuit breaker: enough real
+        failures pauses new buys until a test buy proves the pipeline is
+        healthy again. Never affects selling."""
+        state = self.state
+        now = time.time()
+
+        if success:
+            if state.circuit_breaker_state != "closed":
+                state.circuit_breaker_state = "closed"
+                state.buy_failure_timestamps = []
+                message = "🟢 Circuit breaker gesloten - test-buy geslaagd, normale werking hervat."
+                logger.warning(message)
+                if self.alerter is not None:
+                    await self.alerter.send(message)
+            return
+
+        if state.circuit_breaker_state == "half_open":
+            # the test failed - stay paused, restart the cooldown
+            state.circuit_breaker_state = "open"
+            state.circuit_breaker_opened_at = now
+            message = (
+                f"🔴 Circuit breaker blijft open - test-buy ook mislukt, "
+                f"nog {CIRCUIT_BREAKER_COOLDOWN_SEC}s cooldown."
+            )
+            logger.error(message)
+            if self.alerter is not None:
+                await self.alerter.send(message)
+            return
+
+        state.buy_failure_timestamps.append(now)
+        cutoff = now - CIRCUIT_BREAKER_WINDOW_SEC
+        state.buy_failure_timestamps = [t for t in state.buy_failure_timestamps if t > cutoff]
+
+        if (
+            state.circuit_breaker_state == "closed"
+            and len(state.buy_failure_timestamps) >= CIRCUIT_BREAKER_FAILURE_THRESHOLD
+        ):
+            state.circuit_breaker_state = "open"
+            state.circuit_breaker_opened_at = now
+            message = (
+                f"🔴 Circuit breaker open - {len(state.buy_failure_timestamps)} mislukte buys "
+                f"binnen {CIRCUIT_BREAKER_WINDOW_SEC}s, nieuwe buys gepauzeerd voor "
+                f"{CIRCUIT_BREAKER_COOLDOWN_SEC}s (verkopen blijft gewoon werken)."
+            )
+            logger.error(message)
+            if self.alerter is not None:
+                await self.alerter.send(message)
 
     def register_trade_opened(self, sol_amount: float) -> None:
         self.state.open_exposure_sol += sol_amount

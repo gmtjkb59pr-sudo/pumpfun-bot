@@ -1,7 +1,21 @@
+import asyncio
 import unittest
 
 from pumpfun_bot.config import RiskConfig
-from pumpfun_bot.risk import RiskManager
+from pumpfun_bot.risk import (
+    CIRCUIT_BREAKER_COOLDOWN_SEC,
+    CIRCUIT_BREAKER_FAILURE_THRESHOLD,
+    CIRCUIT_BREAKER_HALF_OPEN_TIMEOUT_SEC,
+    RiskManager,
+)
+
+
+class FakeAlerter:
+    def __init__(self):
+        self.messages = []
+
+    async def send(self, message):
+        self.messages.append(message)
 
 
 def make_manager(**overrides) -> RiskManager:
@@ -14,7 +28,7 @@ def make_manager(**overrides) -> RiskManager:
     )
     for key, value in overrides.items():
         setattr(cfg, key, value)
-    return RiskManager(cfg)
+    return RiskManager(cfg, alerter=FakeAlerter())
 
 
 class RiskManagerCanTradeTests(unittest.TestCase):
@@ -103,6 +117,123 @@ class RiskManagerStateTests(unittest.TestCase):
         risk = make_manager()
         risk.register_trade_closed(0.03, pnl_sol=0.0)
         self.assertEqual(risk.state.open_exposure_sol, 0.0)
+
+
+class CircuitBreakerTests(unittest.TestCase):
+    """Repeated buy failures mean something systemic is likely wrong - the
+    breaker pauses new buys and tests the waters before resuming, rather
+    than blindly spending real SOL into a broken pipeline. Never affects
+    selling - can_trade() is the only thing it gates."""
+
+    def _fail_n_times(self, risk, n):
+        for _ in range(n):
+            asyncio.run(risk.report_buy_result(success=False))
+
+    def test_stays_closed_below_the_failure_threshold(self):
+        risk = make_manager()
+        self._fail_n_times(risk, CIRCUIT_BREAKER_FAILURE_THRESHOLD - 1)
+        ok, _ = risk.can_trade(0.01, liquidity_sol=10)
+        self.assertTrue(ok)
+
+    def test_trips_open_at_the_failure_threshold(self):
+        risk = make_manager()
+        self._fail_n_times(risk, CIRCUIT_BREAKER_FAILURE_THRESHOLD)
+        ok, reason = risk.can_trade(0.01, liquidity_sol=10)
+        self.assertFalse(ok)
+        self.assertIn("Circuit breaker", reason)
+
+    def test_sends_an_alert_when_it_trips(self):
+        risk = make_manager()
+        self._fail_n_times(risk, CIRCUIT_BREAKER_FAILURE_THRESHOLD)
+        self.assertTrue(any("Circuit breaker open" in m for m in risk.alerter.messages))
+
+    def test_failures_outside_the_window_do_not_count(self):
+        risk = make_manager()
+        # backdate old failures past the rolling window - they must not
+        # contribute to tripping the breaker
+        old = risk.state.buy_failure_timestamps
+        import time as time_module
+        from pumpfun_bot.risk import CIRCUIT_BREAKER_WINDOW_SEC
+        for _ in range(CIRCUIT_BREAKER_FAILURE_THRESHOLD):
+            old.append(time_module.time() - CIRCUIT_BREAKER_WINDOW_SEC - 10)
+        ok, _ = risk.can_trade(0.01, liquidity_sol=10)
+        self.assertTrue(ok)
+
+    def test_open_blocks_trades_until_cooldown_elapses(self):
+        risk = make_manager()
+        self._fail_n_times(risk, CIRCUIT_BREAKER_FAILURE_THRESHOLD)
+        risk.state.circuit_breaker_opened_at -= CIRCUIT_BREAKER_COOLDOWN_SEC - 1  # not quite elapsed
+        ok, _ = risk.can_trade(0.01, liquidity_sol=10)
+        self.assertFalse(ok)
+
+    def test_transitions_to_half_open_and_allows_one_test_buy_after_cooldown(self):
+        risk = make_manager()
+        self._fail_n_times(risk, CIRCUIT_BREAKER_FAILURE_THRESHOLD)
+        risk.state.circuit_breaker_opened_at -= CIRCUIT_BREAKER_COOLDOWN_SEC + 1
+
+        ok, _ = risk.can_trade(0.01, liquidity_sol=10)
+        self.assertTrue(ok)  # the one test buy gets through
+        self.assertEqual(risk.state.circuit_breaker_state, "half_open")
+
+        # a second check before the test buy resolves must be blocked -
+        # exactly one test buy at a time, not a flood of them
+        ok2, reason2 = risk.can_trade(0.01, liquidity_sol=10)
+        self.assertFalse(ok2)
+        self.assertIn("half-open", reason2)
+
+    def test_half_open_success_closes_the_breaker_and_clears_failures(self):
+        risk = make_manager()
+        self._fail_n_times(risk, CIRCUIT_BREAKER_FAILURE_THRESHOLD)
+        risk.state.circuit_breaker_opened_at -= CIRCUIT_BREAKER_COOLDOWN_SEC + 1
+        risk.can_trade(0.01, liquidity_sol=10)  # triggers the half-open transition
+        self.assertEqual(risk.state.circuit_breaker_state, "half_open")
+
+        asyncio.run(risk.report_buy_result(success=True))
+
+        self.assertEqual(risk.state.circuit_breaker_state, "closed")
+        self.assertEqual(risk.state.buy_failure_timestamps, [])
+        ok, _ = risk.can_trade(0.01, liquidity_sol=10)
+        self.assertTrue(ok)
+
+    def test_half_open_failure_reopens_with_a_fresh_cooldown(self):
+        risk = make_manager()
+        self._fail_n_times(risk, CIRCUIT_BREAKER_FAILURE_THRESHOLD)
+        risk.state.circuit_breaker_opened_at -= CIRCUIT_BREAKER_COOLDOWN_SEC + 1
+        risk.can_trade(0.01, liquidity_sol=10)  # triggers the half-open transition
+
+        asyncio.run(risk.report_buy_result(success=False))
+
+        self.assertEqual(risk.state.circuit_breaker_state, "open")
+        ok, _ = risk.can_trade(0.01, liquidity_sol=10)
+        self.assertFalse(ok)  # fresh cooldown, not immediately retestable
+
+    def test_half_open_with_no_result_reported_eventually_reopens(self):
+        # safety net: if the caller never reports back (e.g. an unrelated
+        # crash between can_trade() and report_buy_result()), don't stay
+        # stuck half-open forever, blocking every future trade
+        risk = make_manager()
+        self._fail_n_times(risk, CIRCUIT_BREAKER_FAILURE_THRESHOLD)
+        risk.state.circuit_breaker_opened_at -= CIRCUIT_BREAKER_COOLDOWN_SEC + 1
+        risk.can_trade(0.01, liquidity_sol=10)  # triggers the half-open transition
+        self.assertEqual(risk.state.circuit_breaker_state, "half_open")
+
+        risk.state.circuit_breaker_opened_at -= CIRCUIT_BREAKER_HALF_OPEN_TIMEOUT_SEC + 1
+        ok, _ = risk.can_trade(0.01, liquidity_sol=10)
+
+        self.assertFalse(ok)
+        self.assertEqual(risk.state.circuit_breaker_state, "open")
+
+    def test_breaker_never_blocks_selling(self):
+        # register_trade_closed (used on every sell) must never be gated by
+        # the breaker - it doesn't go through can_trade() at all, and has
+        # no circuit-breaker check of its own
+        risk = make_manager()
+        risk.register_trade_opened(0.03)
+        self._fail_n_times(risk, CIRCUIT_BREAKER_FAILURE_THRESHOLD)
+        self.assertEqual(risk.state.circuit_breaker_state, "open")
+
+        risk.register_trade_closed(0.03, pnl_sol=0.01)  # must not raise or be blocked
+        self.assertAlmostEqual(risk.state.open_exposure_sol, 0.0)
 
 
 if __name__ == "__main__":
