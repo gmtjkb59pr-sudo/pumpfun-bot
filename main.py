@@ -17,6 +17,7 @@ import base58
 from solders.keypair import Keypair
 
 from pumpfun_bot.alerts import Alerter
+from pumpfun_bot.auto_tuner import AutoTuner
 from pumpfun_bot.config import load_config
 from pumpfun_bot.dashboard_server import start_dashboard_server
 from pumpfun_bot.logger_setup import setup_logging
@@ -136,6 +137,15 @@ async def main() -> None:
         asyncio.create_task(market_maker.run()),
         asyncio.create_task(outcome_tracker.run()),
     ]
+
+    if cfg.sniper.enabled:
+        auto_tuner = AutoTuner(sniper_cfg=cfg.sniper, risk=risk, alerter=alerter)
+        logger.info(
+            "Auto-tuner gestart: past sniper-filters aan op basis van outcome-stats "
+            "(alleen strenger, nooit losser, zie pumpfun_bot/auto_tuner.py)."
+        )
+        tasks.append(asyncio.create_task(auto_tuner.run()))
+
     await asyncio.gather(*tasks)
 
 
