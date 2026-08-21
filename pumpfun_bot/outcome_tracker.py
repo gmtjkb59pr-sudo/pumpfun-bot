@@ -144,6 +144,15 @@ class OutcomeTracker:
     def _persist_pending(self) -> None:
         position_store.save(self._pending, self.position_store_path)
 
+    def open_position_count(self) -> int:
+        """The real, current number of positions actually being tracked -
+        the single source of truth for "is there room to buy another",
+        rather than a separately-incremented counter that can drift from
+        reality (e.g. if track() ever returns early - no price ref, an
+        already-tracked mint - a naive counter would still say a slot is
+        taken even though nothing is actually being held/managed there)."""
+        return len(self._pending)
+
     def is_tracking(self, mint: str) -> bool:
         """Whether a position for this mint is already open - strategies
         should check this BEFORE buying, not just before calling track(),

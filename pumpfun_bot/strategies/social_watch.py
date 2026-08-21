@@ -148,7 +148,12 @@ class SocialWatchStrategy:
             logger.info("Social-watch: %s wordt al gevolgd, sla over.", mint)
             return
 
-        ok, reason = self.risk.can_trade(self.trade_size_sol, liquidity_sol)
+        open_positions_count = (
+            self.outcome_tracker.open_position_count() if self.outcome_tracker is not None else None
+        )
+        ok, reason = self.risk.can_trade(
+            self.trade_size_sol, liquidity_sol, open_positions_count=open_positions_count,
+        )
         if not ok:
             logger.info("Social-watch: trade geblokkeerd door risk manager: %s", reason)
             return

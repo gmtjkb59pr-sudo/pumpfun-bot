@@ -18,7 +18,6 @@ logger = logging.getLogger("pumpfun_bot.risk")
 @dataclass
 class RiskState:
     open_exposure_sol: float = 0.0
-    open_positions_count: int = 0
     realized_pnl_sol: float = 0.0
     trade_timestamps: list = field(default_factory=list)
     day_start_ts: float = field(default_factory=time.time)
@@ -40,8 +39,19 @@ class RiskManager:
         self.state.trade_timestamps = [t for t in self.state.trade_timestamps if t > cutoff]
         return len(self.state.trade_timestamps)
 
-    def can_trade(self, sol_amount: float, liquidity_sol: float | None = None) -> tuple[bool, str]:
-        """Controleer of een voorgestelde trade toegestaan is. Geeft (ok, reden)."""
+    def can_trade(
+        self, sol_amount: float, liquidity_sol: float | None = None,
+        open_positions_count: int | None = None,
+    ) -> tuple[bool, str]:
+        """Controleer of een voorgestelde trade toegestaan is. Geeft (ok, reden).
+
+        open_positions_count should come from OutcomeTracker.open_position_count()
+        - the real, current count of tracked positions - not a separately
+        maintained counter here. A counter incremented on every buy and
+        decremented on every sell can drift from reality (e.g. a buy whose
+        track() call returns early never actually gets tracked, so it can
+        never be "sold" to free its slot back up) - "is there room" must
+        reflect what's actually held, not what was once assumed opened."""
         self._reset_day_if_needed()
 
         if sol_amount <= 0:
@@ -59,9 +69,9 @@ class RiskManager:
                 f"brengen, max is {self.cfg.max_sol_total_exposure}."
             )
 
-        if self.state.open_positions_count >= self.cfg.max_open_positions:
+        if open_positions_count is not None and open_positions_count >= self.cfg.max_open_positions:
             return False, (
-                f"Al {self.state.open_positions_count} open posities, max is "
+                f"Al {open_positions_count} open posities, max is "
                 f"{self.cfg.max_open_positions}."
             )
 
@@ -83,13 +93,11 @@ class RiskManager:
 
     def register_trade_opened(self, sol_amount: float) -> None:
         self.state.open_exposure_sol += sol_amount
-        self.state.open_positions_count += 1
         self.state.trade_timestamps.append(time.time())
         self._sync_dashboard()
 
     def register_trade_closed(self, sol_amount: float, pnl_sol: float) -> None:
         self.state.open_exposure_sol = max(0.0, self.state.open_exposure_sol - sol_amount)
-        self.state.open_positions_count = max(0, self.state.open_positions_count - 1)
         self.state.realized_pnl_sol += pnl_sol
         logger.info(
             "Trade gesloten: pnl=%.4f SOL | dag totaal pnl=%.4f SOL | open exposure=%.4f SOL",
