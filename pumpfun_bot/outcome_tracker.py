@@ -55,6 +55,7 @@ from .price_ref import extract_price_ref
 from .pumpportal_client import authenticated_ws_url
 from .risk import RiskManager
 from .state import bot_state
+from .wallet_reconciliation import fetch_wallet_token_mints
 
 logger = logging.getLogger("pumpfun_bot.outcome_tracker")
 
@@ -80,6 +81,14 @@ STALE_PRICE_TIMEOUT_SEC = 10
 # matches STALE_PRICE_TIMEOUT_SEC so a position isn't force-detected as
 # stale well before a sell attempt could ever actually succeed.
 MIN_SELL_DELAY_SEC = 15
+# how often to reconcile _pending against real wallet holdings - not just
+# once at startup, since drift can happen any time a position gets closed
+# outside the bot's own exit logic (e.g. a manual sale). Found live: a
+# manually-sold position kept getting retried forever, since nothing was
+# selling anything, there was nothing left to sell - each retry still cost
+# a real fee failing with SellZeroAmount, for a position that was already
+# gone. Not too frequent - this is a real RPC call, not free.
+WALLET_RECONCILE_INTERVAL_SEC = 60
 
 EXIT_EMOJI = {
     "take_profit": "🟢", "stop_loss": "🔴", "trailing_stop": "🟡", "timeout": "⏱️",
@@ -142,6 +151,7 @@ class OutcomeTracker:
         self._post_exit: dict[str, dict] = {}
         self._lock = asyncio.Lock()
         self._warned_no_access = False
+        self._last_wallet_reconcile_ts = 0.0
 
     def load_pending(self) -> None:
         """Reconstructs _pending from disk - call once at startup, before
@@ -243,6 +253,8 @@ class OutcomeTracker:
 
     async def run(self) -> None:
         while True:
+            await self._reconcile_with_wallet_if_due()
+
             async with self._lock:
                 mints = list(self._pending.keys()) + list(self._post_exit.keys())
 
@@ -254,6 +266,63 @@ class OutcomeTracker:
             await self._emit_due_checkpoints()
             await self._emit_post_exit_checkpoints()
             await asyncio.sleep(IDLE_SLEEP_SEC)
+
+    async def _reconcile_with_wallet_if_due(self) -> None:
+        if self.dry_run or self.client is None:
+            return  # dry-run never touches the real wallet, nothing to check
+        now = time.time()
+        if now - self._last_wallet_reconcile_ts < WALLET_RECONCILE_INTERVAL_SEC:
+            return
+        self._last_wallet_reconcile_ts = now
+        await self._reconcile_with_wallet()
+
+    async def _reconcile_with_wallet(self) -> None:
+        """Keeps _pending in sync with what the wallet actually holds, in
+        both directions - not just once at startup, since drift can happen
+        any time a position closes outside the bot's own exit logic (a
+        manual sale, or anything else). A position the wallet no longer
+        holds gets dropped from tracking (nothing left to sell there,
+        retrying forever just burns fees failing with SellZeroAmount); a
+        wallet holding the bot isn't tracking gets surfaced so it can be
+        checked manually - it isn't auto-adopted, since we have no idea
+        what price it was bought at or what strategy (if any) intended it."""
+        async with self._lock:
+            tracked = set(self._pending.keys())
+
+        held = await fetch_wallet_token_mints(str(self.client.keypair.pubkey()), self.client.rpc_http_url)
+        if held is None:
+            logger.debug("Kon wallet niet verifiëren voor reconciliatie, sla deze ronde over.")
+            return
+
+        stale = tracked - held
+        untracked = held - tracked
+
+        if stale:
+            async with self._lock:
+                for mint in stale:
+                    info = self._pending.pop(mint, None)
+                    if info is not None and self.risk is not None and info.get("trade_size_sol"):
+                        # genuinely unknown what it sold for (if anything) -
+                        # release the exposure slot without guessing a P&L
+                        self.risk.register_trade_closed(info["trade_size_sol"], 0.0)
+                self._persist_pending()
+            message = (
+                f"🔄 {len(stale)} positie(s) niet meer echt in de wallet (waarschijnlijk "
+                f"handmatig verkocht) - gestopt met volgen, niet langer geteld tegen "
+                f"max_open_positions/exposure: {', '.join(sorted(stale))}"
+            )
+            logger.warning(message)
+            if self.alerter is not None:
+                await self.alerter.send(message)
+
+        if untracked:
+            message = (
+                f"⚠️ {len(untracked)} token(s) in de wallet worden niet gevolgd - "
+                f"controleer handmatig: {', '.join(sorted(untracked))}"
+            )
+            logger.warning(message)
+            if self.alerter is not None:
+                await self.alerter.send(message)
 
     async def _poll_once(self, mints: list[str]) -> None:
         try:

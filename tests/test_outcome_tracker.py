@@ -3,6 +3,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import pumpfun_bot.activity_log as activity_log
 import pumpfun_bot.position_store as position_store
@@ -53,6 +54,11 @@ def tearDownModule():
         Path(_TEST_STORE_FILE.name).unlink(missing_ok=True)
 
 
+class _FakeKeypair:
+    def pubkey(self):
+        return "FAKE_WALLET_PUBKEY"
+
+
 class FakeClient:
     """Stands in for PumpPortalClient - no real network calls."""
 
@@ -60,6 +66,8 @@ class FakeClient:
         self.should_fail = should_fail
         self.signature = signature
         self.sell_calls = []
+        self.keypair = _FakeKeypair()
+        self.rpc_http_url = "https://example.invalid/rpc"
 
     async def build_and_send_full_sell(self, mint, slippage_pct):
         self.sell_calls.append((mint, slippage_pct))
@@ -548,6 +556,96 @@ class MinSellDelayTests(unittest.TestCase):
 
         self.assertEqual(len(client.sell_calls), 1)
         self.assertNotIn("MINT", tracker._pending)
+
+
+class ReconcileWithWalletTests(unittest.TestCase):
+    """Real bug found live: a manually-sold position kept getting retried
+    forever - nothing was left to sell, so every attempt failed with
+    SellZeroAmount and still cost a real fee. _reconcile_with_wallet() must
+    drop tracking for anything the wallet no longer actually holds, and
+    surface (without auto-adopting) anything held that isn't tracked."""
+
+    def _make_tracker(self):
+        risk = RiskManager(RiskConfig())
+        risk.register_trade_opened(0.03)
+        client = FakeClient()
+        tracker = OutcomeTracker(ws_url="wss://example.invalid", risk=risk, client=client, dry_run=False)
+        tracker._pending["SOLD_MINT"] = {
+            "entry_ts": time.time(), "entry_ref": 100.0, "last_ref": 100.0, "peak_ref": 100.0,
+            "name": "Sold Elsewhere", "symbol": "SOLD", "trade_size_sol": 0.03,
+            "hit": set(), "has_real_update": False,
+        }
+        return tracker, risk
+
+    def test_drops_a_position_the_wallet_no_longer_holds(self):
+        tracker, risk = self._make_tracker()
+
+        async def _fake_fetch(wallet_pubkey, rpc_http_url):
+            return set()  # wallet holds nothing
+
+        with patch("pumpfun_bot.outcome_tracker.fetch_wallet_token_mints", _fake_fetch):
+            asyncio.run(tracker._reconcile_with_wallet())
+
+        self.assertNotIn("SOLD_MINT", tracker._pending)
+        self.assertAlmostEqual(risk.state.open_exposure_sol, 0.0)  # slot released
+
+    def test_keeps_a_position_the_wallet_still_holds(self):
+        tracker, risk = self._make_tracker()
+
+        async def _fake_fetch(wallet_pubkey, rpc_http_url):
+            return {"SOLD_MINT"}
+
+        with patch("pumpfun_bot.outcome_tracker.fetch_wallet_token_mints", _fake_fetch):
+            asyncio.run(tracker._reconcile_with_wallet())
+
+        self.assertIn("SOLD_MINT", tracker._pending)
+        self.assertAlmostEqual(risk.state.open_exposure_sol, 0.03)
+
+    def test_does_nothing_when_the_lookup_fails(self):
+        # unknown state, not "wallet holds nothing" - must not drop anything
+        tracker, risk = self._make_tracker()
+
+        async def _fake_fetch(wallet_pubkey, rpc_http_url):
+            return None
+
+        with patch("pumpfun_bot.outcome_tracker.fetch_wallet_token_mints", _fake_fetch):
+            asyncio.run(tracker._reconcile_with_wallet())
+
+        self.assertIn("SOLD_MINT", tracker._pending)
+        self.assertAlmostEqual(risk.state.open_exposure_sol, 0.03)
+
+    def test_dry_run_never_calls_the_wallet(self):
+        risk = RiskManager(RiskConfig())
+        client = FakeClient()
+        tracker = OutcomeTracker(ws_url="wss://example.invalid", risk=risk, client=client, dry_run=True)
+        with patch("pumpfun_bot.outcome_tracker.fetch_wallet_token_mints") as mock_fetch:
+            asyncio.run(tracker._reconcile_with_wallet_if_due())
+            mock_fetch.assert_not_called()
+
+    def test_skips_reconciliation_before_the_interval_elapses(self):
+        risk = RiskManager(RiskConfig())
+        client = FakeClient()
+        tracker = OutcomeTracker(ws_url="wss://example.invalid", risk=risk, client=client, dry_run=False)
+        tracker._last_wallet_reconcile_ts = time.time()  # just reconciled
+        with patch("pumpfun_bot.outcome_tracker.fetch_wallet_token_mints") as mock_fetch:
+            asyncio.run(tracker._reconcile_with_wallet_if_due())
+            mock_fetch.assert_not_called()
+
+    def test_reconciles_once_the_interval_has_passed(self):
+        from pumpfun_bot.outcome_tracker import WALLET_RECONCILE_INTERVAL_SEC
+
+        risk = RiskManager(RiskConfig())
+        client = FakeClient()
+        tracker = OutcomeTracker(ws_url="wss://example.invalid", risk=risk, client=client, dry_run=False)
+        tracker._last_wallet_reconcile_ts = time.time() - WALLET_RECONCILE_INTERVAL_SEC - 1
+
+        async def _fake_fetch(wallet_pubkey, rpc_http_url):
+            return set()
+
+        with patch("pumpfun_bot.outcome_tracker.fetch_wallet_token_mints", _fake_fetch):
+            asyncio.run(tracker._reconcile_with_wallet_if_due())
+
+        self.assertGreater(tracker._last_wallet_reconcile_ts, time.time() - 1)
 
 
 class LiveExitTests(unittest.TestCase):
