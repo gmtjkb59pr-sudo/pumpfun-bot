@@ -64,10 +64,13 @@ IDLE_SLEEP_SEC = 5
 # don't hammer a failing real sell on every single price tick - back off
 # between attempts, but keep retrying rather than giving up
 EXIT_RETRY_COOLDOWN_SEC = 15
+# no real trade event for this mint in this long -> likely dead/rugged, exit
+# well before the full MAX_HOLD_SEC timeout instead of holding a dead token
+STALE_PRICE_TIMEOUT_SEC = 120
 
 EXIT_EMOJI = {
     "take_profit": "🟢", "stop_loss": "🔴", "trailing_stop": "🟡", "timeout": "⏱️",
-    "timeout_unmeasured": "❔",
+    "timeout_unmeasured": "❔", "stale_price": "💤", "stale_price_unmeasured": "💤",
 }
 
 
@@ -127,8 +130,9 @@ class OutcomeTracker:
             logger.debug("Geen price-ref beschikbaar voor %s, sla outcome-tracking over.", mint)
             return
         async with self._lock:
+            now = time.time()
             self._pending[mint] = {
-                "entry_ts": time.time(),
+                "entry_ts": now,
                 "entry_ref": entry_ref,
                 "last_ref": entry_ref,
                 "peak_ref": entry_ref,
@@ -140,6 +144,10 @@ class OutcomeTracker:
                 # without this, a rejected/empty subscription would silently look
                 # like "0% change" instead of "never measured"
                 "has_real_update": False,
+                # last time we got ANY real trade event for this mint - used to
+                # detect a token that's gone quiet (likely dead/rugged) well
+                # before the full MAX_HOLD_SEC timeout
+                "last_update_ts": now,
             }
 
     async def run(self) -> None:
@@ -210,6 +218,7 @@ class OutcomeTracker:
             info = self._pending.get(mint)
             if info is not None:
                 info["last_ref"] = ref
+                info["last_update_ts"] = time.time()
                 info["has_real_update"] = True
                 if ref > info["peak_ref"]:
                     info["peak_ref"] = ref
@@ -376,6 +385,32 @@ class OutcomeTracker:
                         "measured": info["has_real_update"],
                     })
                     info["hit"].add(cp)
+
+                last_update_age = now - info.get("last_update_ts", info["entry_ts"])
+                if last_update_age >= STALE_PRICE_TIMEOUT_SEC:
+                    # no real trade event for STALE_PRICE_TIMEOUT_SEC - likely
+                    # dead/rugged, don't wait for the full MAX_HOLD_SEC timeout
+                    if info["has_real_update"]:
+                        if self._exit_attempt_allowed(info):
+                            pct_change = round(
+                                ((info["last_ref"] - info["entry_ref"]) / info["entry_ref"]) * 100, 2
+                            )
+                            to_timeout_exit.append((mint, dict(info), "stale_price", pct_change))
+                    elif self.dry_run:
+                        finished_mints.append(mint)
+                    elif self._exit_attempt_allowed(info):
+                        if not info.get("no_data_warned"):
+                            info["no_data_warned"] = True
+                            logger.error(
+                                "LIVE positie %s (%s) heeft na %ds nog geen koersdata - "
+                                "forceer verkoop blind (stale), resultaat wordt als "
+                                "'unmeasured' gelogd.",
+                                info["symbol"], mint, STALE_PRICE_TIMEOUT_SEC,
+                            )
+                            no_data_warnings.append(info["symbol"])
+                        to_timeout_exit.append((mint, dict(info), "stale_price_unmeasured", None))
+                    continue
+
                 if age >= MAX_HOLD_SEC:
                     if info["has_real_update"]:
                         if self._exit_attempt_allowed(info):
