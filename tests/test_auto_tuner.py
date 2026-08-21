@@ -3,8 +3,8 @@ import unittest
 from pumpfun_bot.auto_tuner import MIN_SAMPLES, decide_adjustments
 
 
-def make_bucket(count, avg_pct_change):
-    return {"count": count, "avg_pct_change": avg_pct_change, "win_rate_pct": 50.0}
+def make_bucket(count, median_pct_change):
+    return {"count": count, "median_pct_change": median_pct_change, "win_rate_pct": 50.0}
 
 
 def make_stats(overall, by_socials=None, by_liquidity=None, checkpoint_sec=300):

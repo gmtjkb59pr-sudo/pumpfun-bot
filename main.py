@@ -67,7 +67,12 @@ async def main() -> None:
     )
 
     outcome_tracker = OutcomeTracker(
-        ws_url=cfg.pumpportal_ws_url, api_key=cfg.pumpportal_api_key, risk=risk
+        ws_url=cfg.pumpportal_ws_url,
+        api_key=cfg.pumpportal_api_key,
+        risk=risk,
+        alerter=alerter,
+        take_profit_pct=cfg.sniper.take_profit_pct,
+        stop_loss_pct=cfg.sniper.stop_loss_pct,
     )
 
     sniper = SniperStrategy(

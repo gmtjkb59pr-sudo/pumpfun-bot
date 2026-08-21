@@ -59,5 +59,58 @@ class ClosesPositionAtFinalCheckpointTests(unittest.TestCase):
         self.assertAlmostEqual(risk.state.realized_pnl_sol, 0.0)
 
 
+class TakeProfitStopLossExitTests(unittest.TestCase):
+    def _make_tracker(self, *, take_profit_pct=50.0, stop_loss_pct=25.0, entry_ref=100.0):
+        risk = RiskManager(RiskConfig())
+        risk.register_trade_opened(0.05)
+        tracker = OutcomeTracker(
+            ws_url="wss://example.invalid", risk=risk,
+            take_profit_pct=take_profit_pct, stop_loss_pct=stop_loss_pct,
+        )
+        tracker._pending["MINT"] = {
+            "entry_ts": time.time(),
+            "entry_ref": entry_ref,
+            "last_ref": entry_ref,
+            "name": "Test Token",
+            "symbol": "TEST",
+            "trade_size_sol": 0.05,
+            "hit": set(),
+            "has_real_update": False,
+        }
+        return tracker, risk
+
+    def test_take_profit_closes_position_immediately(self):
+        tracker, risk = self._make_tracker(take_profit_pct=50.0, entry_ref=100.0)
+        asyncio.run(tracker._handle_price_update("MINT", 151.0))  # +51%, crosses +50%
+
+        self.assertNotIn("MINT", tracker._pending)
+        self.assertAlmostEqual(risk.state.open_exposure_sol, 0.0)
+        self.assertAlmostEqual(risk.state.realized_pnl_sol, 0.05 * 0.51, places=4)
+
+    def test_stop_loss_closes_position_immediately(self):
+        tracker, risk = self._make_tracker(stop_loss_pct=25.0, entry_ref=100.0)
+        asyncio.run(tracker._handle_price_update("MINT", 70.0))  # -30%, crosses -25%
+
+        self.assertNotIn("MINT", tracker._pending)
+        self.assertAlmostEqual(risk.state.open_exposure_sol, 0.0)
+        self.assertAlmostEqual(risk.state.realized_pnl_sol, 0.05 * -0.30, places=4)
+
+    def test_small_move_does_not_trigger_exit(self):
+        tracker, risk = self._make_tracker(take_profit_pct=50.0, stop_loss_pct=25.0, entry_ref=100.0)
+        asyncio.run(tracker._handle_price_update("MINT", 110.0))  # +10%, neither threshold
+
+        self.assertIn("MINT", tracker._pending)
+        self.assertAlmostEqual(risk.state.open_exposure_sol, 0.05)
+        self.assertAlmostEqual(risk.state.realized_pnl_sol, 0.0)
+        self.assertTrue(tracker._pending["MINT"]["has_real_update"])
+        self.assertEqual(tracker._pending["MINT"]["last_ref"], 110.0)
+
+    def test_ignores_updates_for_untracked_mints(self):
+        tracker, risk = self._make_tracker()
+        # should not raise even though "OTHER" was never tracked
+        asyncio.run(tracker._handle_price_update("OTHER", 999.0))
+        self.assertNotIn("OTHER", tracker._pending)
+
+
 if __name__ == "__main__":
     unittest.main()

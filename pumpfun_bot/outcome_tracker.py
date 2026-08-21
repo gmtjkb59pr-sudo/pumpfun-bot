@@ -1,9 +1,14 @@
 """
-Follows up on simulated buys to see what actually happened to the token's
-price afterward, so there's real signal to learn from instead of just a log
-of what the bot would have bought. Records a percentage change (vs. the
-price_ref proxy at entry) at a few checkpoints after each tracked buy, into
-the same activity_log.jsonl the rest of the bot writes to.
+Follows up on simulated buys with an actual exit strategy - take-profit,
+stop-loss, or a timeout - instead of just watching price drift forever.
+This is what makes the bot's simulated P&L mean something: measuring raw
+buy-and-hold price movement doesn't tell you whether a strategy is
+profitable, because real trading is entries AND exits.
+
+Also still records informational price-drift checkpoints (60s/300s/900s)
+for tokens that haven't exited yet, for the dashboard's Learning Stats
+panel - these are separate from the exit events that actually close a
+position and register P&L.
 
 Runs as a single long-lived background task shared across all tracked mints,
 rather than one connection per mint, to keep the number of open websockets
@@ -19,6 +24,7 @@ import time
 import websockets
 
 from .activity_log import append_jsonl
+from .alerts import Alerter
 from .price_ref import extract_price_ref
 from .pumpportal_client import authenticated_ws_url
 from .risk import RiskManager
@@ -27,8 +33,11 @@ from .state import bot_state
 logger = logging.getLogger("pumpfun_bot.outcome_tracker")
 
 CHECKPOINTS_SEC = (60, 300, 900)
+MAX_HOLD_SEC = CHECKPOINTS_SEC[-1]
 POLL_WINDOW_SEC = 20
 IDLE_SLEEP_SEC = 5
+
+EXIT_EMOJI = {"take_profit": "🟢", "stop_loss": "🔴", "timeout": "⏱️"}
 
 
 def is_funded_key_rejection(message: str) -> bool:
@@ -39,13 +48,24 @@ def is_funded_key_rejection(message: str) -> bool:
 
 
 class OutcomeTracker:
-    def __init__(self, ws_url: str, api_key: str = "", risk: RiskManager | None = None):
+    def __init__(
+        self,
+        ws_url: str,
+        api_key: str = "",
+        risk: RiskManager | None = None,
+        alerter: Alerter | None = None,
+        take_profit_pct: float = 50.0,
+        stop_loss_pct: float = 25.0,
+    ):
         self.ws_url = ws_url
         self.api_key = api_key
         # closes the simulated position (feeds P&L back into the risk
-        # manager/dashboard) once a tracked mint reaches its final checkpoint
-        # with real measured data - optional so tests/simple usage don't need one
+        # manager/dashboard) on exit - optional so tests/simple usage don't
+        # need one
         self.risk = risk
+        self.alerter = alerter
+        self.take_profit_pct = take_profit_pct
+        self.stop_loss_pct = stop_loss_pct
         self._pending: dict[str, dict] = {}
         self._lock = asyncio.Lock()
         self._warned_no_access = False
@@ -124,15 +144,55 @@ class OutcomeTracker:
                             # working now, despite an earlier rejection
                             self._warned_no_access = False
                             bot_state.set_outcome_tracking_rejected(False)
-                        async with self._lock:
-                            if mint in self._pending:
-                                self._pending[mint]["last_ref"] = ref
-                                self._pending[mint]["has_real_update"] = True
+                        await self._handle_price_update(mint, ref)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Outcome tracker WS fout (probeer volgende ronde opnieuw): %s", exc)
 
+    async def _handle_price_update(self, mint: str, ref: float) -> None:
+        """Records the new price and exits the position immediately if it
+        crosses take-profit or stop-loss. Separated from _poll_once so this
+        decision logic can be exercised directly in tests."""
+        exit_args = None
+        async with self._lock:
+            info = self._pending.get(mint)
+            if info is None:
+                return
+            info["last_ref"] = ref
+            info["has_real_update"] = True
+            pct_change = ((ref - info["entry_ref"]) / info["entry_ref"]) * 100
+            if pct_change >= self.take_profit_pct:
+                exit_args = (mint, dict(info), "take_profit", pct_change)
+            elif pct_change <= -self.stop_loss_pct:
+                exit_args = (mint, dict(info), "stop_loss", pct_change)
+            if exit_args:
+                del self._pending[mint]
+        if exit_args:
+            await self._exit(*exit_args)
+
+    async def _exit(self, mint: str, info: dict, reason: str, pct_change: float) -> None:
+        pct_change = round(pct_change, 2)
+        if self.risk is not None and info["trade_size_sol"]:
+            pnl_sol = round(info["trade_size_sol"] * (pct_change / 100), 6)
+            self.risk.register_trade_closed(info["trade_size_sol"], pnl_sol)
+        append_jsonl({
+            "type": "exit",
+            "ts": time.time(),
+            "mint": mint,
+            "name": info["name"],
+            "symbol": info["symbol"],
+            "reason": reason,
+            "pct_change": pct_change,
+            "trade_size_sol": info["trade_size_sol"],
+        })
+        if self.alerter is not None:
+            emoji = EXIT_EMOJI.get(reason, "")
+            await self.alerter.send(
+                f"{emoji} Exit ({reason}): {info['name']} ({info['symbol']}) @ {pct_change:+.1f}%"
+            )
+
     async def _emit_due_checkpoints(self) -> None:
         now = time.time()
+        to_timeout_exit = []
         async with self._lock:
             finished_mints = []
             for mint, info in self._pending.items():
@@ -147,7 +207,8 @@ class OutcomeTracker:
                     else:
                         # never received a real trade event for this mint (most
                         # likely subscribeTokenTrade was rejected for lack of a
-                        # funded API key) - record as unmeasured, not "0% change"
+                        # funded API key, or the token just had zero trades) -
+                        # record as unmeasured, not "0% change"
                         pct_change = None
                     append_jsonl({
                         "type": "outcome",
@@ -162,20 +223,14 @@ class OutcomeTracker:
                         "measured": info["has_real_update"],
                     })
                     info["hit"].add(cp)
-
-                    # at the final checkpoint, close the simulated position so
-                    # the result shows up in the dashboard's P&L/exposure -
-                    # only when we actually measured something real; an
-                    # unmeasured mint is left open rather than faking a result
-                    if (
-                        cp == CHECKPOINTS_SEC[-1]
-                        and info["has_real_update"]
-                        and self.risk is not None
-                        and info["trade_size_sol"]
-                    ):
-                        pnl_sol = round(info["trade_size_sol"] * (pct_change / 100), 6)
-                        self.risk.register_trade_closed(info["trade_size_sol"], pnl_sol)
-                if len(info["hit"]) == len(CHECKPOINTS_SEC):
+                if age >= MAX_HOLD_SEC:
                     finished_mints.append(mint)
+                    if info["has_real_update"]:
+                        pct_change = round(
+                            ((info["last_ref"] - info["entry_ref"]) / info["entry_ref"]) * 100, 2
+                        )
+                        to_timeout_exit.append((mint, dict(info), "timeout", pct_change))
             for mint in finished_mints:
                 del self._pending[mint]
+        for mint, info, reason, pct_change in to_timeout_exit:
+            await self._exit(mint, info, reason, pct_change)
