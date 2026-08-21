@@ -17,12 +17,18 @@ first, set a real threshold once there's evidence.
 Fetched via a filtered getProgramAccounts call on the Token-2022 program
 (confirmed all pump.fun token accounts observed today use it, not the
 legacy SPL Token program) rather than getTokenLargestAccounts, which caps
-at 20 and undercounts any token with more holders than that. The dataSize
-filter (170 bytes) matches the token-account layout observed on real
-pump.fun tokens today (base 165 bytes + the immutableOwner extension) -
-this counts token ACCOUNTS, a close proxy for holder count since a wallet
-normally holds at most one associated token account per mint, but isn't a
-strictly guaranteed 1:1 mapping.
+at 20 and undercounts any token with more holders than that. This counts
+token ACCOUNTS, a close proxy for holder count since a wallet normally
+holds at most one associated token account per mint, but isn't a strictly
+guaranteed 1:1 mapping.
+
+Earlier tried adding a dataSize:170 filter (matching one real pump.fun
+token-account layout observed) to narrow the getProgramAccounts scan, but
+found - by comparing filtered vs unfiltered results on a real mint - that
+it silently excluded about half the real holder accounts (170 bytes isn't
+the only valid layout; accounts with a different extension set land on a
+different size). Undercounting by ~50% is worse than the extra RPC-side
+scan cost, so this only filters on the mint itself now.
 """
 from __future__ import annotations
 
@@ -37,7 +43,6 @@ from .activity_log import append_jsonl
 logger = logging.getLogger("pumpfun_bot.holder_count")
 
 TOKEN_2022_PROGRAM_ID = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
-PUMPFUN_TOKEN_ACCOUNT_DATA_SIZE = 170
 # getProgramAccounts' index lags behind the live chain state - confirmed
 # directly by re-checking a mint minutes after logging 0 holders right after
 # our own buy and finding 7 real holders. Checking immediately after a buy
@@ -61,7 +66,6 @@ async def fetch_holder_count(mint: str, rpc_http_url: str, timeout_sec: float = 
                 "encoding": "base64",
                 "dataSlice": {"offset": 0, "length": 0},
                 "filters": [
-                    {"dataSize": PUMPFUN_TOKEN_ACCOUNT_DATA_SIZE},
                     {"memcmp": {"offset": 0, "bytes": mint}},
                 ],
             },
