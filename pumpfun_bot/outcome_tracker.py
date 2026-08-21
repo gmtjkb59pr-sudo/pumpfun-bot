@@ -47,6 +47,7 @@ import time
 
 import websockets
 
+from . import position_store
 from .activity_log import append_jsonl
 from .alerts import Alerter
 from .fees import ROUND_TRIP_PRIORITY_FEE_SOL, net_pct_change_after_fees
@@ -95,6 +96,7 @@ class OutcomeTracker:
         client=None,
         dry_run: bool = True,
         sell_slippage_pct: float = 10.0,
+        position_store_path=None,
     ):
         self.ws_url = ws_url
         self.api_key = api_key
@@ -115,6 +117,10 @@ class OutcomeTracker:
         self.client = client
         self.dry_run = dry_run
         self.sell_slippage_pct = sell_slippage_pct
+        # resolved at construction time, not import time, so tests (and
+        # anything else) can point position_store.DEFAULT_STORE_PATH
+        # elsewhere before any OutcomeTracker is constructed
+        self.position_store_path = position_store_path or position_store.DEFAULT_STORE_PATH
         self._pending: dict[str, dict] = {}
         # mints that already exited - kept under passive observation (no
         # P&L/exposure effect, already realized) purely to answer "would
@@ -122,6 +128,21 @@ class OutcomeTracker:
         self._post_exit: dict[str, dict] = {}
         self._lock = asyncio.Lock()
         self._warned_no_access = False
+
+    def load_pending(self) -> None:
+        """Reconstructs _pending from disk - call once at startup, before
+        run(), so a restart resumes tracking real open positions instead of
+        silently abandoning them (see position_store.py module docstring)."""
+        loaded = position_store.load(self.position_store_path)
+        if loaded:
+            logger.warning(
+                "%d open positie(s) hersteld van vorige run: %s",
+                len(loaded), ", ".join(loaded.keys()),
+            )
+        self._pending.update(loaded)
+
+    def _persist_pending(self) -> None:
+        position_store.save(self._pending, self.position_store_path)
 
     async def track(
         self, mint: str, name: str, symbol: str, entry_ref: float | None, trade_size_sol: float = 0.0
@@ -149,6 +170,7 @@ class OutcomeTracker:
                 # before the full MAX_HOLD_SEC timeout
                 "last_update_ts": now,
             }
+            self._persist_pending()
 
     async def run(self) -> None:
         while True:
@@ -238,6 +260,7 @@ class OutcomeTracker:
                     triggered_reason = "trailing_stop"
                 if triggered_reason and self._exit_attempt_allowed(info):
                     exit_args = (mint, dict(info), triggered_reason, pct_change)
+                self._persist_pending()
 
             post = self._post_exit.get(mint)
             if post is not None:
@@ -263,6 +286,7 @@ class OutcomeTracker:
         if closed:
             async with self._lock:
                 self._pending.pop(mint, None)
+                self._persist_pending()
 
     async def _exit(self, mint: str, info: dict, reason: str, pct_change: float) -> bool:
         """Returns True if the position is now closed (simulated close, or a
@@ -440,6 +464,8 @@ class OutcomeTracker:
                         to_timeout_exit.append((mint, dict(info), "timeout_unmeasured", None))
             for mint in finished_mints:
                 del self._pending[mint]
+            if finished_mints:
+                self._persist_pending()
         for mint, info, reason, pct_change in to_timeout_exit:
             await self._attempt_exit(mint, info, reason, pct_change)
         if self.alerter is not None:

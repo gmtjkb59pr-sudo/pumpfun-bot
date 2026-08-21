@@ -79,6 +79,7 @@ async def main() -> None:
         dry_run=cfg.risk.dry_run,
         sell_slippage_pct=cfg.risk.default_slippage_pct,
     )
+    outcome_tracker.load_pending()
 
     sniper = SniperStrategy(
         client=PumpPortalClient(cfg.pumpportal_ws_url, cfg.pumpportal_trade_api_url,

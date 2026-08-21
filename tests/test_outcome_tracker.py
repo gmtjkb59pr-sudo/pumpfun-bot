@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 import pumpfun_bot.activity_log as activity_log
+import pumpfun_bot.position_store as position_store
 from pumpfun_bot.config import RiskConfig
 from pumpfun_bot.fees import ROUND_TRIP_PRIORITY_FEE_SOL, net_pct_change_after_fees
 from pumpfun_bot.outcome_tracker import (
@@ -20,24 +21,35 @@ def _net_pnl_sol(trade_size_sol: float, gross_pct_change: float) -> float:
     return round(trade_size_sol * (net_pct_change_after_fees(gross_pct_change) / 100), 6)
 
 _ORIGINAL_DATA_LOG_PATH = activity_log.DATA_LOG_PATH
+_ORIGINAL_STORE_PATH = position_store.DEFAULT_STORE_PATH
 _TEST_LOG_FILE = None
+_TEST_STORE_FILE = None
 
 
 def setUpModule():
-    # append_jsonl() always writes to activity_log.DATA_LOG_PATH - most tests
-    # in this file exercise the real un-mocked path (only a couple of tests
-    # mock append_jsonl directly), so without this every run of this module
-    # would append junk "MINT" records into the real, live activity_log.jsonl
-    global _TEST_LOG_FILE
+    # append_jsonl() always writes to activity_log.DATA_LOG_PATH, and
+    # OutcomeTracker persists open positions to position_store.DEFAULT_STORE_PATH
+    # by default - most tests in this file exercise the real un-mocked paths,
+    # so without this every run of this module would write junk records into
+    # the real, live activity_log.jsonl / data/open_positions.json
+    global _TEST_LOG_FILE, _TEST_STORE_FILE
     _TEST_LOG_FILE = tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False)
     _TEST_LOG_FILE.close()
     activity_log.DATA_LOG_PATH = Path(_TEST_LOG_FILE.name)
+
+    _TEST_STORE_FILE = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
+    _TEST_STORE_FILE.close()
+    position_store.DEFAULT_STORE_PATH = Path(_TEST_STORE_FILE.name)
 
 
 def tearDownModule():
     activity_log.DATA_LOG_PATH = _ORIGINAL_DATA_LOG_PATH
     if _TEST_LOG_FILE is not None:
         Path(_TEST_LOG_FILE.name).unlink(missing_ok=True)
+
+    position_store.DEFAULT_STORE_PATH = _ORIGINAL_STORE_PATH
+    if _TEST_STORE_FILE is not None:
+        Path(_TEST_STORE_FILE.name).unlink(missing_ok=True)
 
 
 class FakeClient:
@@ -135,6 +147,67 @@ class ClosesPositionAtFinalCheckpointTests(unittest.TestCase):
         # unknown price -> 0 pnl from the trade itself, but the real priority
         # fee on the forced sell (and its earlier buy) still gets subtracted
         self.assertAlmostEqual(risk.state.realized_pnl_sol, -ROUND_TRIP_PRIORITY_FEE_SOL)
+
+
+class PositionPersistenceAcrossRestartTests(unittest.TestCase):
+    """A restart used to silently abandon whatever was open at that exact
+    moment - the position was never sold wrong, it was just never looked at
+    again by any process. This is the regression guard for the fix: a new
+    OutcomeTracker instance pointed at the same store file must pick up
+    exactly where the old one left off."""
+
+    def _store_path(self):
+        f = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
+        f.close()
+        path = Path(f.name)
+        self.addCleanup(lambda: path.unlink(missing_ok=True))
+        return path
+
+    def test_new_instance_resumes_a_position_the_old_one_opened(self):
+        path = self._store_path()
+
+        tracker_before_restart = OutcomeTracker(
+            ws_url="wss://example.invalid", position_store_path=path,
+        )
+        asyncio.run(tracker_before_restart.track(
+            "MINT", "Test Token", "TEST", entry_ref=100.0, trade_size_sol=0.03,
+        ))
+        # simulates the process dying right here - tracker_before_restart is
+        # simply discarded, nothing more happens to it
+
+        tracker_after_restart = OutcomeTracker(
+            ws_url="wss://example.invalid", position_store_path=path,
+        )
+        tracker_after_restart.load_pending()
+
+        self.assertIn("MINT", tracker_after_restart._pending)
+        self.assertEqual(tracker_after_restart._pending["MINT"]["entry_ref"], 100.0)
+        self.assertEqual(tracker_after_restart._pending["MINT"]["trade_size_sol"], 0.03)
+
+    def test_a_closed_position_is_not_resumed_after_restart(self):
+        path = self._store_path()
+        risk = RiskManager(RiskConfig())
+        risk.register_trade_opened(0.05)
+        tracker_before_restart = OutcomeTracker(
+            ws_url="wss://example.invalid", risk=risk, position_store_path=path,
+            take_profit_pct=50.0,
+        )
+        asyncio.run(tracker_before_restart.track(
+            "MINT", "Test Token", "TEST", entry_ref=100.0, trade_size_sol=0.05,
+        ))
+        asyncio.run(tracker_before_restart._handle_price_update("MINT", 151.0))  # take-profit exit
+
+        tracker_after_restart = OutcomeTracker(ws_url="wss://example.invalid", position_store_path=path)
+        tracker_after_restart.load_pending()
+
+        self.assertNotIn("MINT", tracker_after_restart._pending)
+
+    def test_fresh_start_with_no_store_file_has_nothing_to_resume(self):
+        path = self._store_path()
+        path.unlink()  # no file at all - first run ever
+        tracker = OutcomeTracker(ws_url="wss://example.invalid", position_store_path=path)
+        tracker.load_pending()
+        self.assertEqual(tracker._pending, {})
 
 
 class TakeProfitStopLossExitTests(unittest.TestCase):
