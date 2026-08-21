@@ -31,11 +31,30 @@ strategies:
     # simpele filters om de ergste scams/rugpulls te vermijden (geen garantie!)
     min_token_age_seconds: 0
     max_token_age_seconds: 15
-    require_socials: false      # true = alleen tokens met twitter/telegram/website meenemen
+    # LET OP: dit filtert op velden (twitter/telegram/website) die niet in
+    # het launch-event zitten - pump.fun levert die alleen via de losse
+    # metadata-JSON (het uri-veld), dus dit staat altijd op "geen socials"
+    # en zet je nu op true, koopt de sniper dus NOOIT meer iets. Gebruik
+    # social_watch hieronder als je echt op socials wilt filteren.
+    require_socials: false
     take_profit_pct: 50
     stop_loss_pct: 25
     trailing_activation_pct: 20  # arm the trailing stop once up this much from entry
     trailing_stop_pct: 15        # exit if price falls this much from its peak since entry
+
+  social_watch:
+    # Wacht op socials in plaats van direct te kopen bij launch (zoals
+    # sniper doet) - kijkt watch_window_sec lang naar elke nieuwe token,
+    # pollt de metadata elke poll_interval_sec, en koopt zodra er socials
+    # verschijnen. Trager dan sniper (per ontwerp), maar filtert op een
+    # signaal dat echt bestaat. Gebruikt dezelfde risk-limieten als sniper.
+    enabled: false
+    watch_window_sec: 60
+    poll_interval_sec: 10
+    take_profit_pct: 50
+    stop_loss_pct: 25
+    trailing_activation_pct: 20
+    trailing_stop_pct: 15
 
   copytrade:
     enabled: false
