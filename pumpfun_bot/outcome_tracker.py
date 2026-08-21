@@ -253,19 +253,35 @@ class OutcomeTracker:
 
     async def run(self) -> None:
         while True:
-            await self._reconcile_with_wallet_if_due()
-
-            async with self._lock:
-                mints = list(self._pending.keys()) + list(self._post_exit.keys())
-
-            if not mints:
-                await asyncio.sleep(IDLE_SLEEP_SEC)
-                continue
-
-            await self._poll_once(mints)
-            await self._emit_due_checkpoints()
-            await self._emit_post_exit_checkpoints()
+            try:
+                await self._run_one_cycle()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                # this loop manages real, live positions - one bad cycle
+                # (a bug anywhere below) must never crash the whole bot.
+                # Confirmed live: an unhandled exception here took down the
+                # entire asyncio.gather in main.py, abandoning every open
+                # position mid-session with no graceful shutdown at all.
+                # Log it, keep the loop alive, positions stay tracked.
+                logger.exception(
+                    "Onverwachte fout in outcome-tracker cyclus - overgeslagen, "
+                    "loop blijft draaien (posities blijven gevolgd)."
+                )
             await asyncio.sleep(IDLE_SLEEP_SEC)
+
+    async def _run_one_cycle(self) -> None:
+        await self._reconcile_with_wallet_if_due()
+
+        async with self._lock:
+            mints = list(self._pending.keys()) + list(self._post_exit.keys())
+
+        if not mints:
+            return
+
+        await self._poll_once(mints)
+        await self._emit_due_checkpoints()
+        await self._emit_post_exit_checkpoints()
 
     async def _reconcile_with_wallet_if_due(self) -> None:
         if self.dry_run or self.client is None:
@@ -657,9 +673,19 @@ class OutcomeTracker:
                         pct_change_if_held_from_entry = round(
                             ((info["last_ref"] - info["entry_ref"]) / info["entry_ref"]) * 100, 2
                         )
-                        vs_realized_pct = round(
-                            pct_change_if_held_from_entry - info["realized_pct_change"], 2
-                        )
+                        # realized_pct_change is None for a blind forced exit
+                        # (timeout_unmeasured/stale_price_unmeasured - we
+                        # never knew the price at exit time) - can't compare
+                        # "vs what we realized" against an unknown baseline.
+                        # This crashed the entire bot process live (an
+                        # unhandled exception here brings down the whole
+                        # asyncio.gather in main.py) - never again.
+                        if info["realized_pct_change"] is None:
+                            vs_realized_pct = None
+                        else:
+                            vs_realized_pct = round(
+                                pct_change_if_held_from_entry - info["realized_pct_change"], 2
+                            )
                     else:
                         pct_change_since_exit = None
                         pct_change_if_held_from_entry = None
