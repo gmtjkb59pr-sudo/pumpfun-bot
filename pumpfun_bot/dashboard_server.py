@@ -11,7 +11,9 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from .activity_log import DATA_LOG_PATH
 from .state import bot_state
+from .stats import compute_stats
 
 logger = logging.getLogger("pumpfun_bot.dashboard")
 
@@ -27,6 +29,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._serve_file(STATIC_DIR / "dashboard.html", "text/html; charset=utf-8")
         elif self.path == "/api/status":
             self._serve_json(bot_state.snapshot())
+        elif self.path == "/api/stats":
+            self._serve_json(compute_stats(DATA_LOG_PATH))
         else:
             self.send_error(404, "Niet gevonden")
 

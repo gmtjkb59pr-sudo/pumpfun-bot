@@ -8,7 +8,9 @@ from __future__ import annotations
 import threading
 import time
 from collections import deque
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
+
+from .activity_log import append_jsonl
 
 
 @dataclass
@@ -20,6 +22,9 @@ class TradeLogEntry:
     amount_sol: float
     dry_run: bool
     tx_signature: str = ""
+    # entry-time features (e.g. liquidity_sol, has_socials) kept alongside the
+    # trade so outcome stats can later be broken down by what the bot saw
+    meta: dict = field(default_factory=dict)
 
 
 class BotState:
@@ -71,23 +76,27 @@ class BotState:
         amount_sol: float,
         dry_run: bool,
         tx_signature: str = "",
+        meta: dict | None = None,
     ) -> None:
+        entry = TradeLogEntry(
+            ts=time.time(),
+            strategy=strategy,
+            action=action,
+            mint=mint,
+            amount_sol=amount_sol,
+            dry_run=dry_run,
+            tx_signature=tx_signature,
+            meta=meta or {},
+        )
         with self._lock:
-            self._trades.appendleft(
-                TradeLogEntry(
-                    ts=time.time(),
-                    strategy=strategy,
-                    action=action,
-                    mint=mint,
-                    amount_sol=amount_sol,
-                    dry_run=dry_run,
-                    tx_signature=tx_signature,
-                )
-            )
+            self._trades.appendleft(entry)
+        append_jsonl({"type": "trade", **asdict(entry)})
 
     def log_alert(self, message: str) -> None:
+        entry = {"ts": time.time(), "message": message}
         with self._lock:
-            self._alerts.appendleft({"ts": time.time(), "message": message})
+            self._alerts.appendleft(entry)
+        append_jsonl({"type": "alert", **entry})
 
     def snapshot(self) -> dict:
         with self._lock:
