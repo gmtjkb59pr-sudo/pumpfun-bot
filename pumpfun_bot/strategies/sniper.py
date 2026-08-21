@@ -11,6 +11,8 @@ import time
 
 from ..alerts import Alerter
 from ..config import SniperConfig
+from ..outcome_tracker import OutcomeTracker
+from ..price_ref import extract_price_ref
 from ..pumpportal_client import PumpPortalClient
 from ..risk import RiskManager
 from ..state import bot_state
@@ -28,6 +30,7 @@ class SniperStrategy:
         trade_size_sol: float,
         slippage_pct: float,
         dry_run: bool,
+        outcome_tracker: OutcomeTracker | None = None,
     ):
         self.client = client
         self.cfg = cfg
@@ -36,6 +39,7 @@ class SniperStrategy:
         self.trade_size_sol = trade_size_sol
         self.slippage_pct = slippage_pct
         self.dry_run = dry_run
+        self.outcome_tracker = outcome_tracker
 
     def _passes_filters(self, event: dict) -> bool:
         # PumpPortal new-token events bevatten o.a. mint, name, symbol, initial
@@ -80,7 +84,15 @@ class SniperStrategy:
             if self.dry_run:
                 logger.info("[DRY RUN] Zou kopen: %s SOL van %s", self.trade_size_sol, mint)
                 self.risk.register_trade_opened(self.trade_size_sol)
-                bot_state.log_trade("sniper", "buy", mint, self.trade_size_sol, dry_run=True)
+                has_socials = any(event.get(k) for k in ("twitter", "telegram", "website"))
+                bot_state.log_trade(
+                    "sniper", "buy", mint, self.trade_size_sol, dry_run=True,
+                    meta={"liquidity_sol": liquidity_sol, "has_socials": has_socials},
+                )
+                if self.outcome_tracker is not None:
+                    await self.outcome_tracker.track(
+                        mint, name, symbol, extract_price_ref(event)
+                    )
                 continue
 
             try:

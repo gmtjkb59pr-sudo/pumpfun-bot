@@ -375,6 +375,16 @@
     </div>
   </div>
 
+  <div class="panel" style="margin-top: 16px;">
+    <div class="panel-header">
+      <span>Learning stats — hoe deden simulated snipes het na verloop van tijd?</span>
+      <span class="count" id="statsOutcomeCount">0 outcomes</span>
+    </div>
+    <div id="statsWrap">
+      <div class="empty-state">Nog geen outcomes gemeten — check terug over een paar minuten.</div>
+    </div>
+  </div>
+
   <footer>lokaal dashboard · ververst elke 2s · sluiten van dit venster stopt de bot niet</footer>
 </div>
 
@@ -500,8 +510,96 @@
     }
   }
 
+  function fmtCheckpointLabel(sec) {
+    if (sec < 60) return sec + 's';
+    if (sec < 3600) return Math.round(sec / 60) + 'm';
+    return Math.round(sec / 3600) + 'u';
+  }
+
+  function fmtPct(v) {
+    if (v === null || v === undefined) return '—';
+    const sign = v > 0 ? '+' : '';
+    return sign + v.toFixed(1) + '%';
+  }
+
+  function pctClass(v) {
+    if (v === null || v === undefined) return '';
+    return v > 0 ? 'positive' : v < 0 ? 'negative' : '';
+  }
+
+  function fmtRow(label, row) {
+    if (!row || row.count === 0) return '';
+    return `
+      <tr>
+        <td>${escapeHtml(label)}</td>
+        <td class="value ${pctClass(row.avg_pct_change)}" style="font-size: 12.5px;">${fmtPct(row.avg_pct_change)}</td>
+        <td>${row.win_rate_pct === null ? '—' : row.win_rate_pct + '%'}</td>
+        <td>${row.count}</td>
+      </tr>
+    `;
+  }
+
+  async function refreshStats() {
+    let stats;
+    try {
+      const res = await fetch('/api/stats', { cache: 'no-store' });
+      stats = await res.json();
+    } catch (e) {
+      return;
+    }
+
+    document.getElementById('statsOutcomeCount').textContent = `${stats.total_outcomes} gemeten`;
+    const wrap = document.getElementById('statsWrap');
+
+    const apiKeyNotice = (stats.total_unmeasured > 0) ? `
+      <div class="empty-state" style="text-align: left; padding: 8px 14px; color: var(--negative);">
+        ${stats.total_unmeasured} snipe(s) konden niet gevolgd worden — PumpPortal's
+        per-token trade-feed vereist een <strong>funded API key</strong> (0.02+ SOL),
+        zie <code>PUMPPORTAL_API_KEY</code> in <code>.env</code>. Zonder key: alleen
+        entry-data, geen koersvervolg.
+      </div>` : '';
+
+    const checkpoints = Object.keys(stats.by_checkpoint || {});
+    if (checkpoints.length === 0 || stats.total_outcomes === 0) {
+      wrap.innerHTML = '<div class="empty-state">Nog geen outcomes gemeten — check terug over een paar minuten.</div>' + apiKeyNotice;
+      return;
+    }
+
+    let html = '';
+    for (const cpSec of checkpoints.sort((a, b) => a - b)) {
+      const cp = stats.by_checkpoint[cpSec];
+      const rows = [
+        fmtRow('Alle simulated snipes', cp.overall),
+        fmtRow('— met socials (twitter/telegram/website)', cp.by_socials?.true),
+        fmtRow('— zonder socials', cp.by_socials?.false),
+        ...Object.entries(cp.by_liquidity || {}).map(([k, v]) => fmtRow(`— liquiditeit ${k}`, v)),
+      ].filter(Boolean).join('');
+
+      if (!rows) continue;
+      html += `
+        <table style="margin-bottom: 4px;">
+          <thead>
+            <tr>
+              <th>${fmtCheckpointLabel(Number(cpSec))} na simulated buy</th>
+              <th>Gem. koersverandering</th>
+              <th>Win rate</th>
+              <th>N</th>
+            </tr>
+          </thead>
+          <tbody>${rows}</tbody>
+        </table>
+      `;
+    }
+    if (html) {
+      html += '<div class="empty-state" style="text-align: left; padding: 8px 14px;">Koersverandering is een ruwe proxy (marketcap/bonding-curve waarde), geen exacte marktprijs — en bij weinig samples (N) is dit nog ruis, geen signaal.</div>';
+    }
+    wrap.innerHTML = (html || '<div class="empty-state">Nog geen outcomes gemeten — check terug over een paar minuten.</div>') + apiKeyNotice;
+  }
+
   refresh();
+  refreshStats();
   setInterval(refresh, 2000);
+  setInterval(refreshStats, 5000);
 </script>
 </body>
 </html>

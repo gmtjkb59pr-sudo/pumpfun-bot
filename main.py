@@ -20,6 +20,7 @@ from pumpfun_bot.alerts import Alerter
 from pumpfun_bot.config import load_config
 from pumpfun_bot.dashboard_server import start_dashboard_server
 from pumpfun_bot.logger_setup import setup_logging
+from pumpfun_bot.outcome_tracker import OutcomeTracker
 from pumpfun_bot.pumpportal_client import PumpPortalClient
 from pumpfun_bot.risk import RiskManager
 from pumpfun_bot.state import bot_state
@@ -63,6 +64,8 @@ async def main() -> None:
         chat_id=cfg.telegram_chat_id,
     )
 
+    outcome_tracker = OutcomeTracker(ws_url=cfg.pumpportal_ws_url)
+
     sniper = SniperStrategy(
         client=PumpPortalClient(cfg.pumpportal_ws_url, cfg.pumpportal_trade_api_url,
                                  cfg.rpc_http_url, keypair),
@@ -72,6 +75,7 @@ async def main() -> None:
         trade_size_sol=cfg.risk.max_sol_per_trade,
         slippage_pct=cfg.risk.default_slippage_pct,
         dry_run=cfg.risk.dry_run,
+        outcome_tracker=outcome_tracker,
     )
     copytrade = CopyTradeStrategy(
         client=PumpPortalClient(cfg.pumpportal_ws_url, cfg.pumpportal_trade_api_url,
@@ -127,6 +131,7 @@ async def main() -> None:
         asyncio.create_task(sniper.run()),
         asyncio.create_task(copytrade.run()),
         asyncio.create_task(market_maker.run()),
+        asyncio.create_task(outcome_tracker.run()),
     ]
     await asyncio.gather(*tasks)
 

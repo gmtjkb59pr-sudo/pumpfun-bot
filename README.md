@@ -86,6 +86,26 @@ webserver) en luistert standaard alleen op `127.0.0.1` — dus niet bereikbaar
 vanaf andere apparaten in je netwerk. Wil je het uitzetten of op een andere
 poort draaien, pas dan de `dashboard:` sectie in `config.yaml` aan.
 
+## Data-logging & "learning stats"
+
+Elke trade en alert wordt (naast het in-memory dashboard) ook append-only
+weggeschreven naar `data/activity_log.jsonl` (gitignored), zodat je een volledige
+geschiedenis hebt die een dashboard-restart overleeft.
+
+De sniper-strategie probeert daarnaast bij te houden wat er na een simulated
+buy met de koers gebeurde (checkpoints op 60s/300s/900s), zodat je op het
+dashboard onder "Learning stats" kunt zien of bv. tokens met socials of meer
+liquiditeit het beter deden. **Belangrijk:** dit vereist PumpPortal's
+`subscribeTokenTrade` feed, wat zelf weer een **gefunde API key** vereist
+(0.02+ SOL op de wallet achter `PUMPPORTAL_API_KEY`). Zonder zo'n key wijst
+PumpPortal de subscription af en toont het dashboard duidelijk "N snipe(s)
+konden niet gevolgd worden" in plaats van foutieve 0%-cijfers te verzinnen.
+Dit raakt ook de market-maker strategie, die dezelfde feed gebruikt.
+
+Dit bouwt alleen de dataverzameling — er is geen automatische aanpassing van
+filters/strategie op basis van deze stats. Dat "echt leren" zou een aparte,
+grotere stap zijn.
+
 ## Structuur
 
 ```
@@ -110,6 +130,11 @@ pumpfun_bot/strategies/market_maker.py
   zelf uitbreiden.
 - Market maker gebruikt een vereenvoudigd prijsmodel; houdt geen rekening met
   de exacte bonding-curve wiskunde van pump.fun.
+- Market maker (en outcome-tracking, zie hierboven) hangen af van PumpPortal's
+  `subscribeTokenTrade`/`subscribeAccountTrade` feeds, die alleen werken met
+  een **gefunde API key** (0.02+ SOL). Zonder key wijst PumpPortal de
+  subscription af en doet market maker dus niets (geen grid wordt ooit
+  geïnitialiseerd) — dit is niet eerder expliciet getest/gedocumenteerd.
 - Geen persistente opslag van posities/PnL tussen herstarts (alles zit in het
   geheugen, dus een restart reset de risk-manager teller).
 - PumpPortal veldnamen (bv. `vSolInBondingCurve`, `txType`) zijn gebaseerd op
