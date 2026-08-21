@@ -26,6 +26,7 @@ strictly guaranteed 1:1 mapping.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 
@@ -37,6 +38,13 @@ logger = logging.getLogger("pumpfun_bot.holder_count")
 
 TOKEN_2022_PROGRAM_ID = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
 PUMPFUN_TOKEN_ACCOUNT_DATA_SIZE = 170
+# getProgramAccounts' index lags behind the live chain state - confirmed
+# directly by re-checking a mint minutes after logging 0 holders right after
+# our own buy and finding 7 real holders. Checking immediately after a buy
+# reliably reads as 0 (it hasn't even indexed our own just-executed
+# transaction yet), which would make every logged count worthless noise -
+# wait before checking instead of recording a number known to be wrong.
+INDEXING_DELAY_SEC = 20
 
 
 async def fetch_holder_count(mint: str, rpc_http_url: str, timeout_sec: float = 5.0) -> int | None:
@@ -72,11 +80,15 @@ async def fetch_holder_count(mint: str, rpc_http_url: str, timeout_sec: float = 
         return None
 
 
-async def record_holder_count(mint: str, rpc_http_url: str) -> None:
-    """Fire-and-forget: fetches and logs the holder count without blocking
-    the caller's event loop - meant to run as a background task right after
-    a buy, so the ~100-200ms lookup never delays processing the next launch
+async def record_holder_count(
+    mint: str, rpc_http_url: str, delay_sec: float = INDEXING_DELAY_SEC
+) -> None:
+    """Fire-and-forget: waits for the indexer to catch up, then fetches and
+    logs the holder count, without blocking the caller's event loop - meant
+    to run as a background task right after a buy, so neither the delay nor
+    the ~100-200ms lookup itself ever delays processing the next launch
     event (matters most for sniper, where that's the whole point)."""
+    await asyncio.sleep(delay_sec)
     count = await fetch_holder_count(mint, rpc_http_url)
     if count is None:
         return
