@@ -354,6 +354,11 @@
       <div class="sub" id="statPnlSub">verlieslimiet: —</div>
     </div>
     <div class="stat-card">
+      <div class="label">Echte wallet P&amp;L (sessie)</div>
+      <div class="value" id="statRealPnl">—</div>
+      <div class="sub" id="statRealPnlSub">t.o.v. balans bij opstarten - geen fee-model</div>
+    </div>
+    <div class="stat-card">
       <div class="label">Trades / uur</div>
       <div class="value" id="statTrades">—</div>
       <div class="sub" id="statTradesSub">van limiet</div>
@@ -473,14 +478,31 @@
     }
 
     document.getElementById('statExposure').textContent = fmtSol(data.open_exposure_sol);
-    document.getElementById('statExposureSub').textContent =
-      `limiet: ${fmtSol(data.max_sol_total_exposure)}`;
+    const untrackedCount = data.untracked_holdings_count || 0;
+    document.getElementById('statExposureSub').textContent = untrackedCount > 0
+      ? `limiet: ${fmtSol(data.max_sol_total_exposure)} · +${untrackedCount} niet-getrackt (niet meegeteld)`
+      : `limiet: ${fmtSol(data.max_sol_total_exposure)}`;
 
     const pnlEl = document.getElementById('statPnl');
     pnlEl.textContent = fmtSol(data.realized_pnl_sol);
     pnlEl.className = 'value ' + (data.realized_pnl_sol > 0 ? 'positive' : data.realized_pnl_sol < 0 ? 'negative' : '');
     document.getElementById('statPnlSub').textContent =
       `verlieslimiet: -${fmtSol(data.max_daily_loss_sol)}`;
+
+    const realPnlEl = document.getElementById('statRealPnl');
+    const realPnlSubEl = document.getElementById('statRealPnlSub');
+    if (data.real_pnl_sol === null || data.real_pnl_sol === undefined) {
+      realPnlEl.textContent = '—';
+      realPnlEl.className = 'value';
+      realPnlSubEl.textContent = 'nog geen balans-check gedaan';
+    } else {
+      const sign = data.real_pnl_sol > 0 ? '+' : '';
+      realPnlEl.textContent = `${sign}${data.real_pnl_sol.toFixed(4)} SOL`;
+      realPnlEl.className = 'value ' + (data.real_pnl_sol > 0 ? 'positive' : data.real_pnl_sol < 0 ? 'negative' : '');
+      const usdPart = (data.real_pnl_usd === null || data.real_pnl_usd === undefined)
+        ? '' : ` (${data.real_pnl_usd > 0 ? '+' : ''}$${data.real_pnl_usd.toFixed(2)})`;
+      realPnlSubEl.textContent = `start: ${fmtSol(data.session_start_balance_sol)}${usdPart}`;
+    }
 
     document.getElementById('statTrades').textContent = `${data.trades_last_hour}`;
     document.getElementById('statTradesSub').textContent = `van max ${data.max_trades_per_hour}/uur`;

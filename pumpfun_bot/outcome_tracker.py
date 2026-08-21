@@ -426,6 +426,12 @@ class OutcomeTracker:
             return
 
         untracked = held - tracked
+        # surfaces the gap in the dashboard's "open exposure" figure - that
+        # number only ever sums positions this bot tracked opening, so it
+        # silently misses whatever's untracked here (confirmed live: the
+        # wallet held real balances of several leftover mints never counted
+        # toward it at all)
+        bot_state.set_untracked_holdings_count(len(untracked))
 
         confirmed_stale = []
         async with self._lock:

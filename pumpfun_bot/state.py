@@ -45,6 +45,25 @@ class BotState:
         # distinguish "your key doesn't work" from "these tokens just never
         # traded", instead of always blaming a missing key
         self.outcome_tracking_api_key_rejected: bool = False
+        # ground-truth wallet balance vs. the bot's own per-trade P&L model
+        # (realized_pnl_sol above) - the model doesn't account for real
+        # slippage or fees on failed attempts, confirmed live: it read
+        # positive while the real wallet balance dropped far more in the
+        # same window. session_start_* is recorded once at process startup;
+        # real_pnl_* is the actual delta since then, not a fee-model guess.
+        # None until the first successful balance lookup.
+        self.session_start_balance_sol: float | None = None
+        self.session_start_balance_usd: float | None = None
+        self.current_balance_sol: float | None = None
+        self.real_pnl_sol: float | None = None
+        self.real_pnl_usd: float | None = None
+        # open_exposure_sol only sums positions the bot itself tracked
+        # opening (_pending) - confirmed live: the wallet held real balances
+        # of several mints (leftovers from earlier sessions/bugs) that were
+        # never counted there at all, understating how much capital is
+        # actually tied up in illiquid token holdings. Updated from
+        # OutcomeTracker._reconcile_with_wallet's real on-chain check.
+        self.untracked_holdings_count: int = 0
         self._trades: deque = deque(maxlen=max_trades)
         self._alerts: deque = deque(maxlen=max_alerts)
 
@@ -76,6 +95,29 @@ class BotState:
     def set_outcome_tracking_rejected(self, rejected: bool) -> None:
         with self._lock:
             self.outcome_tracking_api_key_rejected = rejected
+
+    def set_untracked_holdings_count(self, count: int) -> None:
+        with self._lock:
+            self.untracked_holdings_count = count
+
+    def set_session_start_balance(self, balance_sol: float, balance_usd: float | None) -> None:
+        """Called once at startup with the real wallet balance - the
+        baseline every later real_pnl_* figure is measured against."""
+        with self._lock:
+            self.session_start_balance_sol = balance_sol
+            self.session_start_balance_usd = balance_usd
+
+    def update_real_balance(self, balance_sol: float, balance_usd: float | None) -> None:
+        """Called periodically with the current real wallet balance -
+        recomputes real_pnl_* against session_start_balance_*. A no-op on
+        the delta (balance still recorded) if the session start was never
+        captured (e.g. the very first lookup at startup failed)."""
+        with self._lock:
+            self.current_balance_sol = balance_sol
+            if self.session_start_balance_sol is not None:
+                self.real_pnl_sol = round(balance_sol - self.session_start_balance_sol, 6)
+                if balance_usd is not None and self.session_start_balance_usd is not None:
+                    self.real_pnl_usd = round(balance_usd - self.session_start_balance_usd, 2)
 
     def log_trade(
         self,
@@ -122,6 +164,12 @@ class BotState:
                 "max_daily_loss_sol": self.max_daily_loss_sol,
                 "max_sol_total_exposure": self.max_sol_total_exposure,
                 "outcome_tracking_api_key_rejected": self.outcome_tracking_api_key_rejected,
+                "session_start_balance_sol": self.session_start_balance_sol,
+                "session_start_balance_usd": self.session_start_balance_usd,
+                "current_balance_sol": self.current_balance_sol,
+                "real_pnl_sol": self.real_pnl_sol,
+                "real_pnl_usd": self.real_pnl_usd,
+                "untracked_holdings_count": self.untracked_holdings_count,
                 "trades": [asdict(t) for t in list(self._trades)[:50]],
                 "alerts": list(self._alerts)[:50],
             }
