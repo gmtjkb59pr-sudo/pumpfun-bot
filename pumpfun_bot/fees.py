@@ -14,6 +14,10 @@ handle):
 - PumpPortal Local Trading API fee: 0.5% per trade. Confirmed directly from
   PumpPortal's own docs: https://pumpportal.fun/fees ("We take a 0.5% fee
   on each Local trade.")
+- Priority fee: a flat SOL amount attached to every transaction we submit
+  (see pumpportal_client.py's priority_fee_sol default) to get included
+  faster - this is OUR OWN configured value, not looked up externally, but
+  it's a real cost paid on-chain on both the buy and the sell leg.
 
 Slippage is deliberately NOT modeled here. Unlike the fees above, there is
 no published fixed slippage rate to import - actual slippage depends on
@@ -27,6 +31,12 @@ from __future__ import annotations
 PUMPFUN_FEE_PCT = 1.25
 PUMPPORTAL_LOCAL_API_FEE_PCT = 0.5
 FEE_PCT_PER_LEG = PUMPFUN_FEE_PCT + PUMPPORTAL_LOCAL_API_FEE_PCT  # 1.75%, paid on buy AND sell
+
+# must match the priority_fee_sol default in pumpportal_client.py - single
+# source of truth so P&L tracking can't silently drift from what's actually
+# submitted on-chain
+PRIORITY_FEE_SOL_PER_LEG = 0.0005
+ROUND_TRIP_PRIORITY_FEE_SOL = PRIORITY_FEE_SOL_PER_LEG * 2
 
 
 def net_pct_change_after_fees(gross_pct_change: float) -> float:
