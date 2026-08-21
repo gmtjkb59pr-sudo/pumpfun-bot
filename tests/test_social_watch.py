@@ -62,11 +62,14 @@ class FakeAlerter:
         self.messages.append(message)
 
 
-def _make_strategy(client, *, dry_run=True, outcome_tracker=None):
+def _make_strategy(client, *, dry_run=True, outcome_tracker=None, min_holder_count=0):
     risk = RiskManager(RiskConfig())
     strategy = SocialWatchStrategy(
         client=client,
-        cfg=SocialWatchConfig(enabled=True, watch_window_sec=60, poll_interval_sec=10),
+        cfg=SocialWatchConfig(
+            enabled=True, watch_window_sec=60, poll_interval_sec=10,
+            min_holder_count=min_holder_count,
+        ),
         risk=risk,
         alerter=FakeAlerter(),
         trade_size_sol=0.03,
@@ -107,6 +110,87 @@ class SharedTrackerCollisionTests(unittest.TestCase):
 
         self.assertEqual(client.buy_calls, [])
         self.assertAlmostEqual(risk.state.open_exposure_sol, 0.0)
+
+
+class MinHolderCountGateTests(unittest.TestCase):
+    """min_holder_count is only ever set by auto_tuner.py once there's real
+    evidence (see holder_count_tuning.py) - once it IS set, _buy() must
+    actually enforce it."""
+
+    def test_skips_buy_below_min_holder_count(self):
+        client = FakeClient(trade_events=[{"marketCapSol": 30.0}])
+        strategy, risk = _make_strategy(client, dry_run=False, min_holder_count=16)
+
+        async def _fake_fetch_holder_count(mint, rpc_http_url):
+            return 5  # below the 16 minimum
+
+        with patch(
+            "pumpfun_bot.strategies.social_watch.HOLDER_COUNT_INDEXING_DELAY_SEC", 0,
+        ), patch(
+            "pumpfun_bot.strategies.social_watch.fetch_holder_count", _fake_fetch_holder_count,
+        ):
+            asyncio.run(strategy._buy("MINT", {
+                "mint": "MINT", "name": "Test", "symbol": "TEST", "vSolInBondingCurve": 30.0,
+            }, time.time()))
+
+        self.assertEqual(client.buy_calls, [])
+        self.assertAlmostEqual(risk.state.open_exposure_sol, 0.0)
+
+    def test_buys_at_or_above_min_holder_count(self):
+        client = FakeClient(trade_events=[{"marketCapSol": 30.0}])
+        strategy, risk = _make_strategy(client, dry_run=False, min_holder_count=16)
+
+        async def _fake_fetch_holder_count(mint, rpc_http_url):
+            return 16
+
+        with patch(
+            "pumpfun_bot.strategies.social_watch.HOLDER_COUNT_INDEXING_DELAY_SEC", 0,
+        ), patch(
+            "pumpfun_bot.strategies.social_watch.fetch_holder_count", _fake_fetch_holder_count,
+        ):
+            asyncio.run(strategy._buy("MINT", {
+                "mint": "MINT", "name": "Test", "symbol": "TEST", "vSolInBondingCurve": 30.0,
+            }, time.time()))
+
+        self.assertEqual(len(client.buy_calls), 1)
+        self.assertAlmostEqual(risk.state.open_exposure_sol, 0.03)
+
+    def test_skips_buy_when_min_holder_count_set_but_lookup_fails(self):
+        client = FakeClient(trade_events=[{"marketCapSol": 30.0}])
+        strategy, risk = _make_strategy(client, dry_run=False, min_holder_count=16)
+
+        async def _failing_fetch_holder_count(mint, rpc_http_url):
+            return None
+
+        with patch(
+            "pumpfun_bot.strategies.social_watch.HOLDER_COUNT_INDEXING_DELAY_SEC", 0,
+        ), patch(
+            "pumpfun_bot.strategies.social_watch.fetch_holder_count", _failing_fetch_holder_count,
+        ):
+            asyncio.run(strategy._buy("MINT", {
+                "mint": "MINT", "name": "Test", "symbol": "TEST", "vSolInBondingCurve": 30.0,
+            }, time.time()))
+
+        self.assertEqual(client.buy_calls, [])
+
+    def test_buys_regardless_of_holder_count_when_no_minimum_set(self):
+        # default min_holder_count=0 - the current, pre-evidence behavior
+        client = FakeClient(trade_events=[{"marketCapSol": 30.0}])
+        strategy, risk = _make_strategy(client, dry_run=False, min_holder_count=0)
+
+        async def _failing_fetch_holder_count(mint, rpc_http_url):
+            return None
+
+        with patch(
+            "pumpfun_bot.strategies.social_watch.HOLDER_COUNT_INDEXING_DELAY_SEC", 0,
+        ), patch(
+            "pumpfun_bot.strategies.social_watch.fetch_holder_count", _failing_fetch_holder_count,
+        ):
+            asyncio.run(strategy._buy("MINT", {
+                "mint": "MINT", "name": "Test", "symbol": "TEST", "vSolInBondingCurve": 30.0,
+            }, time.time()))
+
+        self.assertEqual(len(client.buy_calls), 1)
 
 
 class HolderCountIndexingDelayTests(unittest.TestCase):

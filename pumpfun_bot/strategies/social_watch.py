@@ -177,8 +177,20 @@ class SocialWatchStrategy:
             entry_ref = extract_price_ref(event)
         if holder_count is None:
             # couldn't verify - not evidence the token is bad, just that the
-            # RPC lookup itself failed, so don't block the buy on it
+            # RPC lookup itself failed
             logger.debug("Social-watch: kon holder count niet verifiëren voor %s.", mint)
+            if self.cfg.min_holder_count > 0:
+                # a real minimum is set (auto-tuned from evidence, see
+                # holder_count_tuning.py) - an unverifiable count can't be
+                # confirmed to clear that bar, so don't buy blind
+                logger.info("Social-watch: holder count onbekend voor %s, sla over.", mint)
+                return
+        elif holder_count < self.cfg.min_holder_count:
+            logger.info(
+                "Social-watch: %s heeft %d holders, onder de min_holder_count van %d, sla over.",
+                mint, holder_count, self.cfg.min_holder_count,
+            )
+            return
 
         await self.alerter.send(
             f"👥 Social-watch kandidaat: {name} ({symbol}) - {mint} "

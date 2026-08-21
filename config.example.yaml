@@ -55,6 +55,10 @@ strategies:
     stop_loss_pct: 25
     trailing_activation_pct: 20
     trailing_stop_pct: 15
+    # 0 = geen filter. Alleen de auto-tuner verhoogt dit (alleen strenger,
+    # nooit losser, en pas als er genoeg data is), zie
+    # pumpfun_bot/holder_count_tuning.py - niet handmatig zetten zonder bewijs
+    min_holder_count: 0
 
   copytrade:
     enabled: false
