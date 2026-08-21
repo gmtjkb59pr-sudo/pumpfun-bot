@@ -12,6 +12,7 @@ de "Lightning API" waarbij zij namens jou signen.
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
@@ -201,6 +202,14 @@ class PumpPortalClient:
 
         try:
             sig = await self._send_raw_transaction(bytes(signed_tx))
+            # sendTransaction only confirms the tx was ACCEPTED for
+            # processing, not that it actually executed - with skipPreflight
+            # on (needed to avoid rejecting valid-but-just-issued blockhashes,
+            # see _check_blockhash_valid above) there's no other check left
+            # that would catch a transaction that reverts on-chain (e.g.
+            # slippage tolerance exceeded), so without this a failed sell
+            # would silently be treated as a successful one
+            await self._confirm_transaction(sig)
         except Exception:
             log_timing("FAILED", time.monotonic())
             raise
@@ -225,6 +234,45 @@ class PumpPortalClient:
         except Exception as exc:  # noqa: BLE001
             logger.debug("Kon blockhash-geldigheid niet checken: %s", exc)
             return None
+
+    async def _confirm_transaction(
+        self, signature: str, timeout_sec: float = 30.0, poll_interval_sec: float = 0.5
+    ) -> None:
+        """Polls until the transaction actually lands (or definitively
+        failed) on-chain. Raises RuntimeError if it reverted, or if it never
+        confirms within timeout_sec - never silently assume success."""
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getSignatureStatuses",
+            "params": [[signature], {"searchTransactionHistory": True}],
+        }
+        deadline = time.monotonic() + timeout_sec
+        while time.monotonic() < deadline:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(self.rpc_http_url, json=payload, timeout=10) as resp:
+                        data = await resp.json()
+                        statuses = (data.get("result") or {}).get("value") or [None]
+                        status = statuses[0]
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Kon transactiestatus niet checken voor %s: %s", signature, exc)
+                status = None
+
+            if status is not None:
+                if status.get("err") is not None:
+                    raise RuntimeError(
+                        f"Transactie {signature} is gefaald on-chain: {status['err']}"
+                    )
+                if status.get("confirmationStatus") in ("confirmed", "finalized"):
+                    return
+
+            await asyncio.sleep(poll_interval_sec)
+
+        raise RuntimeError(
+            f"Transactie {signature} nog niet bevestigd na {timeout_sec}s - "
+            f"status onbekend, behandel als mislukt."
+        )
 
     async def _send_raw_transaction(self, raw_tx: bytes) -> str:
         payload = {
