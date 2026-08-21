@@ -29,6 +29,13 @@ POLL_WINDOW_SEC = 20
 IDLE_SLEEP_SEC = 5
 
 
+def is_funded_key_rejection(message: str) -> bool:
+    """PumpPortal replies with a bare {"message": ...} for both subscribe
+    confirmations ("Successfully subscribed...") and the funded-API-key
+    rejection - only the latter should be surfaced as a warning."""
+    return "funded" in message.lower()
+
+
 class OutcomeTracker:
     def __init__(self, ws_url: str, api_key: str = ""):
         self.ws_url = ws_url
@@ -89,17 +96,14 @@ class OutcomeTracker:
 
                     mint = data.get("mint")
                     if mint is None:
-                        # PumpPortal rejects subscribeTokenTrade without a
-                        # funded API key and replies with a bare {"message": ...}
-                        # instead of a mint-keyed event - surface that once
-                        # instead of silently treating it as "no price change"
-                        if not self._warned_no_access and "message" in data:
+                        message = data.get("message", "")
+                        if not self._warned_no_access and is_funded_key_rejection(message):
                             self._warned_no_access = True
                             logger.warning(
                                 "PumpPortal wees subscribeTokenTrade af: %s "
                                 "-> outcome-tracking levert geen echte data zonder "
                                 "een funded PUMPPORTAL_API_KEY.",
-                                data["message"],
+                                message,
                             )
                         continue
 
