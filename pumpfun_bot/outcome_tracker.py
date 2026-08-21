@@ -193,6 +193,11 @@ class OutcomeTracker:
         # these were never real tracked positions (no entry price, no risk/
         # exposure attribution), just something being cleaned up
         self._untracked_liquidation: dict[str, dict] = {}
+        # the currently in-flight liquidation sweep (if any) - guards
+        # against starting an overlapping sweep every reconciliation cycle,
+        # which would pile up concurrent RPC/confirm-polling load on top of
+        # a sweep that's already slow (see _reconcile_with_wallet)
+        self._liquidation_task: asyncio.Task | None = None
 
     def load_pending(self) -> None:
         """Reconstructs _pending from disk - call once at startup, before
@@ -461,7 +466,21 @@ class OutcomeTracker:
             logger.warning(message)
             if self.alerter is not None:
                 await self.alerter.send(message)
-            await self._liquidate_untracked_holdings(untracked)
+            # fired off as a background task, NEVER awaited inline here -
+            # confirmed live: awaiting this directly blocked the entire
+            # housekeeping loop (checkpoints, stale-price detection,
+            # subscription sync for REAL tracked positions) for up to
+            # 5 mints * 30s confirmation-timeout each = 150s, because each
+            # failed liquidation attempt can take the full 30s to time out.
+            # A real position's stale-price detection was delayed from the
+            # expected ~10-15s to 44s because of exactly this. Guarded
+            # against overlap - only one liquidation sweep runs at a time,
+            # so a slow sweep doesn't spawn more concurrent RPC load on top
+            # of itself every reconciliation cycle.
+            if self._liquidation_task is None or self._liquidation_task.done():
+                self._liquidation_task = asyncio.create_task(
+                    self._liquidate_untracked_holdings(untracked)
+                )
 
     async def _liquidate_untracked_holdings(self, untracked: set[str]) -> None:
         """Best-effort sell of wallet holdings the bot isn't tracking (see
@@ -474,7 +493,18 @@ class OutcomeTracker:
         cap protection as a normal tracked position's exit (see
         MAX_CONSECUTIVE_SELL_FAILURES) - a mint that keeps failing the same
         way (e.g. the same on-chain Overflow bug that hit a tracked
-        position) stops being retried instead of burning fees forever."""
+        position) stops being retried instead of burning fees forever.
+
+        Runs as a detached background task (see _reconcile_with_wallet) -
+        wrapped in its own try/except so a bug here can't vanish silently
+        (asyncio only logs an unretrieved task exception generically) or,
+        worse, take down anything else."""
+        try:
+            await self._liquidate_untracked_holdings_inner(untracked)
+        except Exception:  # noqa: BLE001
+            logger.exception("Onverwachte fout tijdens liquidatie van niet-getrackte holdings.")
+
+    async def _liquidate_untracked_holdings_inner(self, untracked: set[str]) -> None:
         if self.dry_run or self.client is None:
             return
         for mint in untracked:
