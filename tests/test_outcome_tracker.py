@@ -111,6 +111,80 @@ class TakeProfitStopLossExitTests(unittest.TestCase):
         asyncio.run(tracker._handle_price_update("OTHER", 999.0))
         self.assertNotIn("OTHER", tracker._pending)
 
+    def test_exit_starts_post_exit_tracking(self):
+        tracker, risk = self._make_tracker(take_profit_pct=50.0, entry_ref=100.0)
+        asyncio.run(tracker._handle_price_update("MINT", 150.0))  # +50%, exits
+
+        self.assertIn("MINT", tracker._post_exit)
+        post = tracker._post_exit["MINT"]
+        self.assertEqual(post["reason"], "take_profit")
+        self.assertEqual(post["realized_pct_change"], 50.0)
+        self.assertEqual(post["entry_ref"], 100.0)
+        self.assertEqual(post["exit_ref"], 150.0)
+        self.assertFalse(post["has_real_update"])
+
+
+class PostExitCheckpointTests(unittest.TestCase):
+    def _make_tracker_with_post_exit(self, *, has_real_update: bool, last_ref=180.0):
+        tracker = OutcomeTracker(ws_url="wss://example.invalid")
+        tracker._post_exit["MINT"] = {
+            "exit_ts": time.time() - CHECKPOINTS_SEC[-1] - 1,
+            "entry_ref": 100.0,
+            "exit_ref": 150.0,  # exited at +50%
+            "realized_pct_change": 50.0,
+            "reason": "take_profit",
+            "name": "Test Token",
+            "symbol": "TEST",
+            "last_ref": last_ref,
+            "hit": set(CHECKPOINTS_SEC[:-1]),
+            "has_real_update": has_real_update,
+        }
+        return tracker
+
+    def test_holding_would_have_done_better(self):
+        # price kept climbing to 180 (i.e. +80% from entry) after we exited at +50%
+        tracker = self._make_tracker_with_post_exit(has_real_update=True, last_ref=180.0)
+        asyncio.run(tracker._emit_post_exit_checkpoints())
+
+        self.assertNotIn("MINT", tracker._post_exit)  # final checkpoint clears it
+
+    def test_computes_vs_realized_pct_correctly(self):
+        import pumpfun_bot.outcome_tracker as outcome_tracker_module
+
+        captured = []
+        original_append = outcome_tracker_module.append_jsonl
+        outcome_tracker_module.append_jsonl = captured.append
+        try:
+            tracker = self._make_tracker_with_post_exit(has_real_update=True, last_ref=180.0)
+            asyncio.run(tracker._emit_post_exit_checkpoints())
+        finally:
+            outcome_tracker_module.append_jsonl = original_append
+
+        checks = [r for r in captured if r["type"] == "post_exit_check"]
+        self.assertEqual(len(checks), 1)
+        record = checks[0]
+        self.assertEqual(record["checkpoint_sec_after_exit"], CHECKPOINTS_SEC[-1])
+        # held from 100 to 180 = +80%, realized was +50% -> holding was +30pp better
+        self.assertEqual(record["pct_change_if_held_from_entry"], 80.0)
+        self.assertEqual(record["vs_realized_pct"], 30.0)
+
+    def test_leaves_unmeasured_flag_when_no_real_update(self):
+        import pumpfun_bot.outcome_tracker as outcome_tracker_module
+
+        captured = []
+        original_append = outcome_tracker_module.append_jsonl
+        outcome_tracker_module.append_jsonl = captured.append
+        try:
+            tracker = self._make_tracker_with_post_exit(has_real_update=False)
+            asyncio.run(tracker._emit_post_exit_checkpoints())
+        finally:
+            outcome_tracker_module.append_jsonl = original_append
+
+        checks = [r for r in captured if r["type"] == "post_exit_check"]
+        self.assertEqual(len(checks), 1)
+        self.assertIsNone(checks[0]["vs_realized_pct"])
+        self.assertFalse(checks[0]["measured"])
+
 
 if __name__ == "__main__":
     unittest.main()

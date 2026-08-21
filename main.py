@@ -144,7 +144,9 @@ async def main() -> None:
     ]
 
     if cfg.sniper.enabled:
-        auto_tuner = AutoTuner(sniper_cfg=cfg.sniper, risk=risk, alerter=alerter)
+        auto_tuner = AutoTuner(
+            sniper_cfg=cfg.sniper, risk=risk, alerter=alerter, outcome_tracker=outcome_tracker
+        )
         logger.info(
             "Auto-tuner gestart: past sniper-filters aan op basis van outcome-stats "
             "(alleen strenger, nooit losser, zie pumpfun_bot/auto_tuner.py)."

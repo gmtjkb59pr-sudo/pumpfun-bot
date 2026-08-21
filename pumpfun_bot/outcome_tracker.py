@@ -10,6 +10,11 @@ for tokens that haven't exited yet, for the dashboard's Learning Stats
 panel - these are separate from the exit events that actually close a
 position and register P&L.
 
+After a position exits, it isn't dropped - it's watched passively for
+another 60s/300s/900s (now measured from the exit) so the log has real
+data on whether holding longer would have beaten the exit strategy, not
+just an assumption that 50%/25% are the right thresholds.
+
 Runs as a single long-lived background task shared across all tracked mints,
 rather than one connection per mint, to keep the number of open websockets
 reasonable.
@@ -67,6 +72,10 @@ class OutcomeTracker:
         self.take_profit_pct = take_profit_pct
         self.stop_loss_pct = stop_loss_pct
         self._pending: dict[str, dict] = {}
+        # mints that already exited - kept under passive observation (no
+        # P&L/exposure effect, already realized) purely to answer "would
+        # holding longer have done better than the exit strategy did?"
+        self._post_exit: dict[str, dict] = {}
         self._lock = asyncio.Lock()
         self._warned_no_access = False
 
@@ -94,7 +103,7 @@ class OutcomeTracker:
     async def run(self) -> None:
         while True:
             async with self._lock:
-                mints = list(self._pending.keys())
+                mints = list(self._pending.keys()) + list(self._post_exit.keys())
 
             if not mints:
                 await asyncio.sleep(IDLE_SLEEP_SEC)
@@ -102,6 +111,7 @@ class OutcomeTracker:
 
             await self._poll_once(mints)
             await self._emit_due_checkpoints()
+            await self._emit_post_exit_checkpoints()
             await asyncio.sleep(IDLE_SLEEP_SEC)
 
     async def _poll_once(self, mints: list[str]) -> None:
@@ -155,17 +165,21 @@ class OutcomeTracker:
         exit_args = None
         async with self._lock:
             info = self._pending.get(mint)
-            if info is None:
-                return
-            info["last_ref"] = ref
-            info["has_real_update"] = True
-            pct_change = ((ref - info["entry_ref"]) / info["entry_ref"]) * 100
-            if pct_change >= self.take_profit_pct:
-                exit_args = (mint, dict(info), "take_profit", pct_change)
-            elif pct_change <= -self.stop_loss_pct:
-                exit_args = (mint, dict(info), "stop_loss", pct_change)
-            if exit_args:
-                del self._pending[mint]
+            if info is not None:
+                info["last_ref"] = ref
+                info["has_real_update"] = True
+                pct_change = ((ref - info["entry_ref"]) / info["entry_ref"]) * 100
+                if pct_change >= self.take_profit_pct:
+                    exit_args = (mint, dict(info), "take_profit", pct_change)
+                elif pct_change <= -self.stop_loss_pct:
+                    exit_args = (mint, dict(info), "stop_loss", pct_change)
+                if exit_args:
+                    del self._pending[mint]
+
+            post = self._post_exit.get(mint)
+            if post is not None:
+                post["last_ref"] = ref
+                post["has_real_update"] = True
         if exit_args:
             await self._exit(*exit_args)
 
@@ -189,6 +203,23 @@ class OutcomeTracker:
             await self.alerter.send(
                 f"{emoji} Exit ({reason}): {info['name']} ({info['symbol']}) @ {pct_change:+.1f}%"
             )
+
+        # keep passively watching after the exit - doesn't touch risk/P&L
+        # again, purely so we can later tell whether holding past this exit
+        # would actually have done better
+        async with self._lock:
+            self._post_exit[mint] = {
+                "exit_ts": time.time(),
+                "entry_ref": info["entry_ref"],
+                "exit_ref": info["last_ref"],
+                "realized_pct_change": pct_change,
+                "reason": reason,
+                "name": info["name"],
+                "symbol": info["symbol"],
+                "last_ref": info["last_ref"],
+                "hit": set(),
+                "has_real_update": False,
+            }
 
     async def _emit_due_checkpoints(self) -> None:
         now = time.time()
@@ -234,3 +265,54 @@ class OutcomeTracker:
                 del self._pending[mint]
         for mint, info, reason, pct_change in to_timeout_exit:
             await self._exit(mint, info, reason, pct_change)
+
+    async def _emit_post_exit_checkpoints(self) -> None:
+        """For mints that already exited, records - at the same 60/300/900s
+        cadence, now measured from the exit instead of the entry - what the
+        price actually did afterward, so we can tell whether the exit
+        strategy (take-profit/stop-loss/timeout) is well-calibrated or
+        whether holding longer would have realized more."""
+        now = time.time()
+        async with self._lock:
+            finished_mints = []
+            for mint, info in self._post_exit.items():
+                age = now - info["exit_ts"]
+                for cp in CHECKPOINTS_SEC:
+                    if cp in info["hit"] or age < cp:
+                        continue
+                    if info["has_real_update"]:
+                        pct_change_since_exit = round(
+                            ((info["last_ref"] - info["exit_ref"]) / info["exit_ref"]) * 100, 2
+                        )
+                        pct_change_if_held_from_entry = round(
+                            ((info["last_ref"] - info["entry_ref"]) / info["entry_ref"]) * 100, 2
+                        )
+                        vs_realized_pct = round(
+                            pct_change_if_held_from_entry - info["realized_pct_change"], 2
+                        )
+                    else:
+                        pct_change_since_exit = None
+                        pct_change_if_held_from_entry = None
+                        vs_realized_pct = None
+                    append_jsonl({
+                        "type": "post_exit_check",
+                        "ts": now,
+                        "mint": mint,
+                        "name": info["name"],
+                        "symbol": info["symbol"],
+                        "exit_reason": info["reason"],
+                        "checkpoint_sec_after_exit": cp,
+                        "realized_pct_change": info["realized_pct_change"],
+                        "pct_change_since_exit": pct_change_since_exit,
+                        "pct_change_if_held_from_entry": pct_change_if_held_from_entry,
+                        # positive = holding past the exit would have made
+                        # more than the exit strategy actually realized;
+                        # negative = exiting when we did was the right call
+                        "vs_realized_pct": vs_realized_pct,
+                        "measured": info["has_real_update"],
+                    })
+                    info["hit"].add(cp)
+                if age >= CHECKPOINTS_SEC[-1]:
+                    finished_mints.append(mint)
+            for mint in finished_mints:
+                del self._post_exit[mint]
