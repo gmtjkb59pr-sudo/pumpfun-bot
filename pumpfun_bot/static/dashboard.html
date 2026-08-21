@@ -31,6 +31,9 @@
     color: var(--text);
     font-family: var(--sans);
     -webkit-font-smoothing: antialiased;
+    /* the page itself should never need horizontal scrolling - any wide
+       content (tables) scrolls inside its own bounded container instead */
+    overflow-x: hidden;
   }
 
   a { color: inherit; }
@@ -232,10 +235,19 @@
 
   .feed-row .msg { word-break: break-word; }
 
+  /* fallback for the rare case content still doesn't fit (e.g. a very
+     narrow viewport) - scrolling is scoped to the table itself, with the
+     page never needing to scroll sideways to reach it */
+  .table-scroll {
+    overflow-x: auto;
+    max-width: 100%;
+  }
+
   table {
     width: 100%;
     border-collapse: collapse;
     font-size: 12.5px;
+    table-layout: fixed;
   }
 
   th {
@@ -247,12 +259,14 @@
     padding: 10px 14px;
     border-bottom: 1px solid var(--border);
     font-weight: 500;
+    word-break: break-word;
   }
 
   td {
     padding: 9px 14px;
     border-bottom: 1px solid var(--surface-2);
     font-family: var(--mono);
+    word-break: break-word;
   }
 
   tr:last-child td { border-bottom: none; }
@@ -490,6 +504,7 @@
       tradesWrap.innerHTML = '<div class="empty-state">Nog geen trades</div>';
     } else {
       tradesWrap.innerHTML = `
+        <div class="table-scroll">
         <table>
           <thead>
             <tr><th>Tijd</th><th>Strategie</th><th>Actie</th><th>Token</th><th>Bedrag</th></tr>
@@ -506,6 +521,7 @@
             `).join('')}
           </tbody>
         </table>
+        </div>
       `;
     }
   }
@@ -577,6 +593,7 @@
 
       if (!rows) continue;
       html += `
+        <div class="table-scroll">
         <table style="margin-bottom: 4px;">
           <thead>
             <tr>
@@ -588,6 +605,7 @@
           </thead>
           <tbody>${rows}</tbody>
         </table>
+        </div>
       `;
     }
     if (html) {
