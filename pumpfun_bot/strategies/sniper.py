@@ -152,6 +152,7 @@ class SniperStrategy:
                     slippage_pct=self.slippage_pct,
                 )
                 self.risk.register_trade_opened(self.trade_size_sol)
+                await self.risk.report_buy_result(success=True)
                 has_socials = any(event.get(k) for k in ("twitter", "telegram", "website"))
                 bot_state.log_trade(
                     "sniper", "buy", mint, self.trade_size_sol,
@@ -171,4 +172,5 @@ class SniperStrategy:
                     )
             except Exception as exc:  # noqa: BLE001
                 logger.exception("Snipe buy mislukt voor %s: %s", mint, exc)
+                await self.risk.report_buy_result(success=False)
                 await self.alerter.send(f"❌ Snipe mislukt voor {symbol}: {exc}")

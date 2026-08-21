@@ -225,6 +225,7 @@ class SocialWatchStrategy:
                 slippage_pct=self.slippage_pct,
             )
             self.risk.register_trade_opened(self.trade_size_sol)
+            await self.risk.report_buy_result(success=True)
             creator = event.get("traderPublicKey")
             bot_state.log_trade(
                 "social_watch", "buy", mint, self.trade_size_sol,
@@ -245,4 +246,5 @@ class SocialWatchStrategy:
                 )
         except Exception as exc:  # noqa: BLE001
             logger.exception("Social-watch buy mislukt voor %s: %s", mint, exc)
+            await self.risk.report_buy_result(success=False)
             await self.alerter.send(f"❌ Social-watch buy mislukt voor {symbol}: {exc}")

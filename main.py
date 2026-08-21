@@ -59,13 +59,13 @@ async def main() -> None:
         keypair=keypair,
         api_key=cfg.pumpportal_api_key,
     )
-    risk = RiskManager(cfg.risk)
     alerter = Alerter(
         console=cfg.alerts_console,
         telegram_enabled=cfg.telegram_enabled,
         bot_token=cfg.telegram_bot_token,
         chat_id=cfg.telegram_chat_id,
     )
+    risk = RiskManager(cfg.risk, alerter=alerter)
 
     outcome_tracker = OutcomeTracker(
         ws_url=cfg.pumpportal_ws_url,
