@@ -4,10 +4,13 @@ from unittest.mock import patch
 
 from pumpfun_bot.balance_watch import (
     BalanceFloorReached,
+    MaxRealLossReached,
     fetch_sol_balance,
     fetch_sol_usd_price,
     watch_balance_floor,
+    watch_max_real_loss,
 )
+from pumpfun_bot.state import bot_state
 
 
 class _FakeResponse:
@@ -182,6 +185,79 @@ class WatchBalanceFloorTests(unittest.TestCase):
                     pass
 
         asyncio.run(_drive())  # must not raise BalanceFloorReached
+
+
+class WatchMaxRealLossTests(unittest.TestCase):
+    """Distinct kill-switch from the balance floor: stops the bot once the
+    REAL (ground-truth wallet) session loss reaches a dollar amount,
+    regardless of the wallet's absolute balance - "stop after losing $X"
+    rather than "stop once down to $Y". Reads bot_state.real_pnl_usd, which
+    main.py's periodic real-balance tracker keeps up to date elsewhere."""
+
+    def setUp(self):
+        # bot_state is a shared singleton - reset the fields this reads/
+        # writes so earlier/later tests can't leak into this one
+        self._original = (
+            bot_state.session_start_balance_sol, bot_state.session_start_balance_usd,
+            bot_state.current_balance_sol, bot_state.real_pnl_sol, bot_state.real_pnl_usd,
+        )
+        bot_state.real_pnl_usd = None
+
+    def tearDown(self):
+        (
+            bot_state.session_start_balance_sol, bot_state.session_start_balance_usd,
+            bot_state.current_balance_sol, bot_state.real_pnl_sol, bot_state.real_pnl_usd,
+        ) = self._original
+
+    def test_raises_once_the_real_loss_reaches_the_limit(self):
+        bot_state.real_pnl_usd = -10.0
+        alerter = FakeAlerter()
+
+        async def _drive():
+            with self.assertRaises(MaxRealLossReached):
+                await watch_max_real_loss(max_loss_usd=10, alerter=alerter, poll_interval_sec=0)
+
+        asyncio.run(_drive())
+        self.assertTrue(any("$" in m for m in alerter.messages))
+
+    def test_does_not_raise_above_the_limit(self):
+        bot_state.real_pnl_usd = -3.0
+
+        async def _drive():
+            try:
+                await asyncio.wait_for(
+                    watch_max_real_loss(max_loss_usd=10, poll_interval_sec=0), timeout=0.05,
+                )
+            except asyncio.TimeoutError:
+                pass
+
+        asyncio.run(_drive())  # must not raise MaxRealLossReached
+
+    def test_a_gain_never_triggers(self):
+        bot_state.real_pnl_usd = 25.0
+
+        async def _drive():
+            try:
+                await asyncio.wait_for(
+                    watch_max_real_loss(max_loss_usd=10, poll_interval_sec=0), timeout=0.05,
+                )
+            except asyncio.TimeoutError:
+                pass
+
+        asyncio.run(_drive())  # must not raise MaxRealLossReached
+
+    def test_a_missing_real_pnl_is_skipped_not_treated_as_a_loss(self):
+        bot_state.real_pnl_usd = None  # no successful balance/price check yet
+
+        async def _drive():
+            try:
+                await asyncio.wait_for(
+                    watch_max_real_loss(max_loss_usd=10, poll_interval_sec=0), timeout=0.05,
+                )
+            except asyncio.TimeoutError:
+                pass
+
+        asyncio.run(_drive())  # must not raise MaxRealLossReached
 
 
 if __name__ == "__main__":

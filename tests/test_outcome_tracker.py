@@ -200,6 +200,18 @@ class OpenPositionCountTests(unittest.TestCase):
         asyncio.run(tracker._handle_price_update("MINT", 151.0))  # +51%, take-profit
         self.assertEqual(tracker.open_position_count(), 0)
 
+    def test_excludes_a_paused_position_from_the_count(self):
+        # user-requested: a permanently-stuck position (see MAX_CONSECUTIVE_
+        # SELL_FAILURES) still holds real capital, but shouldn't also block
+        # ALL new buying by sitting in a max_open_positions slot forever -
+        # nothing further can be done for it automatically anyway
+        tracker = OutcomeTracker(ws_url="wss://example.invalid")
+        asyncio.run(tracker.track("STUCK", "Test", "STUCK", entry_ref=100.0, trade_size_sol=0.03))
+        asyncio.run(tracker.track("NORMAL", "Test2", "NORMAL", entry_ref=100.0, trade_size_sol=0.03))
+        tracker._pending["STUCK"]["sell_paused"] = True
+
+        self.assertEqual(tracker.open_position_count(), 1)
+
 
 class SharedTrackerCollisionTests(unittest.TestCase):
     """Two strategies (sniper, social_watch) share one OutcomeTracker keyed

@@ -29,6 +29,10 @@ risk:
   # bot zodra de echte wallet-balans (SOL omgerekend naar USD via een live
   # koers) hieronder zakt. 0 = uitgeschakeld (standaard).
   min_wallet_balance_usd: 0
+  # tweede hard kill-switch, ander criterium dan hierboven: stopt de bot
+  # zodra het ECHTE verlies deze sessie (echte wallet-balans, niet het
+  # fee-model) dit bedrag bereikt. 0 = uitgeschakeld (standaard).
+  max_real_loss_usd: 0
 
 strategies:
   sniper:

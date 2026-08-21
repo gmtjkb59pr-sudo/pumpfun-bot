@@ -220,8 +220,15 @@ class OutcomeTracker:
         rather than a separately-incremented counter that can drift from
         reality (e.g. if track() ever returns early - no price ref, an
         already-tracked mint - a naive counter would still say a slot is
-        taken even though nothing is actually being held/managed there)."""
-        return len(self._pending)
+        taken even though nothing is actually being held/managed there).
+
+        Excludes positions with sell_paused=True - user-requested: a
+        permanently-stuck position (see MAX_CONSECUTIVE_SELL_FAILURES)
+        still holds real capital (still counted in RiskManager's exposure,
+        unaffected by this), but nothing further can be done for it
+        automatically, so it shouldn't also block ALL new buying by sitting
+        in a max_open_positions slot forever."""
+        return sum(1 for info in self._pending.values() if not info.get("sell_paused"))
 
     def tracked_mints(self) -> set[str]:
         """The mints currently being tracked - used at startup to reconcile

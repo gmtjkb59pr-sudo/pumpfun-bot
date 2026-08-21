@@ -17,6 +17,8 @@ import logging
 
 import aiohttp
 
+from .state import bot_state
+
 logger = logging.getLogger("pumpfun_bot.balance_watch")
 
 SOL_USD_PRICE_URL = "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd"
@@ -26,6 +28,14 @@ class BalanceFloorReached(Exception):
     """Raised to stop the bot once the wallet balance is confirmed below
     the configured USD floor - propagates up through main()'s
     asyncio.gather to end the whole process."""
+
+
+class MaxRealLossReached(Exception):
+    """Raised to stop the bot once the REAL (ground-truth wallet, not the
+    bot's own fee-model estimate) session loss has reached the configured
+    USD limit - propagates up through main()'s asyncio.gather the same way
+    as BalanceFloorReached, but answers a different question: "stop after
+    losing $X" rather than "stop once down to $Y"."""
 
 
 async def fetch_sol_balance(wallet_pubkey: str, rpc_http_url: str, timeout_sec: float = 10.0) -> float | None:
@@ -92,3 +102,28 @@ async def watch_balance_floor(
             if alerter is not None:
                 await alerter.send(message)
             raise BalanceFloorReached(message)
+
+
+async def watch_max_real_loss(
+    max_loss_usd: float, alerter=None, poll_interval_sec: float = 30.0,
+) -> None:
+    """Runs forever, checking bot_state.real_pnl_usd (kept up to date
+    elsewhere by main.py's periodic real-balance tracker) every
+    poll_interval_sec. Raises MaxRealLossReached the first time the REAL
+    loss reaches max_loss_usd. A missing real_pnl_usd (no successful
+    balance/price check has landed yet) is skipped, not a trigger - same
+    fail-safe stance as the rest of this module."""
+    while True:
+        await asyncio.sleep(poll_interval_sec)
+        real_pnl_usd = bot_state.real_pnl_usd
+        if real_pnl_usd is None:
+            continue
+        if real_pnl_usd <= -abs(max_loss_usd):
+            message = (
+                f"🛑 Echt verlies deze sessie (${real_pnl_usd:.2f}) heeft de ingestelde "
+                f"limiet van -${max_loss_usd:.2f} bereikt - bot stopt nu."
+            )
+            logger.error(message)
+            if alerter is not None:
+                await alerter.send(message)
+            raise MaxRealLossReached(message)
