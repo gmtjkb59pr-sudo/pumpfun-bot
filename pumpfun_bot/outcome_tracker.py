@@ -111,6 +111,15 @@ MAX_CONSECUTIVE_SELL_FAILURES = 5
 # a real fee failing with SellZeroAmount, for a position that was already
 # gone. Not too frequent - this is a real RPC call, not free.
 WALLET_RECONCILE_INTERVAL_SEC = 60
+# a position must be missing from fetch_wallet_token_mints() on this many
+# CONSECUTIVE reconciliation cycles before being dropped as stale - a single
+# miss could be an incomplete RPC read (confirmed live: a genuinely
+# still-held position, verified directly on-chain, was missing from one
+# wallet fetch and present again the very next cycle with nothing bought or
+# sold in between), not a real sale. Trades a bit of extra lag on a
+# genuinely-stale drop (up to ~2x WALLET_RECONCILE_INTERVAL_SEC) for real
+# protection against silently abandoning a position that's still held.
+WALLET_MISS_CONFIRMATION_COUNT = 2
 
 EXIT_EMOJI = {
     "take_profit": "🟢", "stop_loss": "🔴", "trailing_stop": "🟡", "timeout": "⏱️",
@@ -387,7 +396,17 @@ class OutcomeTracker:
         retrying forever just burns fees failing with SellZeroAmount); a
         wallet holding the bot isn't tracking gets surfaced so it can be
         checked manually - it isn't auto-adopted, since we have no idea
-        what price it was bought at or what strategy (if any) intended it."""
+        what price it was bought at or what strategy (if any) intended it.
+
+        A single miss isn't enough to drop a position - confirmed live: a
+        genuinely still-held position (verified directly on-chain) was
+        missing from ONE fetch_wallet_token_mints() call and present again
+        the very next cycle, with nothing bought or sold in between. Now
+        fixed at the source (see wallet_reconciliation.py - it was only
+        querying one of the two token programs a pump.fun mint can use), but
+        an RPC read can still fail incompletely in other ways, so a position
+        only gets dropped after WALLET_MISS_CONFIRMATION_COUNT CONSECUTIVE
+        misses, not one."""
         async with self._lock:
             tracked = set(self._pending.keys())
 
@@ -396,22 +415,34 @@ class OutcomeTracker:
             logger.debug("Kon wallet niet verifiëren voor reconciliatie, sla deze ronde over.")
             return
 
-        stale = tracked - held
         untracked = held - tracked
 
-        if stale:
-            async with self._lock:
-                for mint in stale:
-                    info = self._pending.pop(mint, None)
-                    if info is not None and self.risk is not None and info.get("trade_size_sol"):
-                        # genuinely unknown what it sold for (if anything) -
-                        # release the exposure slot without guessing a P&L
-                        self.risk.register_trade_closed(info["trade_size_sol"], 0.0)
-                self._persist_pending()
+        confirmed_stale = []
+        async with self._lock:
+            for mint in tracked:
+                info = self._pending.get(mint)
+                if info is None:
+                    continue
+                if mint in held:
+                    info["wallet_miss_streak"] = 0
+                    continue
+                info["wallet_miss_streak"] = info.get("wallet_miss_streak", 0) + 1
+                if info["wallet_miss_streak"] >= WALLET_MISS_CONFIRMATION_COUNT:
+                    confirmed_stale.append(mint)
+            for mint in confirmed_stale:
+                info = self._pending.pop(mint, None)
+                if info is not None and self.risk is not None and info.get("trade_size_sol"):
+                    # genuinely unknown what it sold for (if anything) -
+                    # release the exposure slot without guessing a P&L
+                    self.risk.register_trade_closed(info["trade_size_sol"], 0.0)
+            self._persist_pending()
+
+        if confirmed_stale:
             message = (
-                f"🔄 {len(stale)} positie(s) niet meer echt in de wallet (waarschijnlijk "
-                f"handmatig verkocht) - gestopt met volgen, niet langer geteld tegen "
-                f"max_open_positions/exposure: {', '.join(sorted(stale))}"
+                f"🔄 {len(confirmed_stale)} positie(s) niet meer echt in de wallet (waarschijnlijk "
+                f"handmatig verkocht, {WALLET_MISS_CONFIRMATION_COUNT}x op rij bevestigd) - gestopt "
+                f"met volgen, niet langer geteld tegen max_open_positions/exposure: "
+                f"{', '.join(sorted(confirmed_stale))}"
             )
             logger.warning(message)
             if self.alerter is not None:

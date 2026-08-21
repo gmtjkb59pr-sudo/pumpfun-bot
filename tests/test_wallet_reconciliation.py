@@ -47,6 +47,25 @@ def _account(mint: str, ui_amount: float) -> dict:
     }
 
 
+class _FakeSessionByProgram:
+    """Routes each post() call to a different canned response based on the
+    programId in the request payload - used to prove both token programs
+    (see TOKEN_PROGRAM_IDS) are actually queried and unioned, not just one."""
+
+    def __init__(self, response_by_program_id):
+        self._response_by_program_id = response_by_program_id
+
+    def post(self, url, json=None, timeout=None):
+        program_id = json["params"][1]["programId"]
+        return self._response_by_program_id[program_id]
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+
 class FetchWalletTokenMintsTests(unittest.TestCase):
     def test_returns_mints_with_nonzero_balance(self):
         response = _FakeResponse({"result": {"value": [
@@ -82,6 +101,35 @@ class FetchWalletTokenMintsTests(unittest.TestCase):
         with _patched(response):
             mints = asyncio.run(fetch_wallet_token_mints("WALLET", "https://example.invalid/rpc"))
         self.assertEqual(mints, set())
+
+    def test_unions_holdings_from_both_token_programs(self):
+        # real bug found live: a mint held under the classic SPL Token
+        # program (confirmed directly on-chain) never showed up when only
+        # Token-2022 was queried - a pump.fun mint can use either program,
+        # not consistently one or the other, so both must be queried
+        from pumpfun_bot.wallet_reconciliation import SPL_TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID
+
+        session = _FakeSessionByProgram({
+            SPL_TOKEN_PROGRAM_ID: _FakeResponse({"result": {"value": [_account("CLASSIC_MINT", 10.0)]}}),
+            TOKEN_2022_PROGRAM_ID: _FakeResponse({"result": {"value": [_account("TOKEN2022_MINT", 5.0)]}}),
+        })
+        with patch("pumpfun_bot.wallet_reconciliation.aiohttp.ClientSession", return_value=session):
+            mints = asyncio.run(fetch_wallet_token_mints("WALLET", "https://example.invalid/rpc"))
+        self.assertEqual(mints, {"CLASSIC_MINT", "TOKEN2022_MINT"})
+
+    def test_none_if_either_program_query_fails(self):
+        # a combined result missing one program's accounts is incomplete by
+        # definition - must report "unknown", never a confidently-wrong
+        # partial set that silently drops real holdings
+        from pumpfun_bot.wallet_reconciliation import SPL_TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID
+
+        session = _FakeSessionByProgram({
+            SPL_TOKEN_PROGRAM_ID: _FakeResponse({"result": {"value": [_account("CLASSIC_MINT", 10.0)]}}),
+            TOKEN_2022_PROGRAM_ID: _FakeResponse({"error": {"code": -32000, "message": "boom"}}),
+        })
+        with patch("pumpfun_bot.wallet_reconciliation.aiohttp.ClientSession", return_value=session):
+            mints = asyncio.run(fetch_wallet_token_mints("WALLET", "https://example.invalid/rpc"))
+        self.assertIsNone(mints)
 
 
 class FindUntrackedWalletHoldingsTests(unittest.TestCase):

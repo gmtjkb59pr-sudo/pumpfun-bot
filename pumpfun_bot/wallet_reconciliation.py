@@ -18,42 +18,45 @@ dry-run never touches the real wallet.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 
 import aiohttp
 
 logger = logging.getLogger("pumpfun_bot.wallet_reconciliation")
 
+SPL_TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 TOKEN_2022_PROGRAM_ID = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+# a pump.fun mint can be created under EITHER token program, not
+# consistently one or the other - confirmed live: this bot's own wallet held
+# real, positive balances of mints under the classic SPL program that a
+# Token-2022-only query never saw at all, which fed a false "wallet no
+# longer holds this" conclusion elsewhere (see OutcomeTracker._reconcile_
+# with_wallet) and dropped a still-held position from tracking for no real
+# reason. Must query both and union the results to see the whole wallet.
+TOKEN_PROGRAM_IDS = (SPL_TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID)
 
 
-async def fetch_wallet_token_mints(
-    wallet_pubkey: str, rpc_http_url: str, timeout_sec: float = 15.0
+async def _fetch_mints_for_program(
+    session: aiohttp.ClientSession, rpc_http_url: str, wallet_pubkey: str,
+    program_id: str, timeout_sec: float,
 ) -> set[str] | None:
-    """Returns the set of mints with a nonzero balance currently held by the
-    wallet, or None if the lookup itself failed - a broken RPC response
-    shouldn't be read as "wallet holds nothing", it means "unknown"."""
     payload = {
         "jsonrpc": "2.0",
         "id": 1,
         "method": "getTokenAccountsByOwner",
         "params": [
             wallet_pubkey,
-            {"programId": TOKEN_2022_PROGRAM_ID},
+            {"programId": program_id},
             {"encoding": "jsonParsed"},
         ],
     }
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(rpc_http_url, json=payload, timeout=timeout_sec) as resp:
-                data = await resp.json()
-                if "error" in data:
-                    logger.debug("getTokenAccountsByOwner fout: %s", data["error"])
-                    return None
-                accounts = (data.get("result") or {}).get("value") or []
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("Kon wallet holdings niet ophalen: %s", exc)
-        return None
+    async with session.post(rpc_http_url, json=payload, timeout=timeout_sec) as resp:
+        data = await resp.json()
+        if "error" in data:
+            logger.debug("getTokenAccountsByOwner fout (%s): %s", program_id, data["error"])
+            return None
+        accounts = (data.get("result") or {}).get("value") or []
 
     mints = set()
     for acc in accounts:
@@ -62,6 +65,33 @@ async def fetch_wallet_token_mints(
         mint = info.get("mint")
         if mint and amount > 0:
             mints.add(mint)
+    return mints
+
+
+async def fetch_wallet_token_mints(
+    wallet_pubkey: str, rpc_http_url: str, timeout_sec: float = 15.0
+) -> set[str] | None:
+    """Returns the set of mints with a nonzero balance currently held by the
+    wallet, or None if the lookup itself failed - a broken RPC response
+    shouldn't be read as "wallet holds nothing", it means "unknown". Queries
+    BOTH token programs (see TOKEN_PROGRAM_IDS) and unions the results. If
+    EITHER query fails, the combined result is incomplete by definition, so
+    this returns None rather than a confidently-wrong partial set."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            results = await asyncio.gather(*(
+                _fetch_mints_for_program(session, rpc_http_url, wallet_pubkey, program_id, timeout_sec)
+                for program_id in TOKEN_PROGRAM_IDS
+            ))
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Kon wallet holdings niet ophalen: %s", exc)
+        return None
+
+    if any(r is None for r in results):
+        return None
+    mints: set[str] = set()
+    for r in results:
+        mints |= r
     return mints
 
 
