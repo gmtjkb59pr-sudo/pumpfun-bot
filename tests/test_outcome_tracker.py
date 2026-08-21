@@ -141,6 +141,19 @@ class PerPositionThresholdTests(unittest.TestCase):
         self.assertGreater(risk.state.realized_pnl_sol, 0.0)
 
 
+class TrackedMintsTests(unittest.TestCase):
+    """Used at startup to reconcile against real wallet holdings (see
+    wallet_reconciliation.py) - must expose exactly what's tracked, no
+    more, no less."""
+
+    def test_returns_the_set_of_currently_tracked_mints(self):
+        tracker = OutcomeTracker(ws_url="wss://example.invalid")
+        self.assertEqual(tracker.tracked_mints(), set())
+        asyncio.run(tracker.track("MINT1", "Test", "TEST", entry_ref=100.0, trade_size_sol=0.03))
+        asyncio.run(tracker.track("MINT2", "Test2", "TEST2", entry_ref=100.0, trade_size_sol=0.03))
+        self.assertEqual(tracker.tracked_mints(), {"MINT1", "MINT2"})
+
+
 class OpenPositionCountTests(unittest.TestCase):
     """max_open_positions must reflect what's actually held, not a separate
     counter that can drift - e.g. if track() ever returns early (no price

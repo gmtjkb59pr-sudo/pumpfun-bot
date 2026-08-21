@@ -29,6 +29,7 @@ from pumpfun_bot.strategies.copytrade import CopyTradeStrategy
 from pumpfun_bot.strategies.market_maker import MarketMakerStrategy
 from pumpfun_bot.strategies.sniper import SniperStrategy
 from pumpfun_bot.strategies.social_watch import SocialWatchStrategy
+from pumpfun_bot.wallet_reconciliation import find_untracked_wallet_holdings
 
 
 async def main() -> None:
@@ -81,6 +82,30 @@ async def main() -> None:
         sell_slippage_pct=cfg.risk.default_slippage_pct,
     )
     outcome_tracker.load_pending()
+
+    if not cfg.risk.dry_run:
+        untracked = await find_untracked_wallet_holdings(
+            str(keypair.pubkey()), cfg.rpc_http_url, outcome_tracker.tracked_mints(),
+        )
+        if untracked is None:
+            logger.warning(
+                "Kon wallet-holdings niet verifiëren tegen wat de bot volgt - "
+                "controleer handmatig of er niet-gevolgde tokens in de wallet zitten."
+            )
+        elif untracked:
+            logger.warning(
+                "%d token(s) in de wallet worden NIET gevolgd door deze sessie "
+                "(waarschijnlijk over van een eerdere sessie/bug) - deze tellen niet "
+                "mee voor max_open_positions/exposure en worden niet automatisch "
+                "verkocht: %s",
+                len(untracked), ", ".join(sorted(untracked)),
+            )
+            await alerter.send(
+                f"⚠️ {len(untracked)} niet-gevolgde token(s) in de wallet gevonden "
+                f"(niet van deze sessie) - controleer handmatig: {', '.join(sorted(untracked))}"
+            )
+        else:
+            logger.info("Wallet-holdings komen overeen met wat deze sessie volgt.")
 
     sniper = SniperStrategy(
         client=PumpPortalClient(cfg.pumpportal_ws_url, cfg.pumpportal_trade_api_url,
