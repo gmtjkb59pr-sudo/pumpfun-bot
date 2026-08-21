@@ -15,7 +15,7 @@ import time
 
 from ..alerts import Alerter
 from ..config import SocialWatchConfig
-from ..holder_count import record_holder_count
+from ..holder_count import fetch_holder_count
 from ..outcome_tracker import OutcomeTracker
 from ..price_ref import extract_price_ref
 from ..pumpportal_client import PumpPortalClient
@@ -152,21 +152,35 @@ class SocialWatchStrategy:
             logger.info("Social-watch: trade geblokkeerd door risk manager: %s", reason)
             return
 
-        await self.alerter.send(
-            f"👥 Social-watch kandidaat: {name} ({symbol}) - {mint} (socials gevonden)"
+        # unlike sniper's instant buy, social_watch already tolerates real
+        # delay - fetch these synchronously so the values are accurate AT
+        # the decision point, instead of a delayed best-effort background
+        # log (holder count checked immediately after a buy always reads 0,
+        # see holder_count.py's INDEXING_DELAY_SEC - by now, watch_window_sec
+        # has already given the indexer time to catch up)
+        entry_ref, holder_count = await asyncio.gather(
+            self._fetch_fresh_ref(mint),
+            fetch_holder_count(mint, self.client.rpc_http_url),
         )
-        entry_ref = await self._fetch_fresh_ref(mint)
         if entry_ref is None:
             entry_ref = extract_price_ref(event)
+        if holder_count is None:
+            # couldn't verify - not evidence the token is bad, just that the
+            # RPC lookup itself failed, so don't block the buy on it
+            logger.debug("Social-watch: kon holder count niet verifiëren voor %s.", mint)
+
+        await self.alerter.send(
+            f"👥 Social-watch kandidaat: {name} ({symbol}) - {mint} "
+            f"(socials gevonden, {holder_count if holder_count is not None else '?'} holders)"
+        )
 
         if self.dry_run:
             logger.info("[DRY RUN] Zou kopen: %s SOL van %s", self.trade_size_sol, mint)
             self.risk.register_trade_opened(self.trade_size_sol)
             bot_state.log_trade(
                 "social_watch", "buy", mint, self.trade_size_sol, dry_run=True,
-                meta={"liquidity_sol": liquidity_sol, "has_socials": True},
+                meta={"liquidity_sol": liquidity_sol, "has_socials": True, "holder_count": holder_count},
             )
-            asyncio.create_task(record_holder_count(mint, self.client.rpc_http_url))
             if self.outcome_tracker is not None:
                 await self.outcome_tracker.track(
                     mint, name, symbol, entry_ref, trade_size_sol=self.trade_size_sol,
@@ -183,9 +197,11 @@ class SocialWatchStrategy:
             bot_state.log_trade(
                 "social_watch", "buy", mint, self.trade_size_sol,
                 dry_run=False, tx_signature=result["signature"],
-                meta={"liquidity_sol": liquidity_sol, "has_socials": True, "creator": creator},
+                meta={
+                    "liquidity_sol": liquidity_sol, "has_socials": True,
+                    "creator": creator, "holder_count": holder_count,
+                },
             )
-            asyncio.create_task(record_holder_count(mint, self.client.rpc_http_url))
             await self.alerter.send(f"✅ Gekocht (social-watch): {symbol} | tx: {result['signature']}")
             if self.outcome_tracker is not None:
                 await self.outcome_tracker.track(

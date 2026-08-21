@@ -1,12 +1,35 @@
 import asyncio
+import tempfile
 import time
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
+import pumpfun_bot.activity_log as activity_log
 from pumpfun_bot.config import RiskConfig, SocialWatchConfig
 from pumpfun_bot.outcome_tracker import OutcomeTracker
 from pumpfun_bot.risk import RiskManager
 from pumpfun_bot.strategies.social_watch import SocialWatchStrategy
+
+_ORIGINAL_DATA_LOG_PATH = activity_log.DATA_LOG_PATH
+_TEST_LOG_FILE = None
+
+
+def setUpModule():
+    # bot_state.log_trade() -> activity_log.append_jsonl() always writes to
+    # activity_log.DATA_LOG_PATH - the live buy path (dry_run=False) here
+    # isn't mocked, so without this every run of this module wrote fake
+    # "MINT" trade records into the real, live activity_log.jsonl
+    global _TEST_LOG_FILE
+    _TEST_LOG_FILE = tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False)
+    _TEST_LOG_FILE.close()
+    activity_log.DATA_LOG_PATH = Path(_TEST_LOG_FILE.name)
+
+
+def tearDownModule():
+    activity_log.DATA_LOG_PATH = _ORIGINAL_DATA_LOG_PATH
+    if _TEST_LOG_FILE is not None:
+        Path(_TEST_LOG_FILE.name).unlink(missing_ok=True)
 
 
 class FakeClient:
@@ -129,13 +152,13 @@ class PollOnceTests(unittest.TestCase):
         async def _fake_has_socials(uri):
             return True
 
-        async def _noop_record_holder_count(mint, rpc_http_url):
-            return None
+        async def _fake_fetch_holder_count(mint, rpc_http_url):
+            return 42
 
         with patch(
             "pumpfun_bot.strategies.social_watch.fetch_has_socials", _fake_has_socials,
         ), patch(
-            "pumpfun_bot.strategies.social_watch.record_holder_count", _noop_record_holder_count,
+            "pumpfun_bot.strategies.social_watch.fetch_holder_count", _fake_fetch_holder_count,
         ):
             asyncio.run(strategy._poll_once())
 
