@@ -138,6 +138,28 @@ class ComputeStatsTests(unittest.TestCase):
         self.assertEqual(stats["exits"]["by_reason"]["stop_loss"]["count"], 1)
         self.assertEqual(stats["exits"]["by_reason"]["stop_loss"]["win_rate_pct"], 0.0)
 
+    def test_exits_also_report_fee_adjusted_totals(self):
+        from pumpfun_bot.fees import net_pct_change_after_fees
+
+        log_path = write_log([
+            {"type": "exit", "mint": "A", "reason": "take_profit", "pct_change": 50.0, "trade_size_sol": 0.05},
+        ])
+        try:
+            stats = compute_stats(log_path)
+        finally:
+            log_path.unlink()
+
+        expected_net_pct = net_pct_change_after_fees(50.0)
+        expected_net_pnl = 0.05 * (expected_net_pct / 100)
+
+        self.assertLess(stats["exits"]["total_realized_pnl_sol_after_fees"], stats["exits"]["total_realized_pnl_sol"])
+        self.assertAlmostEqual(
+            stats["exits"]["total_realized_pnl_sol_after_fees"], expected_net_pnl, places=6
+        )
+        self.assertEqual(
+            stats["exits"]["by_reason_after_fees"]["take_profit"]["median_pct_change"], expected_net_pct
+        )
+
     def test_aggregates_counterfactual_hold_by_reason_and_checkpoint(self):
         log_path = write_log([
             # holding would have beaten the take-profit exit by 30pp

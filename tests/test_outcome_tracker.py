@@ -1,10 +1,33 @@
 import asyncio
+import tempfile
 import time
 import unittest
+from pathlib import Path
 
+import pumpfun_bot.activity_log as activity_log
 from pumpfun_bot.config import RiskConfig
 from pumpfun_bot.outcome_tracker import CHECKPOINTS_SEC, OutcomeTracker, is_funded_key_rejection
 from pumpfun_bot.risk import RiskManager
+
+_ORIGINAL_DATA_LOG_PATH = activity_log.DATA_LOG_PATH
+_TEST_LOG_FILE = None
+
+
+def setUpModule():
+    # append_jsonl() always writes to activity_log.DATA_LOG_PATH - most tests
+    # in this file exercise the real un-mocked path (only a couple of tests
+    # mock append_jsonl directly), so without this every run of this module
+    # would append junk "MINT" records into the real, live activity_log.jsonl
+    global _TEST_LOG_FILE
+    _TEST_LOG_FILE = tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False)
+    _TEST_LOG_FILE.close()
+    activity_log.DATA_LOG_PATH = Path(_TEST_LOG_FILE.name)
+
+
+def tearDownModule():
+    activity_log.DATA_LOG_PATH = _ORIGINAL_DATA_LOG_PATH
+    if _TEST_LOG_FILE is not None:
+        Path(_TEST_LOG_FILE.name).unlink(missing_ok=True)
 
 
 class FakeClient:
