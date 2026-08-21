@@ -10,6 +10,7 @@ from pumpfun_bot.config import RiskConfig
 from pumpfun_bot.fees import ROUND_TRIP_PRIORITY_FEE_SOL, net_pct_change_after_fees
 from pumpfun_bot.outcome_tracker import (
     CHECKPOINTS_SEC,
+    MIN_SELL_DELAY_SEC,
     STALE_PRICE_TIMEOUT_SEC,
     OutcomeTracker,
     is_funded_key_rejection,
@@ -502,6 +503,53 @@ class PostExitCheckpointTests(unittest.TestCase):
         self.assertFalse(checks[0]["measured"])
 
 
+class MinSellDelayTests(unittest.TestCase):
+    """Real bug found live: a real sell attempted too soon after the buy
+    reliably came back SellZeroAmount - PumpPortal's own balance index
+    hadn't caught up with our purchase yet - and still cost a real fee to
+    fail. A sell must be deferred (not submitted at all) until
+    MIN_SELL_DELAY_SEC has passed since entry, confirmed directly from a
+    failed transaction's on-chain logs."""
+
+    def _make_tracker(self, *, entry_ts: float):
+        risk = RiskManager(RiskConfig())
+        risk.register_trade_opened(0.05)
+        client = FakeClient(signature="sig")
+        tracker = OutcomeTracker(
+            ws_url="wss://example.invalid", risk=risk, client=client, dry_run=False,
+            take_profit_pct=50.0,
+        )
+        tracker._pending["MINT"] = {
+            "entry_ts": entry_ts,
+            "entry_ref": 100.0,
+            "last_ref": 100.0,
+            "peak_ref": 100.0,
+            "name": "Test Token",
+            "symbol": "TEST",
+            "trade_size_sol": 0.05,
+            "hit": set(),
+            "has_real_update": False,
+        }
+        return tracker, risk, client
+
+    def test_defers_a_sell_attempted_too_soon_after_entry(self):
+        tracker, risk, client = self._make_tracker(entry_ts=time.time())
+        asyncio.run(tracker._handle_price_update("MINT", 151.0))  # +51%, crosses TP
+
+        self.assertEqual(client.sell_calls, [])  # never even attempted
+        self.assertIn("MINT", tracker._pending)  # still tracked, will retry
+        self.assertAlmostEqual(risk.state.open_exposure_sol, 0.05)
+
+    def test_attempts_a_sell_once_past_the_minimum_delay(self):
+        tracker, risk, client = self._make_tracker(
+            entry_ts=time.time() - MIN_SELL_DELAY_SEC - 1,
+        )
+        asyncio.run(tracker._handle_price_update("MINT", 151.0))
+
+        self.assertEqual(len(client.sell_calls), 1)
+        self.assertNotIn("MINT", tracker._pending)
+
+
 class LiveExitTests(unittest.TestCase):
     def _make_tracker(self, *, client, dry_run, entry_ref=100.0, take_profit_pct=50.0):
         risk = RiskManager(RiskConfig())
@@ -511,7 +559,10 @@ class LiveExitTests(unittest.TestCase):
             take_profit_pct=take_profit_pct,
         )
         tracker._pending["MINT"] = {
-            "entry_ts": time.time(),
+            # past MIN_SELL_DELAY_SEC - a real sell attempt right at buy
+            # time would be deferred (PumpPortal's own balance index hasn't
+            # caught up yet), which isn't what these tests are exercising
+            "entry_ts": time.time() - MIN_SELL_DELAY_SEC - 1,
             "entry_ref": entry_ref,
             "last_ref": entry_ref,
             "peak_ref": entry_ref,
@@ -701,8 +752,11 @@ class StalePriceExitTests(unittest.TestCase):
         tracker = OutcomeTracker(
             ws_url="wss://example.invalid", risk=risk, client=client, dry_run=False,
         )
+        # past both STALE_PRICE_TIMEOUT_SEC (so staleness is detected) and
+        # MIN_SELL_DELAY_SEC (so the resulting sell attempt isn't deferred)
+        stale_and_sellable = max(STALE_PRICE_TIMEOUT_SEC, MIN_SELL_DELAY_SEC) + 1
         tracker._pending["MINT"] = {
-            "entry_ts": time.time() - STALE_PRICE_TIMEOUT_SEC - 1,
+            "entry_ts": time.time() - stale_and_sellable,
             "entry_ref": 100.0,
             "last_ref": 100.0,
             "name": "Test Token",
@@ -710,7 +764,7 @@ class StalePriceExitTests(unittest.TestCase):
             "trade_size_sol": 0.05,
             "hit": set(),
             "has_real_update": False,
-            "last_update_ts": time.time() - STALE_PRICE_TIMEOUT_SEC - 1,
+            "last_update_ts": time.time() - stale_and_sellable,
         }
         asyncio.run(tracker._emit_due_checkpoints())
 
