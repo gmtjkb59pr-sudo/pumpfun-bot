@@ -155,6 +155,13 @@ class OutcomeTracker:
         taken even though nothing is actually being held/managed there)."""
         return len(self._pending)
 
+    def tracked_mints(self) -> set[str]:
+        """The mints currently being tracked - used at startup to reconcile
+        against what the wallet actually holds on-chain (see
+        wallet_reconciliation.py), so leftover tokens from an earlier
+        session never get silently confused with what this session owns."""
+        return set(self._pending.keys())
+
     def is_tracking(self, mint: str) -> bool:
         """Whether a position for this mint is already open - strategies
         should check this BEFORE buying, not just before calling track(),
