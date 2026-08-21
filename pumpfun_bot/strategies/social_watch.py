@@ -15,6 +15,7 @@ import time
 
 from ..alerts import Alerter
 from ..config import SocialWatchConfig
+from ..holder_count import record_holder_count
 from ..outcome_tracker import OutcomeTracker
 from ..price_ref import extract_price_ref
 from ..pumpportal_client import PumpPortalClient
@@ -165,6 +166,7 @@ class SocialWatchStrategy:
                 "social_watch", "buy", mint, self.trade_size_sol, dry_run=True,
                 meta={"liquidity_sol": liquidity_sol, "has_socials": True},
             )
+            asyncio.create_task(record_holder_count(mint, self.client.rpc_http_url))
             if self.outcome_tracker is not None:
                 await self.outcome_tracker.track(
                     mint, name, symbol, entry_ref, trade_size_sol=self.trade_size_sol,
@@ -183,6 +185,7 @@ class SocialWatchStrategy:
                 dry_run=False, tx_signature=result["signature"],
                 meta={"liquidity_sol": liquidity_sol, "has_socials": True, "creator": creator},
             )
+            asyncio.create_task(record_holder_count(mint, self.client.rpc_http_url))
             await self.alerter.send(f"✅ Gekocht (social-watch): {symbol} | tx: {result['signature']}")
             if self.outcome_tracker is not None:
                 await self.outcome_tracker.track(
