@@ -19,8 +19,9 @@ class ComputeStatsTests(unittest.TestCase):
         stats = compute_stats("/nonexistent/activity_log.jsonl")
         self.assertEqual(stats["total_trades"], 0)
         self.assertEqual(stats["total_outcomes"], 0)
+        self.assertEqual(stats["exits"]["total"], 0)
 
-    def test_aggregates_win_rate_and_avg_pct_change(self):
+    def test_aggregates_win_rate_mean_and_median(self):
         log_path = write_log([
             {
                 "type": "trade", "mint": "A", "dry_run": True,
@@ -43,16 +44,35 @@ class ComputeStatsTests(unittest.TestCase):
 
         cp60 = stats["by_checkpoint"]["60"]
         self.assertEqual(cp60["overall"]["count"], 2)
-        self.assertEqual(cp60["overall"]["avg_pct_change"], 5.0)
+        self.assertEqual(cp60["overall"]["mean_pct_change"], 5.0)
+        self.assertEqual(cp60["overall"]["median_pct_change"], 5.0)
         self.assertEqual(cp60["overall"]["win_rate_pct"], 50.0)
 
         self.assertEqual(cp60["by_socials"]["true"]["count"], 1)
-        self.assertEqual(cp60["by_socials"]["true"]["avg_pct_change"], 20.0)
+        self.assertEqual(cp60["by_socials"]["true"]["median_pct_change"], 20.0)
         self.assertEqual(cp60["by_socials"]["false"]["count"], 1)
-        self.assertEqual(cp60["by_socials"]["false"]["avg_pct_change"], -10.0)
+        self.assertEqual(cp60["by_socials"]["false"]["median_pct_change"], -10.0)
 
         self.assertEqual(cp60["by_liquidity"]["5-20 SOL"]["count"], 1)
         self.assertEqual(cp60["by_liquidity"]["<5 SOL"]["count"], 1)
+
+    def test_median_is_not_skewed_by_a_single_outlier(self):
+        # a couple of values near zero plus one enormous outlier should barely
+        # move the median even though it wrecks the mean
+        log_path = write_log([
+            {"type": "outcome", "mint": "A", "checkpoint_sec": 60, "pct_change": 1.0},
+            {"type": "outcome", "mint": "B", "checkpoint_sec": 60, "pct_change": -2.0},
+            {"type": "outcome", "mint": "C", "checkpoint_sec": 60, "pct_change": 3.0},
+            {"type": "outcome", "mint": "D", "checkpoint_sec": 60, "pct_change": 200000.0},
+        ])
+        try:
+            stats = compute_stats(log_path)
+        finally:
+            log_path.unlink()
+
+        cp60 = stats["by_checkpoint"]["60"]["overall"]
+        self.assertGreater(cp60["mean_pct_change"], 1000)
+        self.assertLess(cp60["median_pct_change"], 5)
 
     def test_unmeasured_outcomes_excluded_from_stats_but_counted(self):
         log_path = write_log([
@@ -79,7 +99,7 @@ class ComputeStatsTests(unittest.TestCase):
         self.assertEqual(stats["total_unmeasured"], 1)
         cp60 = stats["by_checkpoint"]["60"]
         self.assertEqual(cp60["overall"]["count"], 1)
-        self.assertEqual(cp60["overall"]["avg_pct_change"], 15.0)
+        self.assertEqual(cp60["overall"]["median_pct_change"], 15.0)
 
     def test_ignores_live_trades_for_meta_lookup(self):
         log_path = write_log([
@@ -95,6 +115,28 @@ class ComputeStatsTests(unittest.TestCase):
         cp60 = stats["by_checkpoint"]["60"]
         self.assertEqual(cp60["overall"]["count"], 1)
         self.assertEqual(cp60["by_socials"]["false"]["count"], 1)
+
+    def test_aggregates_exits_by_reason_and_realized_pnl(self):
+        log_path = write_log([
+            {"type": "exit", "mint": "A", "reason": "take_profit", "pct_change": 50.0, "trade_size_sol": 0.05},
+            {"type": "exit", "mint": "B", "reason": "stop_loss", "pct_change": -25.0, "trade_size_sol": 0.05},
+            {"type": "exit", "mint": "C", "reason": "take_profit", "pct_change": 60.0, "trade_size_sol": 0.05},
+        ])
+        try:
+            stats = compute_stats(log_path)
+        finally:
+            log_path.unlink()
+
+        self.assertEqual(stats["exits"]["total"], 3)
+        self.assertAlmostEqual(
+            stats["exits"]["total_realized_pnl_sol"],
+            0.05 * 0.5 + 0.05 * -0.25 + 0.05 * 0.6,
+            places=6,
+        )
+        self.assertEqual(stats["exits"]["by_reason"]["take_profit"]["count"], 2)
+        self.assertEqual(stats["exits"]["by_reason"]["take_profit"]["win_rate_pct"], 100.0)
+        self.assertEqual(stats["exits"]["by_reason"]["stop_loss"]["count"], 1)
+        self.assertEqual(stats["exits"]["by_reason"]["stop_loss"]["win_rate_pct"], 0.0)
 
 
 if __name__ == "__main__":

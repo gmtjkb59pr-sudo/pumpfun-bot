@@ -56,8 +56,11 @@ def decide_adjustments(
     if not cp:
         return changes
 
+    # median, not mean - pump.fun outcomes are extremely fat-tailed, a
+    # couple of huge winners drag the mean up 1000%+ while the typical
+    # trade is flat or negative, so mean alone gives false signals here
     overall = cp.get("overall") or {}
-    overall_avg = overall.get("avg_pct_change")
+    overall_median = overall.get("median_pct_change")
 
     socials = cp.get("by_socials") or {}
     true_bucket = socials.get("true") or {}
@@ -66,40 +69,40 @@ def decide_adjustments(
         not current_require_socials
         and (true_bucket.get("count") or 0) >= MIN_SAMPLES
         and (false_bucket.get("count") or 0) >= MIN_SAMPLES
-        and true_bucket.get("avg_pct_change") is not None
-        and false_bucket.get("avg_pct_change") is not None
-        and true_bucket["avg_pct_change"] - false_bucket["avg_pct_change"] >= MARGIN_PCT
+        and true_bucket.get("median_pct_change") is not None
+        and false_bucket.get("median_pct_change") is not None
+        and true_bucket["median_pct_change"] - false_bucket["median_pct_change"] >= MARGIN_PCT
     ):
         changes.append({
             "field": "require_socials",
             "from": False,
             "to": True,
             "reason": (
-                f"met socials: {true_bucket['avg_pct_change']}% gem. (N={true_bucket['count']}) vs "
-                f"zonder socials: {false_bucket['avg_pct_change']}% gem. (N={false_bucket['count']}) "
+                f"met socials: {true_bucket['median_pct_change']}% mediaan (N={true_bucket['count']}) vs "
+                f"zonder socials: {false_bucket['median_pct_change']}% mediaan (N={false_bucket['count']}) "
                 f"op {checkpoint_sec}s checkpoint"
             ),
         })
 
     by_liquidity = cp.get("by_liquidity") or {}
-    best_key, best_avg, best_count = None, None, None
+    best_key, best_median, best_count = None, None, None
     for bucket_key, threshold in LIQUIDITY_BUCKET_THRESHOLDS.items():
         bucket = by_liquidity.get(bucket_key) or {}
         if threshold <= current_min_liquidity_sol:
             continue  # wouldn't actually tighten anything
-        if (bucket.get("count") or 0) < MIN_SAMPLES or bucket.get("avg_pct_change") is None:
+        if (bucket.get("count") or 0) < MIN_SAMPLES or bucket.get("median_pct_change") is None:
             continue
-        if best_avg is None or bucket["avg_pct_change"] > best_avg:
-            best_key, best_avg, best_count = bucket_key, bucket["avg_pct_change"], bucket["count"]
+        if best_median is None or bucket["median_pct_change"] > best_median:
+            best_key, best_median, best_count = bucket_key, bucket["median_pct_change"], bucket["count"]
 
-    if best_key is not None and overall_avg is not None and best_avg - overall_avg >= MARGIN_PCT:
+    if best_key is not None and overall_median is not None and best_median - overall_median >= MARGIN_PCT:
         changes.append({
             "field": "min_liquidity_sol",
             "from": current_min_liquidity_sol,
             "to": LIQUIDITY_BUCKET_THRESHOLDS[best_key],
             "reason": (
-                f"liquiditeit {best_key}: {best_avg}% gem. (N={best_count}) vs "
-                f"algemeen gemiddelde {overall_avg}% op {checkpoint_sec}s checkpoint"
+                f"liquiditeit {best_key}: {best_median}% mediaan (N={best_count}) vs "
+                f"algemeen mediaan {overall_median}% op {checkpoint_sec}s checkpoint"
             ),
         })
 

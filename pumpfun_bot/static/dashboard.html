@@ -391,6 +391,16 @@
 
   <div class="panel" style="margin-top: 16px;">
     <div class="panel-header">
+      <span>Realized P&amp;L — take-profit / stop-loss / timeout exits</span>
+      <span class="count" id="exitsCount">0 exits</span>
+    </div>
+    <div id="exitsWrap">
+      <div class="empty-state">Nog geen exits — posities worden pas gesloten bij take-profit, stop-loss, of na 15 min.</div>
+    </div>
+  </div>
+
+  <div class="panel" style="margin-top: 16px;">
+    <div class="panel-header">
       <span>Learning stats — hoe deden simulated snipes het na verloop van tijd?</span>
       <span class="count" id="statsOutcomeCount">0 outcomes</span>
     </div>
@@ -550,10 +560,41 @@
     return `
       <tr>
         <td>${escapeHtml(label)}</td>
-        <td class="value ${pctClass(row.avg_pct_change)}" style="font-size: 12.5px;">${fmtPct(row.avg_pct_change)}</td>
+        <td class="value ${pctClass(row.median_pct_change)}" style="font-size: 12.5px;">${fmtPct(row.median_pct_change)}</td>
+        <td class="value ${pctClass(row.mean_pct_change)}" style="font-size: 11px; color: var(--text-muted);">${fmtPct(row.mean_pct_change)}</td>
         <td>${row.win_rate_pct === null ? '—' : row.win_rate_pct + '%'}</td>
         <td>${row.count}</td>
       </tr>
+    `;
+  }
+
+  function renderExits(exits) {
+    const countEl = document.getElementById('exitsCount');
+    const wrap = document.getElementById('exitsWrap');
+    countEl.textContent = `${exits.total} exits`;
+
+    if (!exits.total) {
+      wrap.innerHTML = '<div class="empty-state">Nog geen exits — posities worden pas gesloten bij take-profit, stop-loss, of na 15 min.</div>';
+      return;
+    }
+
+    const reasonLabels = { take_profit: '🟢 Take-profit', stop_loss: '🔴 Stop-loss', timeout: '⏱️ Timeout (15 min)' };
+    const rows = ['take_profit', 'stop_loss', 'timeout']
+      .map(r => fmtRow(reasonLabels[r] || r, exits.by_reason?.[r]))
+      .filter(Boolean).join('');
+
+    const pnlClass = exits.total_realized_pnl_sol > 0 ? 'positive' : exits.total_realized_pnl_sol < 0 ? 'negative' : '';
+    wrap.innerHTML = `
+      <div style="padding: 14px 16px; border-bottom: 1px solid var(--border);">
+        <span style="font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.08em;">Totaal gerealiseerd (simulated)</span><br>
+        <span class="value ${pnlClass}" style="font-size: 22px;">${exits.total_realized_pnl_sol > 0 ? '+' : ''}${exits.total_realized_pnl_sol.toFixed(4)} SOL</span>
+      </div>
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th>Exit-reden</th><th>Mediaan</th><th>Gemiddelde</th><th>Win rate</th><th>N</th></tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>
     `;
   }
 
@@ -565,6 +606,8 @@
     } catch (e) {
       return;
     }
+
+    if (stats.exits) renderExits(stats.exits);
 
     document.getElementById('statsOutcomeCount').textContent = `${stats.total_outcomes} gemeten`;
     const wrap = document.getElementById('statsWrap');
@@ -611,7 +654,8 @@
           <thead>
             <tr>
               <th>${fmtCheckpointLabel(Number(cpSec))} na simulated buy</th>
-              <th>Gem. koersverandering</th>
+              <th>Mediaan</th>
+              <th>Gemiddelde</th>
               <th>Win rate</th>
               <th>N</th>
             </tr>
@@ -622,7 +666,7 @@
       `;
     }
     if (html) {
-      html += '<div class="empty-state" style="text-align: left; padding: 8px 14px;">Koersverandering is een ruwe proxy (marketcap/bonding-curve waarde), geen exacte marktprijs — en bij weinig samples (N) is dit nog ruis, geen signaal.</div>';
+      html += '<div class="empty-state" style="text-align: left; padding: 8px 14px;">Koersverandering is een ruwe proxy (marketcap/bonding-curve waarde), geen exacte marktprijs. <strong>Mediaan is leidend</strong> — pump.fun uitkomsten zijn extreem scheef (een paar uitschieters trekken het gemiddelde enorm omhoog), dus het gemiddelde alleen kan misleidend zijn. Bij weinig samples (N) is dit nog ruis, geen signaal.</div>';
     }
     wrap.innerHTML = (html || '<div class="empty-state">Nog geen outcomes gemeten — check terug over een paar minuten.</div>') + apiKeyNotice;
   }

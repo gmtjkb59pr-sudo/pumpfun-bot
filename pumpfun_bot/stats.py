@@ -1,12 +1,20 @@
 """
 Aggregates activity_log.jsonl into simple learning stats: how simulated
-snipes performed at each outcome checkpoint, broken down by the entry-time
-features logged alongside each trade. Pure function over the log file so it's
-easy to test and reuse from both the dashboard API and a standalone script.
+snipes performed at each outcome checkpoint (price drift, informational
+only), broken down by the entry-time features logged alongside each trade,
+plus the realized P&L from actual exits (take-profit/stop-loss/timeout).
+
+Reports both mean and median: pump.fun outcomes are extremely fat-tailed
+(a couple of huge winners can drag the mean up 1000%+ while the typical
+trade is flat or negative), so mean alone is actively misleading.
+
+Pure function over the log file so it's easy to test and reuse from both
+the dashboard API and a standalone script.
 """
 from __future__ import annotations
 
 import json
+import statistics
 from pathlib import Path
 
 from .outcome_tracker import CHECKPOINTS_SEC
@@ -22,28 +30,31 @@ def _liquidity_bucket(liquidity_sol: float | None) -> str:
     return "20+ SOL"
 
 
-def _empty_bucket() -> dict:
-    return {"count": 0, "sum_pct_change": 0.0, "wins": 0}
-
-
-def _summarize(bucket: dict) -> dict:
-    count = bucket["count"]
-    if count == 0:
-        return {"count": 0, "avg_pct_change": None, "win_rate_pct": None}
+def _summarize(values: list[float]) -> dict:
+    if not values:
+        return {"count": 0, "mean_pct_change": None, "median_pct_change": None, "win_rate_pct": None}
     return {
-        "count": count,
-        "avg_pct_change": round(bucket["sum_pct_change"] / count, 2),
-        "win_rate_pct": round(100 * bucket["wins"] / count, 1),
+        "count": len(values),
+        "mean_pct_change": round(statistics.mean(values), 2),
+        "median_pct_change": round(statistics.median(values), 2),
+        "win_rate_pct": round(100 * sum(1 for v in values if v > 0) / len(values), 1),
     }
 
 
 def compute_stats(log_path: str | Path) -> dict:
     log_path = Path(log_path)
     if not log_path.exists():
-        return {"total_trades": 0, "total_outcomes": 0, "total_unmeasured": 0, "by_checkpoint": {}}
+        return {
+            "total_trades": 0,
+            "total_outcomes": 0,
+            "total_unmeasured": 0,
+            "by_checkpoint": {},
+            "exits": {"total": 0, "total_realized_pnl_sol": 0.0, "by_reason": {}},
+        }
 
     trade_meta_by_mint: dict[str, dict] = {}
     outcomes = []
+    exits = []
     unmeasured_count = 0
 
     with open(log_path, "r", encoding="utf-8") as f:
@@ -63,13 +74,15 @@ def compute_stats(log_path: str | Path) -> dict:
                     unmeasured_count += 1
                 else:
                     outcomes.append(record)
+            elif record.get("type") == "exit":
+                exits.append(record)
 
     by_checkpoint: dict[str, dict] = {}
     for cp in CHECKPOINTS_SEC:
         cp_key = str(cp)
-        overall = _empty_bucket()
-        by_socials = {"true": _empty_bucket(), "false": _empty_bucket()}
-        by_liquidity: dict[str, dict] = {}
+        overall_vals: list[float] = []
+        socials_vals = {"true": [], "false": []}
+        liquidity_vals: dict[str, list[float]] = {}
 
         for outcome in outcomes:
             if outcome.get("checkpoint_sec") != cp:
@@ -79,35 +92,35 @@ def compute_stats(log_path: str | Path) -> dict:
                 continue
             meta = trade_meta_by_mint.get(outcome.get("mint"), {})
 
-            for bucket in (overall,):
-                bucket["count"] += 1
-                bucket["sum_pct_change"] += pct
-                if pct > 0:
-                    bucket["wins"] += 1
-
-            socials_key = "true" if meta.get("has_socials") else "false"
-            bucket = by_socials[socials_key]
-            bucket["count"] += 1
-            bucket["sum_pct_change"] += pct
-            if pct > 0:
-                bucket["wins"] += 1
-
-            liq_key = _liquidity_bucket(meta.get("liquidity_sol"))
-            bucket = by_liquidity.setdefault(liq_key, _empty_bucket())
-            bucket["count"] += 1
-            bucket["sum_pct_change"] += pct
-            if pct > 0:
-                bucket["wins"] += 1
+            overall_vals.append(pct)
+            socials_vals["true" if meta.get("has_socials") else "false"].append(pct)
+            liquidity_vals.setdefault(_liquidity_bucket(meta.get("liquidity_sol")), []).append(pct)
 
         by_checkpoint[cp_key] = {
-            "overall": _summarize(overall),
-            "by_socials": {k: _summarize(v) for k, v in by_socials.items()},
-            "by_liquidity": {k: _summarize(v) for k, v in by_liquidity.items()},
+            "overall": _summarize(overall_vals),
+            "by_socials": {k: _summarize(v) for k, v in socials_vals.items()},
+            "by_liquidity": {k: _summarize(v) for k, v in liquidity_vals.items()},
         }
+
+    exits_by_reason: dict[str, list[float]] = {}
+    total_realized_pnl_sol = 0.0
+    for exit_record in exits:
+        reason = exit_record.get("reason", "unknown")
+        pct = exit_record.get("pct_change")
+        if pct is not None:
+            exits_by_reason.setdefault(reason, []).append(pct)
+        trade_size = exit_record.get("trade_size_sol") or 0.0
+        if pct is not None and trade_size:
+            total_realized_pnl_sol += trade_size * (pct / 100)
 
     return {
         "total_trades": len(trade_meta_by_mint),
         "total_outcomes": len(outcomes),
         "total_unmeasured": unmeasured_count,
         "by_checkpoint": by_checkpoint,
+        "exits": {
+            "total": len(exits),
+            "total_realized_pnl_sol": round(total_realized_pnl_sol, 6),
+            "by_reason": {k: _summarize(v) for k, v in exits_by_reason.items()},
+        },
     }
