@@ -61,13 +61,23 @@ logger = logging.getLogger("pumpfun_bot.outcome_tracker")
 
 CHECKPOINTS_SEC = (60, 300, 900)
 MAX_HOLD_SEC = CHECKPOINTS_SEC[-1]
-# checkpoints (including the stale-price check) only get evaluated once per
-# poll cycle, i.e. roughly every POLL_WINDOW_SEC + IDLE_SLEEP_SEC - shortened
-# so a low STALE_PRICE_TIMEOUT_SEC actually gets detected close to on time,
-# instead of the threshold being real but the check itself only running
-# every ~20-25s regardless of what it's set to
-POLL_WINDOW_SEC = 8
-IDLE_SLEEP_SEC = 3
+# how often the housekeeping loop (checkpoints, stale-price check, wallet
+# reconcile, subscription sync) runs while the WS connection is up - this no
+# longer gates how fast price ticks are seen (see _run_connection: messages
+# are handled the instant they arrive over a single long-lived connection),
+# it only paces the periodic checks that don't need per-tick precision
+HOUSEKEEPING_INTERVAL_SEC = 5
+# brief backoff before reconnecting after the WS connection actually drops
+# (network hiccup, server restart) - NOT a scheduled disconnect. Before this
+# fix, the tracker tore down and reopened its WS every ~11s on purpose (see
+# git history), which meant a real blind window on every single cycle: any
+# price tick during the teardown/reconnect gap was missed entirely. For a
+# token that pumps and dumps in seconds, that gap could - and did - miss the
+# actual peak, so the trailing stop never armed and take-profit was never
+# seen, only found out about after price had already fallen back. A single
+# persistent connection removes that recurring gap; this constant now only
+# covers the rare case of an actual disconnect.
+RECONNECT_BACKOFF_SEC = 3
 # don't hammer a failing real sell on every single price tick - back off
 # between attempts, but keep retrying rather than giving up
 EXIT_RETRY_COOLDOWN_SEC = 15
@@ -152,6 +162,11 @@ class OutcomeTracker:
         self._lock = asyncio.Lock()
         self._warned_no_access = False
         self._last_wallet_reconcile_ts = 0.0
+        # mints already sent in a subscribeTokenTrade message on the current
+        # WS connection - a fresh connection starts empty, and gets a new
+        # subscribe message merely for whatever's newly tracked, not the
+        # whole set again (see _sync_subscription)
+        self._subscribed_mints: set[str] = set()
 
     def load_pending(self) -> None:
         """Reconstructs _pending from disk - call once at startup, before
@@ -254,34 +269,93 @@ class OutcomeTracker:
     async def run(self) -> None:
         while True:
             try:
-                await self._run_one_cycle()
+                await self._run_connection()
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001
-                # this loop manages real, live positions - one bad cycle
-                # (a bug anywhere below) must never crash the whole bot.
-                # Confirmed live: an unhandled exception here took down the
-                # entire asyncio.gather in main.py, abandoning every open
-                # position mid-session with no graceful shutdown at all.
-                # Log it, keep the loop alive, positions stay tracked.
+                # this loop manages real, live positions - one bad connection
+                # cycle (a dropped WS, a bug anywhere below) must never crash
+                # the whole bot. Confirmed live: an unhandled exception here
+                # took down the entire asyncio.gather in main.py, abandoning
+                # every open position mid-session with no graceful shutdown
+                # at all. Log it, keep the loop alive, positions stay tracked.
                 logger.exception(
-                    "Onverwachte fout in outcome-tracker cyclus - overgeslagen, "
-                    "loop blijft draaien (posities blijven gevolgd)."
+                    "Onverwachte fout in outcome-tracker verbinding - "
+                    "opnieuw verbinden, posities blijven gevolgd."
                 )
-            await asyncio.sleep(IDLE_SLEEP_SEC)
+            await asyncio.sleep(RECONNECT_BACKOFF_SEC)
 
-    async def _run_one_cycle(self) -> None:
-        await self._reconcile_with_wallet_if_due()
+    async def _run_connection(self) -> None:
+        """Opens ONE WebSocket connection and keeps it open for the life of
+        this call, instead of tearing it down and reopening it every cycle -
+        see RECONNECT_BACKOFF_SEC's docstring for why that mattered. Price
+        ticks are handled the instant they arrive via `async for`; a
+        separate housekeeping task (checkpoints, stale-price check, wallet
+        reconcile, subscription sync) runs concurrently on its own cadence
+        so it never blocks message receipt."""
+        self._subscribed_mints = set()
+        ws_url = authenticated_ws_url(self.ws_url, self.api_key)
+        async with websockets.connect(ws_url, ping_interval=20) as ws:
+            await self._sync_subscription(ws)
+            housekeeping = asyncio.create_task(self._housekeeping_loop(ws))
+            try:
+                async for raw in ws:
+                    await self._handle_ws_message(raw)
+            finally:
+                housekeeping.cancel()
+                try:
+                    await housekeeping
+                except asyncio.CancelledError:
+                    pass
 
+    async def _housekeeping_loop(self, ws) -> None:
+        while True:
+            await asyncio.sleep(HOUSEKEEPING_INTERVAL_SEC)
+            await self._reconcile_with_wallet_if_due()
+            await self._sync_subscription(ws)
+            await self._emit_due_checkpoints()
+            await self._emit_post_exit_checkpoints()
+
+    async def _sync_subscription(self, ws) -> None:
+        """Adds newly-tracked mints to the live subscription without
+        touching the connection itself - a new position opened mid-connection
+        must start getting price ticks immediately, not wait for the next
+        reconnect (there may not be one for a long time now)."""
         async with self._lock:
-            mints = list(self._pending.keys()) + list(self._post_exit.keys())
+            current = set(self._pending.keys()) | set(self._post_exit.keys())
+        new_mints = current - self._subscribed_mints
+        if new_mints:
+            await ws.send(json.dumps({"method": "subscribeTokenTrade", "keys": sorted(new_mints)}))
+            self._subscribed_mints |= new_mints
 
-        if not mints:
+    async def _handle_ws_message(self, raw) -> None:
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
             return
 
-        await self._poll_once(mints)
-        await self._emit_due_checkpoints()
-        await self._emit_post_exit_checkpoints()
+        mint = data.get("mint")
+        if mint is None:
+            message = data.get("message", "")
+            if not self._warned_no_access and is_funded_key_rejection(message):
+                self._warned_no_access = True
+                bot_state.set_outcome_tracking_rejected(True)
+                logger.warning(
+                    "PumpPortal wees subscribeTokenTrade af: %s "
+                    "-> outcome-tracking levert geen echte data zonder "
+                    "een funded PUMPPORTAL_API_KEY.",
+                    message,
+                )
+            return
+
+        ref = extract_price_ref(data)
+        if ref is not None:
+            if self._warned_no_access:
+                # a real trade event means the feed is actually
+                # working now, despite an earlier rejection
+                self._warned_no_access = False
+                bot_state.set_outcome_tracking_rejected(False)
+            await self._handle_price_update(mint, ref)
 
     async def _reconcile_with_wallet_if_due(self) -> None:
         if self.dry_run or self.client is None:
@@ -340,55 +414,11 @@ class OutcomeTracker:
             if self.alerter is not None:
                 await self.alerter.send(message)
 
-    async def _poll_once(self, mints: list[str]) -> None:
-        try:
-            ws_url = authenticated_ws_url(self.ws_url, self.api_key)
-            async with websockets.connect(ws_url, ping_interval=20) as ws:
-                await ws.send(json.dumps({"method": "subscribeTokenTrade", "keys": mints}))
-                deadline = time.time() + POLL_WINDOW_SEC
-                while True:
-                    remaining = deadline - time.time()
-                    if remaining <= 0:
-                        break
-                    try:
-                        raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
-                    except asyncio.TimeoutError:
-                        break
-                    try:
-                        data = json.loads(raw)
-                    except json.JSONDecodeError:
-                        continue
-
-                    mint = data.get("mint")
-                    if mint is None:
-                        message = data.get("message", "")
-                        if not self._warned_no_access and is_funded_key_rejection(message):
-                            self._warned_no_access = True
-                            bot_state.set_outcome_tracking_rejected(True)
-                            logger.warning(
-                                "PumpPortal wees subscribeTokenTrade af: %s "
-                                "-> outcome-tracking levert geen echte data zonder "
-                                "een funded PUMPPORTAL_API_KEY.",
-                                message,
-                            )
-                        continue
-
-                    ref = extract_price_ref(data)
-                    if ref is not None:
-                        if self._warned_no_access:
-                            # a real trade event means the feed is actually
-                            # working now, despite an earlier rejection
-                            self._warned_no_access = False
-                            bot_state.set_outcome_tracking_rejected(False)
-                        await self._handle_price_update(mint, ref)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Outcome tracker WS fout (probeer volgende ronde opnieuw): %s", exc)
-
     async def _handle_price_update(self, mint: str, ref: float) -> None:
         """Records the new price and exits the position immediately if it
         crosses take-profit, stop-loss, or the trailing stop. Separated from
-        _poll_once so this decision logic can be exercised directly in
-        tests."""
+        _handle_ws_message so this decision logic can be exercised directly
+        in tests."""
         exit_args = None
         async with self._lock:
             info = self._pending.get(mint)
