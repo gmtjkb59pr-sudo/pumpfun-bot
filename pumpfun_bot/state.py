@@ -40,6 +40,11 @@ class BotState:
         self.max_trades_per_hour: int = 0
         self.max_daily_loss_sol: float = 0.0
         self.max_sol_total_exposure: float = 0.0
+        # whether PumpPortal has rejected the paid subscribeTokenTrade feed
+        # this run (missing/unfunded PUMPPORTAL_API_KEY) - lets the dashboard
+        # distinguish "your key doesn't work" from "these tokens just never
+        # traded", instead of always blaming a missing key
+        self.outcome_tracking_api_key_rejected: bool = False
         self._trades: deque = deque(maxlen=max_trades)
         self._alerts: deque = deque(maxlen=max_alerts)
 
@@ -67,6 +72,10 @@ class BotState:
             self.open_exposure_sol = open_exposure_sol
             self.realized_pnl_sol = realized_pnl_sol
             self.trades_last_hour = trades_last_hour
+
+    def set_outcome_tracking_rejected(self, rejected: bool) -> None:
+        with self._lock:
+            self.outcome_tracking_api_key_rejected = rejected
 
     def log_trade(
         self,
@@ -112,6 +121,7 @@ class BotState:
                 "max_trades_per_hour": self.max_trades_per_hour,
                 "max_daily_loss_sol": self.max_daily_loss_sol,
                 "max_sol_total_exposure": self.max_sol_total_exposure,
+                "outcome_tracking_api_key_rejected": self.outcome_tracking_api_key_rejected,
                 "trades": [asdict(t) for t in list(self._trades)[:50]],
                 "alerts": list(self._alerts)[:50],
             }

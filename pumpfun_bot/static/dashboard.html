@@ -444,6 +444,8 @@
     document.getElementById('wallet').textContent = data.wallet_pubkey
       ? shortMint(data.wallet_pubkey) : 'nog niet geladen';
 
+    window.__outcomeTrackingApiKeyRejected = !!data.outcome_tracking_api_key_rejected;
+
     const banner = document.getElementById('modeBanner');
     const label = document.getElementById('modeLabel');
     const sub = document.getElementById('modeSub');
@@ -567,13 +569,24 @@
     document.getElementById('statsOutcomeCount').textContent = `${stats.total_outcomes} gemeten`;
     const wrap = document.getElementById('statsWrap');
 
-    const apiKeyNotice = (stats.total_unmeasured > 0) ? `
-      <div class="empty-state" style="text-align: left; padding: 8px 14px; color: var(--negative);">
-        ${stats.total_unmeasured} snipe(s) konden niet gevolgd worden — PumpPortal's
-        per-token trade-feed vereist een <strong>funded API key</strong> (0.02+ SOL),
-        zie <code>PUMPPORTAL_API_KEY</code> in <code>.env</code>. Zonder key: alleen
-        entry-data, geen koersvervolg.
-      </div>` : '';
+    let apiKeyNotice = '';
+    if (stats.total_unmeasured > 0 && window.__outcomeTrackingApiKeyRejected) {
+      apiKeyNotice = `
+        <div class="empty-state" style="text-align: left; padding: 8px 14px; color: var(--negative);">
+          ${stats.total_unmeasured} snipe(s) konden niet gevolgd worden — PumpPortal's
+          per-token trade-feed vereist een <strong>funded API key</strong> (0.02+ SOL),
+          zie <code>PUMPPORTAL_API_KEY</code> in <code>.env</code>. Zonder key: alleen
+          entry-data, geen koersvervolg.
+        </div>`;
+    } else if (stats.total_unmeasured > 0) {
+      apiKeyNotice = `
+        <div class="empty-state" style="text-align: left; padding: 8px 14px;">
+          ${stats.total_unmeasured} snipe(s) hadden geen enkele vervolgtrade binnen het
+          meetvenster — normaal op pump.fun, waar het merendeel van nieuwe tokens
+          direct dood is na launch. Je API key werkt (er komt echte data binnen),
+          deze specifieke tokens hadden simpelweg geen activiteit.
+        </div>`;
+    }
 
     const checkpoints = Object.keys(stats.by_checkpoint || {});
     if (checkpoints.length === 0 || stats.total_outcomes === 0) {

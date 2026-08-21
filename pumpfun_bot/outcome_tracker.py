@@ -22,6 +22,7 @@ from .activity_log import append_jsonl
 from .price_ref import extract_price_ref
 from .pumpportal_client import authenticated_ws_url
 from .risk import RiskManager
+from .state import bot_state
 
 logger = logging.getLogger("pumpfun_bot.outcome_tracker")
 
@@ -107,6 +108,7 @@ class OutcomeTracker:
                         message = data.get("message", "")
                         if not self._warned_no_access and is_funded_key_rejection(message):
                             self._warned_no_access = True
+                            bot_state.set_outcome_tracking_rejected(True)
                             logger.warning(
                                 "PumpPortal wees subscribeTokenTrade af: %s "
                                 "-> outcome-tracking levert geen echte data zonder "
@@ -117,6 +119,11 @@ class OutcomeTracker:
 
                     ref = extract_price_ref(data)
                     if ref is not None:
+                        if self._warned_no_access:
+                            # a real trade event means the feed is actually
+                            # working now, despite an earlier rejection
+                            self._warned_no_access = False
+                            bot_state.set_outcome_tracking_rejected(False)
                         async with self._lock:
                             if mint in self._pending:
                                 self._pending[mint]["last_ref"] = ref
