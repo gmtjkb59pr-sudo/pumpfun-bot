@@ -188,6 +188,11 @@ class OutcomeTracker:
         # subscribe message merely for whatever's newly tracked, not the
         # whole set again (see _sync_subscription)
         self._subscribed_mints: set[str] = set()
+        # per-mint liquidation-attempt state for untracked wallet holdings
+        # (see _liquidate_untracked_holdings) - separate from _pending since
+        # these were never real tracked positions (no entry price, no risk/
+        # exposure attribution), just something being cleaned up
+        self._untracked_liquidation: dict[str, dict] = {}
 
     def load_pending(self) -> None:
         """Reconstructs _pending from disk - call once at startup, before
@@ -451,9 +456,66 @@ class OutcomeTracker:
         if untracked:
             message = (
                 f"⚠️ {len(untracked)} token(s) in de wallet worden niet gevolgd - "
-                f"controleer handmatig: {', '.join(sorted(untracked))}"
+                f"probeer automatisch te liquideren: {', '.join(sorted(untracked))}"
             )
             logger.warning(message)
+            if self.alerter is not None:
+                await self.alerter.send(message)
+            await self._liquidate_untracked_holdings(untracked)
+
+    async def _liquidate_untracked_holdings(self, untracked: set[str]) -> None:
+        """Best-effort sell of wallet holdings the bot isn't tracking (see
+        _reconcile_with_wallet's docstring for why they're never auto-
+        adopted as real positions - no known entry price or strategy).
+        Purely a cleanup pass: no take-profit/stop-loss/trailing logic
+        applies since there's no entry price to measure against, and it
+        never touches risk/exposure - these tokens were never counted as
+        open exposure to begin with, so nothing to release. Same failure-
+        cap protection as a normal tracked position's exit (see
+        MAX_CONSECUTIVE_SELL_FAILURES) - a mint that keeps failing the same
+        way (e.g. the same on-chain Overflow bug that hit a tracked
+        position) stops being retried instead of burning fees forever."""
+        if self.dry_run or self.client is None:
+            return
+        for mint in untracked:
+            state = self._untracked_liquidation.setdefault(mint, {
+                "consecutive_failures": 0, "last_attempt_ts": 0.0, "paused": False,
+            })
+            if state["paused"]:
+                continue
+            if time.time() - state["last_attempt_ts"] < EXIT_RETRY_COOLDOWN_SEC:
+                continue
+            state["last_attempt_ts"] = time.time()
+
+            try:
+                result = await self.client.build_and_send_full_sell(
+                    mint=mint, slippage_pct=self.sell_slippage_pct,
+                )
+            except Exception as exc:  # noqa: BLE001
+                state["consecutive_failures"] += 1
+                if state["consecutive_failures"] >= MAX_CONSECUTIVE_SELL_FAILURES:
+                    state["paused"] = True
+                    message = (
+                        f"⏸️ Kon niet-getrackte holding {mint} niet liquideren na "
+                        f"{state['consecutive_failures']} pogingen (laatste fout: {exc}) - "
+                        f"gestopt met proberen, controleer handmatig."
+                    )
+                else:
+                    message = f"❌ Liquidatie mislukt voor niet-getrackte holding {mint}: {exc}"
+                logger.warning(message)
+                if self.alerter is not None:
+                    await self.alerter.send(message)
+                continue
+
+            del self._untracked_liquidation[mint]
+            append_jsonl({
+                "type": "untracked_liquidation",
+                "ts": time.time(),
+                "mint": mint,
+                "tx_signature": result["signature"],
+            })
+            message = f"🧹 Niet-getrackte holding {mint} geliquideerd - tx: {result['signature']}"
+            logger.info(message)
             if self.alerter is not None:
                 await self.alerter.send(message)
 
