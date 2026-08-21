@@ -24,6 +24,7 @@ risk:
   max_daily_loss_sol: 0.2       # bot stopt zichzelf als dit verlies bereikt is
   default_slippage_pct: 10
   min_liquidity_sol: 5          # negeer tokens met minder liquiditeit dan dit
+  max_open_positions: 1000      # bot koopt niets nieuws zolang dit aantal posities al open staat
 
 strategies:
   sniper:

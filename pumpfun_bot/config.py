@@ -21,6 +21,7 @@ class RiskConfig:
     max_daily_loss_sol: float = 0.2
     default_slippage_pct: float = 10
     min_liquidity_sol: float = 5
+    max_open_positions: int = 1000  # effectively unlimited unless set lower
 
 
 @dataclass
@@ -121,6 +122,7 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         max_daily_loss_sol=risk_raw.get("max_daily_loss_sol", 0.2),
         default_slippage_pct=risk_raw.get("default_slippage_pct", 10),
         min_liquidity_sol=risk_raw.get("min_liquidity_sol", 5),
+        max_open_positions=risk_raw.get("max_open_positions", 1000),
     )
 
     strat_raw = raw.get("strategies", {})
