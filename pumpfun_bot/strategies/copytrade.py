@@ -73,6 +73,8 @@ class CopyTradeStrategy:
 
             if self.dry_run:
                 logger.info("[DRY RUN] Zou %s %s SOL van %s", action, my_amount, mint)
+                if action == "buy":
+                    self.risk.register_trade_opened(my_amount)
                 bot_state.log_trade("copytrade", action, mint, my_amount, dry_run=True)
                 continue
 
