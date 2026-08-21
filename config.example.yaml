@@ -34,6 +34,8 @@ strategies:
     require_socials: false      # true = alleen tokens met twitter/telegram/website meenemen
     take_profit_pct: 50
     stop_loss_pct: 25
+    trailing_activation_pct: 20  # arm the trailing stop once up this much from entry
+    trailing_stop_pct: 15        # exit if price falls this much from its peak since entry
 
   copytrade:
     enabled: false

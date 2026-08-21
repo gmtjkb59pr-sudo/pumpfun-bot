@@ -109,6 +109,7 @@ class TakeProfitStopLossExitTests(unittest.TestCase):
             "entry_ts": time.time(),
             "entry_ref": entry_ref,
             "last_ref": entry_ref,
+            "peak_ref": entry_ref,
             "name": "Test Token",
             "symbol": "TEST",
             "trade_size_sol": 0.05,
@@ -236,6 +237,7 @@ class LiveExitTests(unittest.TestCase):
             "entry_ts": time.time(),
             "entry_ref": entry_ref,
             "last_ref": entry_ref,
+            "peak_ref": entry_ref,
             "name": "Test Token",
             "symbol": "TEST",
             "trade_size_sol": 0.05,
@@ -293,6 +295,78 @@ class LiveExitTests(unittest.TestCase):
         asyncio.run(tracker._handle_price_update("MINT", 151.0))
 
         self.assertEqual(client.sell_calls, [])
+        self.assertNotIn("MINT", tracker._pending)
+        self.assertAlmostEqual(risk.state.realized_pnl_sol, 0.05 * 0.51, places=4)
+
+
+class TrailingStopTests(unittest.TestCase):
+    def _make_tracker(
+        self, *,
+        take_profit_pct=100.0,   # kept high so TP doesn't preempt the trailing-stop tests
+        stop_loss_pct=90.0,      # kept high so SL doesn't preempt the trailing-stop tests
+        trailing_activation_pct=20.0,
+        trailing_stop_pct=15.0,
+        entry_ref=100.0,
+    ):
+        risk = RiskManager(RiskConfig())
+        risk.register_trade_opened(0.05)
+        tracker = OutcomeTracker(
+            ws_url="wss://example.invalid", risk=risk,
+            take_profit_pct=take_profit_pct, stop_loss_pct=stop_loss_pct,
+            trailing_activation_pct=trailing_activation_pct, trailing_stop_pct=trailing_stop_pct,
+        )
+        tracker._pending["MINT"] = {
+            "entry_ts": time.time(),
+            "entry_ref": entry_ref,
+            "last_ref": entry_ref,
+            "peak_ref": entry_ref,
+            "name": "Test Token",
+            "symbol": "TEST",
+            "trade_size_sol": 0.05,
+            "hit": set(),
+            "has_real_update": False,
+        }
+        return tracker, risk
+
+    def test_triggers_after_activation_and_drawdown_from_peak(self):
+        tracker, risk = self._make_tracker(entry_ref=100.0)
+
+        asyncio.run(tracker._handle_price_update("MINT", 140.0))  # +40%, arms trailing (>=20%)
+        self.assertIn("MINT", tracker._pending)  # no exit yet, just tracking the peak
+
+        asyncio.run(tracker._handle_price_update("MINT", 118.0))  # -15.7% from peak of 140
+
+        self.assertNotIn("MINT", tracker._pending)
+        # locked in +18% from entry, not the full round trip back to ~0/negative
+        self.assertAlmostEqual(risk.state.realized_pnl_sol, 0.05 * 0.18, places=4)
+
+    def test_does_not_arm_before_activation_threshold(self):
+        tracker, risk = self._make_tracker(entry_ref=100.0, trailing_activation_pct=20.0)
+
+        asyncio.run(tracker._handle_price_update("MINT", 110.0))  # only +10%, below activation
+        asyncio.run(tracker._handle_price_update("MINT", 95.0))   # drops, but never armed
+
+        self.assertIn("MINT", tracker._pending)
+        self.assertAlmostEqual(risk.state.realized_pnl_sol, 0.0)
+
+    def test_peak_tracks_highest_price_not_last_price(self):
+        tracker, risk = self._make_tracker(entry_ref=100.0, trailing_activation_pct=20.0, trailing_stop_pct=15.0)
+
+        asyncio.run(tracker._handle_price_update("MINT", 150.0))  # peak = 150
+        asyncio.run(tracker._handle_price_update("MINT", 145.0))  # small dip, doesn't trigger (-3.3%)
+        self.assertIn("MINT", tracker._pending)
+        self.assertEqual(tracker._pending["MINT"]["peak_ref"], 150.0)  # peak stays at 150, not 145
+
+        asyncio.run(tracker._handle_price_update("MINT", 127.0))  # -15.3% from peak of 150 -> triggers
+        self.assertNotIn("MINT", tracker._pending)
+
+    def test_take_profit_still_takes_priority_over_trailing_stop(self):
+        tracker, risk = self._make_tracker(
+            entry_ref=100.0, take_profit_pct=50.0, trailing_activation_pct=20.0, trailing_stop_pct=15.0,
+        )
+
+        asyncio.run(tracker._handle_price_update("MINT", 151.0))  # crosses TP before any trailing logic matters
+
         self.assertNotIn("MINT", tracker._pending)
         self.assertAlmostEqual(risk.state.realized_pnl_sol, 0.05 * 0.51, places=4)
 
