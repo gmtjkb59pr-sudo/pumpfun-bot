@@ -15,6 +15,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import time
 from typing import AsyncIterator, Callable
 
 import aiohttp
@@ -161,19 +162,67 @@ class PumpPortalClient:
         return {"signature": sig, "action": "sell", "mint": mint, "amount": "100%"}
 
     async def _sign_and_send(self, body: dict) -> str:
+        # timing + blockhash-validity diagnostics for BlockhashNotFound
+        # failures: separates "PumpPortal handed us an already-stale
+        # blockhash" from "it went stale during our own processing/submission"
+        t_start = time.monotonic()
         async with aiohttp.ClientSession() as session:
             async with session.post(self.trade_api_url, json=body, timeout=15) as resp:
                 if resp.status != 200:
                     text = await resp.text()
                     raise RuntimeError(f"PumpPortal trade-local fout ({resp.status}): {text}")
                 raw_tx_bytes = await resp.read()
+        t_built = time.monotonic()
 
         tx = VersionedTransaction.from_bytes(raw_tx_bytes)
+        blockhash = str(tx.message.recent_blockhash)
         signed_tx = VersionedTransaction(tx.message, [self.keypair])
+        t_signed = time.monotonic()
 
-        sig = await self._send_raw_transaction(bytes(signed_tx))
+        blockhash_valid = await self._check_blockhash_valid(blockhash)
+        t_checked = time.monotonic()
+
+        def log_timing(outcome: str, t_end: float) -> None:
+            logger.info(
+                "Trade timing (%s): pumpportal_build=%.0fms sign=%.0fms "
+                "blockhash_check=%.0fms rest=%.0fms total=%.0fms "
+                "blockhash=%s valid_right_after_receiving_it=%s",
+                outcome,
+                (t_built - t_start) * 1000,
+                (t_signed - t_built) * 1000,
+                (t_checked - t_signed) * 1000,
+                (t_end - t_checked) * 1000,
+                (t_end - t_start) * 1000,
+                blockhash,
+                blockhash_valid,
+            )
+
+        try:
+            sig = await self._send_raw_transaction(bytes(signed_tx))
+        except Exception:
+            log_timing("FAILED", time.monotonic())
+            raise
+        log_timing("OK", time.monotonic())
         logger.info("Transactie verstuurd: %s", sig)
         return sig
+
+    async def _check_blockhash_valid(self, blockhash: str) -> bool | None:
+        """Asks our own RPC whether this blockhash is still valid right now -
+        None if the check itself fails (doesn't block the actual trade)."""
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "isBlockhashValid",
+            "params": [blockhash, {"commitment": "processed"}],
+        }
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(self.rpc_http_url, json=payload, timeout=10) as resp:
+                    data = await resp.json()
+                    return (data.get("result") or {}).get("value")
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Kon blockhash-geldigheid niet checken: %s", exc)
+            return None
 
     async def _send_raw_transaction(self, raw_tx: bytes) -> str:
         payload = {
