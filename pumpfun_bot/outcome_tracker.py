@@ -144,6 +144,14 @@ class OutcomeTracker:
     def _persist_pending(self) -> None:
         position_store.save(self._pending, self.position_store_path)
 
+    def is_tracking(self, mint: str) -> bool:
+        """Whether a position for this mint is already open - strategies
+        should check this BEFORE buying, not just before calling track(),
+        since two strategies sharing this tracker could otherwise both spend
+        real SOL buying the same mint (only the second call's position would
+        ever be tracked/managed; the first would be bought for nothing)."""
+        return mint in self._pending
+
     async def track(
         self, mint: str, name: str, symbol: str, entry_ref: float | None, trade_size_sol: float = 0.0
     ) -> None:
@@ -151,6 +159,17 @@ class OutcomeTracker:
             logger.debug("Geen price-ref beschikbaar voor %s, sla outcome-tracking over.", mint)
             return
         async with self._lock:
+            if mint in self._pending:
+                # a second buy of a mint we already hold slipped through the
+                # strategy-level is_tracking() check (a real but rare race) -
+                # refuse to clobber the existing tracked position rather than
+                # silently losing its entry_ref/P&L and leaking exposure that
+                # would never get released
+                logger.warning(
+                    "track() opnieuw aangeroepen voor %s terwijl al gevolgd - "
+                    "genegeerd, bestaande positie blijft leidend.", mint,
+                )
+                return
             now = time.time()
             self._pending[mint] = {
                 "entry_ts": now,

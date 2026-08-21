@@ -66,6 +66,16 @@ class SniperStrategy:
         if creator and creator in self.blocked_wallets:
             return False
 
+        mint = event.get("mint")
+        if (
+            mint and self.outcome_tracker is not None
+            and self.outcome_tracker.is_tracking(mint)
+        ):
+            # already held (e.g. social_watch bought this same mint) -
+            # buying again would spend real SOL on a position nothing would
+            # ever track or exit, since OutcomeTracker keys by mint alone
+            return False
+
         return True
 
     async def _refresh_blocked_wallets_loop(self) -> None:

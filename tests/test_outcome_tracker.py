@@ -67,6 +67,29 @@ class FakeClient:
         return {"signature": self.signature, "action": "sell", "mint": mint, "amount": "100%"}
 
 
+class SharedTrackerCollisionTests(unittest.TestCase):
+    """Two strategies (sniper, social_watch) share one OutcomeTracker keyed
+    only by mint - if both ever bought the same mint, the second track()
+    call would silently overwrite the first's entry_ref/P&L and leak
+    exposure that would never get released (only one _pending entry exists
+    to ever register_trade_closed against)."""
+
+    def test_is_tracking_reflects_an_open_position(self):
+        tracker = OutcomeTracker(ws_url="wss://example.invalid")
+        self.assertFalse(tracker.is_tracking("MINT"))
+        asyncio.run(tracker.track("MINT", "Test", "TEST", entry_ref=100.0, trade_size_sol=0.03))
+        self.assertTrue(tracker.is_tracking("MINT"))
+
+    def test_second_track_call_for_same_mint_is_ignored(self):
+        tracker = OutcomeTracker(ws_url="wss://example.invalid")
+        asyncio.run(tracker.track("MINT", "First Buyer", "FIRST", entry_ref=100.0, trade_size_sol=0.03))
+        asyncio.run(tracker.track("MINT", "Second Buyer", "SECOND", entry_ref=999.0, trade_size_sol=0.05))
+
+        self.assertEqual(tracker._pending["MINT"]["name"], "First Buyer")
+        self.assertEqual(tracker._pending["MINT"]["entry_ref"], 100.0)
+        self.assertEqual(tracker._pending["MINT"]["trade_size_sol"], 0.03)
+
+
 class IsFundedKeyRejectionTests(unittest.TestCase):
     def test_detects_the_actual_rejection_message(self):
         message = (

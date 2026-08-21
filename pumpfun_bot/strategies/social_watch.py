@@ -138,6 +138,14 @@ class SocialWatchStrategy:
         symbol = event.get("symbol", "?")
         liquidity_sol = event.get("vSolInBondingCurve")
 
+        if self.outcome_tracker is not None and self.outcome_tracker.is_tracking(mint):
+            # already held (e.g. sniper bought this same mint and hasn't
+            # exited yet) - buying again would spend real SOL on a position
+            # nothing would ever track or exit, since OutcomeTracker keys by
+            # mint alone
+            logger.info("Social-watch: %s wordt al gevolgd, sla over.", mint)
+            return
+
         ok, reason = self.risk.can_trade(self.trade_size_sol, liquidity_sol)
         if not ok:
             logger.info("Social-watch: trade geblokkeerd door risk manager: %s", reason)

@@ -4,6 +4,7 @@ import unittest
 from unittest.mock import patch
 
 from pumpfun_bot.config import RiskConfig, SocialWatchConfig
+from pumpfun_bot.outcome_tracker import OutcomeTracker
 from pumpfun_bot.risk import RiskManager
 from pumpfun_bot.strategies.social_watch import SocialWatchStrategy
 
@@ -51,6 +52,37 @@ def _make_strategy(client, *, dry_run=True, outcome_tracker=None):
         fresh_ref_timeout_sec=0.05,
     )
     return strategy, risk
+
+
+class SharedTrackerCollisionTests(unittest.TestCase):
+    """If a mint is already held (e.g. by sniper), social_watch must not
+    also buy it - OutcomeTracker is shared and keyed by mint alone, so a
+    second buy would spend real SOL on a position nothing would ever track
+    or exit."""
+
+    def test_skips_buy_when_mint_already_tracked(self):
+        import tempfile
+        from pathlib import Path
+
+        store_file = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
+        store_file.close()
+        store_path = Path(store_file.name)
+        self.addCleanup(lambda: store_path.unlink(missing_ok=True))
+
+        client = FakeClient()
+        outcome_tracker = OutcomeTracker(ws_url="wss://example.invalid", position_store_path=store_path)
+        asyncio.run(outcome_tracker.track(
+            "MINT", "Already Held", "HELD", entry_ref=100.0, trade_size_sol=0.03,
+        ))
+
+        strategy, risk = _make_strategy(client, dry_run=False, outcome_tracker=outcome_tracker)
+        asyncio.run(strategy._buy("MINT", {
+            "mint": "MINT", "name": "Test", "symbol": "TEST",
+            "vSolInBondingCurve": 30.0, "traderPublicKey": "CREATOR",
+        }))
+
+        self.assertEqual(client.buy_calls, [])
+        self.assertAlmostEqual(risk.state.open_exposure_sol, 0.0)
 
 
 class FetchFreshRefTests(unittest.TestCase):
