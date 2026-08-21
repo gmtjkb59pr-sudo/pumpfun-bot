@@ -67,6 +67,80 @@ class FakeClient:
         return {"signature": self.signature, "action": "sell", "mint": mint, "amount": "100%"}
 
 
+class PerPositionThresholdTests(unittest.TestCase):
+    """sniper and social_watch share one OutcomeTracker instance, which only
+    has ONE set of take_profit_pct/stop_loss_pct/trailing_*_pct - found live
+    that changing social_watch's config values did nothing at all, because
+    nothing ever passed them into track(). Exit thresholds must be stored
+    per-position (from whichever strategy actually opened it), not just
+    read from the shared instance's own defaults."""
+
+    def _make_tracker(self, *, instance_take_profit_pct=50.0):
+        risk = RiskManager(RiskConfig())
+        risk.register_trade_opened(0.05)
+        tracker = OutcomeTracker(
+            ws_url="wss://example.invalid", risk=risk, take_profit_pct=instance_take_profit_pct,
+        )
+        return tracker, risk
+
+    def test_track_stores_explicit_thresholds_on_the_position(self):
+        tracker, _ = self._make_tracker(instance_take_profit_pct=50.0)
+        asyncio.run(tracker.track(
+            "MINT", "Test", "TEST", entry_ref=100.0, trade_size_sol=0.05,
+            take_profit_pct=100.0, stop_loss_pct=25.0,
+            trailing_activation_pct=20.0, trailing_stop_pct=15.0,
+        ))
+        self.assertEqual(tracker._pending["MINT"]["take_profit_pct"], 100.0)
+
+    def test_track_falls_back_to_instance_default_when_not_given(self):
+        tracker, _ = self._make_tracker(instance_take_profit_pct=50.0)
+        asyncio.run(tracker.track("MINT", "Test", "TEST", entry_ref=100.0, trade_size_sol=0.05))
+        self.assertEqual(tracker._pending["MINT"]["take_profit_pct"], 50.0)
+
+    def test_a_100pct_target_does_not_exit_at_the_instance_default_of_50pct(self):
+        # the actual bug: instance-wide take_profit_pct=50 (as if constructed
+        # for sniper), but THIS position was opened with an explicit 100%
+        # target (as if by social_watch) - a +51% move must NOT trigger
+        # take-profit for this position, even though it would cross the
+        # tracker's own instance-level default
+        tracker, risk = self._make_tracker(instance_take_profit_pct=50.0)
+        asyncio.run(tracker.track(
+            "MINT", "Test", "TEST", entry_ref=100.0, trade_size_sol=0.05,
+            take_profit_pct=100.0, stop_loss_pct=25.0,
+            trailing_activation_pct=20.0, trailing_stop_pct=15.0,
+        ))
+        asyncio.run(tracker._handle_price_update("MINT", 151.0))  # +51%
+
+        self.assertIn("MINT", tracker._pending)  # still open, no exit yet
+        self.assertAlmostEqual(risk.state.realized_pnl_sol, 0.0)
+
+    def test_exits_at_its_own_100pct_target_once_actually_crossed(self):
+        tracker, risk = self._make_tracker(instance_take_profit_pct=50.0)
+        asyncio.run(tracker.track(
+            "MINT", "Test", "TEST", entry_ref=100.0, trade_size_sol=0.05,
+            take_profit_pct=100.0, stop_loss_pct=25.0,
+            trailing_activation_pct=20.0, trailing_stop_pct=15.0,
+        ))
+        asyncio.run(tracker._handle_price_update("MINT", 201.0))  # +101%
+
+        self.assertNotIn("MINT", tracker._pending)
+        self.assertGreater(risk.state.realized_pnl_sol, 0.0)
+
+    def test_old_persisted_positions_without_the_field_use_instance_defaults(self):
+        # backward compatibility: a position tracked before this fix existed
+        # (or a hand-built test fixture) has no take_profit_pct key at all
+        tracker, risk = self._make_tracker(instance_take_profit_pct=50.0)
+        tracker._pending["MINT"] = {
+            "entry_ts": 0.0, "entry_ref": 100.0, "last_ref": 100.0, "peak_ref": 100.0,
+            "name": "Test", "symbol": "TEST", "trade_size_sol": 0.05,
+            "hit": set(), "has_real_update": False,
+        }
+        asyncio.run(tracker._handle_price_update("MINT", 151.0))  # +51%, crosses the 50% default
+
+        self.assertNotIn("MINT", tracker._pending)
+        self.assertGreater(risk.state.realized_pnl_sol, 0.0)
+
+
 class SharedTrackerCollisionTests(unittest.TestCase):
     """Two strategies (sniper, social_watch) share one OutcomeTracker keyed
     only by mint - if both ever bought the same mint, the second track()

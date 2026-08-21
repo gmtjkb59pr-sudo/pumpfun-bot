@@ -153,8 +153,19 @@ class OutcomeTracker:
         return mint in self._pending
 
     async def track(
-        self, mint: str, name: str, symbol: str, entry_ref: float | None, trade_size_sol: float = 0.0
+        self, mint: str, name: str, symbol: str, entry_ref: float | None, trade_size_sol: float = 0.0,
+        take_profit_pct: float | None = None,
+        stop_loss_pct: float | None = None,
+        trailing_activation_pct: float | None = None,
+        trailing_stop_pct: float | None = None,
     ) -> None:
+        """take_profit_pct/stop_loss_pct/trailing_*_pct default to this
+        instance's own thresholds - pass explicit values when a DIFFERENT
+        strategy shares this same tracker (e.g. social_watch) and needs its
+        own exit thresholds instead of sniper's. Without this, a shared
+        OutcomeTracker silently applies only whichever strategy's config it
+        was constructed with to every position, regardless of which
+        strategy actually opened it."""
         if entry_ref is None:
             logger.debug("Geen price-ref beschikbaar voor %s, sla outcome-tracking over.", mint)
             return
@@ -188,6 +199,15 @@ class OutcomeTracker:
                 # detect a token that's gone quiet (likely dead/rugged) well
                 # before the full MAX_HOLD_SEC timeout
                 "last_update_ts": now,
+                "take_profit_pct": take_profit_pct if take_profit_pct is not None else self.take_profit_pct,
+                "stop_loss_pct": stop_loss_pct if stop_loss_pct is not None else self.stop_loss_pct,
+                "trailing_activation_pct": (
+                    trailing_activation_pct if trailing_activation_pct is not None
+                    else self.trailing_activation_pct
+                ),
+                "trailing_stop_pct": (
+                    trailing_stop_pct if trailing_stop_pct is not None else self.trailing_stop_pct
+                ),
             }
             self._persist_pending()
 
@@ -267,14 +287,22 @@ class OutcomeTracker:
                 peak_pct_change = ((info["peak_ref"] - info["entry_ref"]) / info["entry_ref"]) * 100
                 drawdown_from_peak_pct = ((ref - info["peak_ref"]) / info["peak_ref"]) * 100
 
+                # per-position thresholds - falls back to this instance's
+                # own defaults for positions tracked before this field
+                # existed (old persisted state, hand-built test fixtures)
+                take_profit_pct = info.get("take_profit_pct", self.take_profit_pct)
+                stop_loss_pct = info.get("stop_loss_pct", self.stop_loss_pct)
+                trailing_activation_pct = info.get("trailing_activation_pct", self.trailing_activation_pct)
+                trailing_stop_pct = info.get("trailing_stop_pct", self.trailing_stop_pct)
+
                 triggered_reason = None
-                if pct_change >= self.take_profit_pct:
+                if pct_change >= take_profit_pct:
                     triggered_reason = "take_profit"
-                elif pct_change <= -self.stop_loss_pct:
+                elif pct_change <= -stop_loss_pct:
                     triggered_reason = "stop_loss"
                 elif (
-                    peak_pct_change >= self.trailing_activation_pct
-                    and drawdown_from_peak_pct <= -self.trailing_stop_pct
+                    peak_pct_change >= trailing_activation_pct
+                    and drawdown_from_peak_pct <= -trailing_stop_pct
                 ):
                     triggered_reason = "trailing_stop"
                 if triggered_reason and self._exit_attempt_allowed(info):

@@ -207,6 +207,10 @@ class SocialWatchStrategy:
             if self.outcome_tracker is not None:
                 await self.outcome_tracker.track(
                     mint, name, symbol, entry_ref, trade_size_sol=self.trade_size_sol,
+                    take_profit_pct=self.cfg.take_profit_pct,
+                    stop_loss_pct=self.cfg.stop_loss_pct,
+                    trailing_activation_pct=self.cfg.trailing_activation_pct,
+                    trailing_stop_pct=self.cfg.trailing_stop_pct,
                 )
             return
 
@@ -229,6 +233,10 @@ class SocialWatchStrategy:
             if self.outcome_tracker is not None:
                 await self.outcome_tracker.track(
                     mint, name, symbol, entry_ref, trade_size_sol=self.trade_size_sol,
+                    take_profit_pct=self.cfg.take_profit_pct,
+                    stop_loss_pct=self.cfg.stop_loss_pct,
+                    trailing_activation_pct=self.cfg.trailing_activation_pct,
+                    trailing_stop_pct=self.cfg.trailing_stop_pct,
                 )
         except Exception as exc:  # noqa: BLE001
             logger.exception("Social-watch buy mislukt voor %s: %s", mint, exc)
