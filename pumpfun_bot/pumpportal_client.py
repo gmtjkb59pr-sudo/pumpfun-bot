@@ -23,6 +23,8 @@ import websockets
 from solders.keypair import Keypair
 from solders.transaction import VersionedTransaction
 
+from .fees import PRIORITY_FEE_SOL_PER_LEG
+
 logger = logging.getLogger("pumpfun_bot.pumpportal")
 
 
@@ -106,7 +108,7 @@ class PumpPortalClient:
         mint: str,
         amount_sol: float,
         slippage_pct: float,
-        priority_fee_sol: float = 0.0005,
+        priority_fee_sol: float = PRIORITY_FEE_SOL_PER_LEG,
         pool: str = "pump",
     ) -> dict:
         """
@@ -138,7 +140,7 @@ class PumpPortalClient:
         self,
         mint: str,
         slippage_pct: float,
-        priority_fee_sol: float = 0.0005,
+        priority_fee_sol: float = PRIORITY_FEE_SOL_PER_LEG,
         pool: str = "pump",
     ) -> dict:
         """

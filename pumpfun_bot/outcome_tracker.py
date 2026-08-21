@@ -49,6 +49,7 @@ import websockets
 
 from .activity_log import append_jsonl
 from .alerts import Alerter
+from .fees import ROUND_TRIP_PRIORITY_FEE_SOL, net_pct_change_after_fees
 from .price_ref import extract_price_ref
 from .pumpportal_client import authenticated_ws_url
 from .risk import RiskManager
@@ -292,9 +293,15 @@ class OutcomeTracker:
             # rather than guessing, but still release the exposure slot since
             # the position really is closing
             if pct_change is not None:
-                pnl_sol = round(info["trade_size_sol"] * (pct_change / 100), 6)
+                net_pct = net_pct_change_after_fees(pct_change)
+                pnl_sol = round(info["trade_size_sol"] * (net_pct / 100), 6)
             else:
                 pnl_sol = 0.0
+            if not self.dry_run:
+                # a real buy and a real sell transaction were each submitted
+                # with a real priority fee attached - subtract that actual
+                # on-chain cost so the dashboard's P&L matches the wallet
+                pnl_sol = round(pnl_sol - ROUND_TRIP_PRIORITY_FEE_SOL, 6)
             self.risk.register_trade_closed(info["trade_size_sol"], pnl_sol)
         append_jsonl({
             "type": "exit",

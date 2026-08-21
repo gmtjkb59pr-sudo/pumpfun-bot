@@ -6,8 +6,13 @@ from pathlib import Path
 
 import pumpfun_bot.activity_log as activity_log
 from pumpfun_bot.config import RiskConfig
+from pumpfun_bot.fees import ROUND_TRIP_PRIORITY_FEE_SOL, net_pct_change_after_fees
 from pumpfun_bot.outcome_tracker import CHECKPOINTS_SEC, OutcomeTracker, is_funded_key_rejection
 from pumpfun_bot.risk import RiskManager
+
+
+def _net_pnl_sol(trade_size_sol: float, gross_pct_change: float) -> float:
+    return round(trade_size_sol * (net_pct_change_after_fees(gross_pct_change) / 100), 6)
 
 _ORIGINAL_DATA_LOG_PATH = activity_log.DATA_LOG_PATH
 _TEST_LOG_FILE = None
@@ -86,7 +91,7 @@ class ClosesPositionAtFinalCheckpointTests(unittest.TestCase):
         asyncio.run(tracker._emit_due_checkpoints())
 
         self.assertAlmostEqual(risk.state.open_exposure_sol, 0.0)
-        self.assertAlmostEqual(risk.state.realized_pnl_sol, 0.05 * 0.20)
+        self.assertAlmostEqual(risk.state.realized_pnl_sol, _net_pnl_sol(0.05, 20.0))
         self.assertNotIn("MINT", tracker._pending)
 
     def test_leaves_position_open_when_unmeasured(self):
@@ -122,7 +127,9 @@ class ClosesPositionAtFinalCheckpointTests(unittest.TestCase):
         self.assertEqual(client.sell_calls, [("MINT", tracker.sell_slippage_pct)])
         self.assertNotIn("MINT", tracker._pending)
         self.assertAlmostEqual(risk.state.open_exposure_sol, 0.0)
-        self.assertAlmostEqual(risk.state.realized_pnl_sol, 0.0)
+        # unknown price -> 0 pnl from the trade itself, but the real priority
+        # fee on the forced sell (and its earlier buy) still gets subtracted
+        self.assertAlmostEqual(risk.state.realized_pnl_sol, -ROUND_TRIP_PRIORITY_FEE_SOL)
 
 
 class TakeProfitStopLossExitTests(unittest.TestCase):
@@ -152,7 +159,7 @@ class TakeProfitStopLossExitTests(unittest.TestCase):
 
         self.assertNotIn("MINT", tracker._pending)
         self.assertAlmostEqual(risk.state.open_exposure_sol, 0.0)
-        self.assertAlmostEqual(risk.state.realized_pnl_sol, 0.05 * 0.51, places=4)
+        self.assertAlmostEqual(risk.state.realized_pnl_sol, _net_pnl_sol(0.05, 51.0), places=4)
 
     def test_stop_loss_closes_position_immediately(self):
         tracker, risk = self._make_tracker(stop_loss_pct=25.0, entry_ref=100.0)
@@ -160,7 +167,7 @@ class TakeProfitStopLossExitTests(unittest.TestCase):
 
         self.assertNotIn("MINT", tracker._pending)
         self.assertAlmostEqual(risk.state.open_exposure_sol, 0.0)
-        self.assertAlmostEqual(risk.state.realized_pnl_sol, 0.05 * -0.30, places=4)
+        self.assertAlmostEqual(risk.state.realized_pnl_sol, _net_pnl_sol(0.05, -30.0), places=4)
 
     def test_small_move_does_not_trigger_exit(self):
         tracker, risk = self._make_tracker(take_profit_pct=50.0, stop_loss_pct=25.0, entry_ref=100.0)
@@ -284,7 +291,9 @@ class LiveExitTests(unittest.TestCase):
         self.assertEqual(client.sell_calls[0][0], "MINT")
         self.assertNotIn("MINT", tracker._pending)
         self.assertAlmostEqual(risk.state.open_exposure_sol, 0.0)
-        self.assertAlmostEqual(risk.state.realized_pnl_sol, 0.05 * 0.51, places=4)
+        self.assertAlmostEqual(
+            risk.state.realized_pnl_sol, _net_pnl_sol(0.05, 51.0) - ROUND_TRIP_PRIORITY_FEE_SOL, places=4
+        )
 
     def test_failed_real_sell_leaves_position_open(self):
         client = FakeClient(should_fail=True)
@@ -324,7 +333,7 @@ class LiveExitTests(unittest.TestCase):
 
         self.assertEqual(client.sell_calls, [])
         self.assertNotIn("MINT", tracker._pending)
-        self.assertAlmostEqual(risk.state.realized_pnl_sol, 0.05 * 0.51, places=4)
+        self.assertAlmostEqual(risk.state.realized_pnl_sol, _net_pnl_sol(0.05, 51.0), places=4)
 
 
 class TrailingStopTests(unittest.TestCase):
@@ -366,7 +375,7 @@ class TrailingStopTests(unittest.TestCase):
 
         self.assertNotIn("MINT", tracker._pending)
         # locked in +18% from entry, not the full round trip back to ~0/negative
-        self.assertAlmostEqual(risk.state.realized_pnl_sol, 0.05 * 0.18, places=4)
+        self.assertAlmostEqual(risk.state.realized_pnl_sol, _net_pnl_sol(0.05, 18.0), places=4)
 
     def test_does_not_arm_before_activation_threshold(self):
         tracker, risk = self._make_tracker(entry_ref=100.0, trailing_activation_pct=20.0)
@@ -396,7 +405,7 @@ class TrailingStopTests(unittest.TestCase):
         asyncio.run(tracker._handle_price_update("MINT", 151.0))  # crosses TP before any trailing logic matters
 
         self.assertNotIn("MINT", tracker._pending)
-        self.assertAlmostEqual(risk.state.realized_pnl_sol, 0.05 * 0.51, places=4)
+        self.assertAlmostEqual(risk.state.realized_pnl_sol, _net_pnl_sol(0.05, 51.0), places=4)
 
 
 if __name__ == "__main__":
