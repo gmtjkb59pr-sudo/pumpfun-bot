@@ -1,19 +1,24 @@
 """
-Looks at social_watch's own buy/exit history to decide whether real evidence
+Looks at a strategy's own buy/exit history to decide whether real evidence
 supports raising min_holder_count - same conservative philosophy as
 auto_tuner.py:
 - Only ever tightens (raises the bar), never loosens.
 - Requires a real minimum sample size in both the candidate bucket and the
   baseline before acting, to avoid reacting to noise on a handful of trades.
-- Only applies to social_watch, not sniper - sniper buys instantly, before
-  holder count is even real (confirmed: checking immediately after a buy
-  reliably reads 0), so there's no point in the pipeline where sniper could
-  ever act on this signal. social_watch already waits, so it can.
+- Not applied to sniper - sniper buys instantly, before holder count is even
+  real (confirmed: checking immediately after a buy reliably reads 0), so
+  there's no point in the pipeline where sniper could ever act on this
+  signal. social_watch and birdeye_movers both wait long enough for a real
+  holder count to exist, so they can.
+
+Generic across any strategy that logs a "holder_count" in its buy meta and
+holds its own min_holder_count field (social_watch, birdeye_movers) - pass
+`strategy` to scope the outcome data, and `field_name` so the caller (see
+auto_tuner.py) can route the resulting change to the right config object.
 
 Deliberately separate from auto_tuner.py's own liquidity/socials logic
-rather than bolted onto it - this looks at a different strategy's own
-trades (social_watch, not sniper) and a config field that only exists on
-SocialWatchConfig.
+rather than bolted onto it - this looks at per-strategy trades and a config
+field that doesn't exist on every strategy's config.
 """
 from __future__ import annotations
 
@@ -35,11 +40,13 @@ HOLDER_COUNT_BUCKETS = (
 )
 
 
-def compute_holder_count_outcomes(log_path=DATA_LOG_PATH) -> list[tuple[int, float]]:
+def compute_holder_count_outcomes(
+    log_path=DATA_LOG_PATH, strategy: str = "social_watch",
+) -> list[tuple[int, float]]:
     """Returns [(holder_count, net_pct_change_after_fees), ...] for every
-    social_watch buy that has both a logged holder_count and a completed
+    `strategy` buy that has both a logged holder_count and a completed
     exit with a measured pct_change."""
-    social_watch_buys: dict[str, int] = {}
+    buys: dict[str, int] = {}
     exits: dict[str, float] = {}
     try:
         with open(log_path) as f:
@@ -52,12 +59,12 @@ def compute_holder_count_outcomes(log_path=DATA_LOG_PATH) -> list[tuple[int, flo
                 except json.JSONDecodeError:
                     continue
                 if d.get("type") == "trade" and d.get("action") == "buy":
-                    if d.get("strategy") != "social_watch":
+                    if d.get("strategy") != strategy:
                         continue
                     hc = (d.get("meta") or {}).get("holder_count")
                     mint = d.get("mint")
                     if hc is not None and mint:
-                        social_watch_buys[mint] = hc
+                        buys[mint] = hc
                 elif d.get("type") == "exit":
                     mint = d.get("mint")
                     pct = d.get("pct_change")
@@ -68,7 +75,7 @@ def compute_holder_count_outcomes(log_path=DATA_LOG_PATH) -> list[tuple[int, flo
 
     return [
         (hc, net_pct_change_after_fees(exits[mint]))
-        for mint, hc in social_watch_buys.items()
+        for mint, hc in buys.items()
         if mint in exits
     ]
 
@@ -78,10 +85,15 @@ def decide_min_holder_count(
     current_min_holder_count: int = 0,
     min_samples: int = MIN_SAMPLES,
     margin_pct: float = MARGIN_PCT,
+    strategy: str = "social_watch",
+    field_name: str = "min_holder_count",
 ) -> list[dict]:
     """Pure decision logic, kept separate from any async loop so it's easy
-    to test without needing real time to pass."""
-    pairs = compute_holder_count_outcomes(log_path)
+    to test without needing real time to pass. `field_name` is only what
+    goes into the returned change dict's "field" key - lets a caller
+    managing multiple strategies (see auto_tuner.py) tell apart which
+    strategy's min_holder_count a given change is meant for."""
+    pairs = compute_holder_count_outcomes(log_path, strategy=strategy)
     if not pairs:
         return []
 
@@ -102,7 +114,7 @@ def decide_min_holder_count(
         return []
 
     return [{
-        "field": "min_holder_count",
+        "field": field_name,
         "from": current_min_holder_count,
         "to": best_min_count,
         "reason": (
