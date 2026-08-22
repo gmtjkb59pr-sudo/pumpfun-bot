@@ -174,6 +174,13 @@ class AppConfig:
     telegram_chat_id: str
     dashboard_enabled: bool = True
     dashboard_port: int = 8765
+    # user-requested: OKX Onchain OS credentials for the smart-money wallet
+    # lister (see smart_money_wallets.py / list_smart_money_wallets.py) -
+    # signed-request auth, needs all three. Empty by default so existing
+    # configs without OKX access never break.
+    okx_api_key: str = ""
+    okx_secret_key: str = ""
+    okx_passphrase: str = ""
 
 
 def load_config(path: str = "config.yaml") -> AppConfig:
@@ -303,4 +310,7 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         telegram_chat_id=tg_raw.get("chat_id", ""),
         dashboard_enabled=dash_raw.get("enabled", True),
         dashboard_port=dash_raw.get("port", 8765),
+        okx_api_key=os.environ.get("OKX_API_KEY", ""),
+        okx_secret_key=os.environ.get("OKX_SECRET_KEY", ""),
+        okx_passphrase=os.environ.get("OKX_PASSPHRASE", ""),
     )
