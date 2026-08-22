@@ -74,6 +74,25 @@ strategies:
     # trade tick). 0 = geen filter.
     min_market_cap_usd: 0
 
+  birdeye_movers:
+    # Ontdekt al bestaande tokens met een echte volume/prijs-spike via
+    # Birdeye's trending API - social_watch ziet alleen gloednieuwe
+    # launches (subscribeNewToken), dit dekt dat gat. Vereist een gratis
+    # account + API key op birdeye.so, zie .env.example (BIRDEYE_API_KEY).
+    enabled: false
+    api_key_env_var: "BIRDEYE_API_KEY"
+    # Birdeye's gratis tier is ~1000 calls/maand (30.000 CU, 30 CU/call) -
+    # deze cadans (45 min) blijft daar ruim binnen, ook 24/7 draaiend. NIET
+    # verlagen zonder eerst de Birdeye pricing-pagina te checken.
+    poll_interval_sec: 2700
+    trending_limit: 20
+    take_profit_pct: 50
+    stop_loss_pct: 25
+    trailing_activation_pct: 20
+    trailing_stop_pct: 15
+    min_holder_count: 0
+    max_top10_concentration_pct: 0
+
   copytrade:
     enabled: false
     watched_wallets:
