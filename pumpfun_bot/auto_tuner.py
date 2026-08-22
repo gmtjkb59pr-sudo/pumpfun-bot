@@ -160,6 +160,7 @@ class AutoTuner:
         alerter: Alerter,
         outcome_tracker=None,
         social_watch_cfg=None,
+        birdeye_movers_cfg=None,
         log_path=DATA_LOG_PATH,
         interval_sec: int = CHECK_INTERVAL_SEC,
         checkpoint_sec: int = DEFAULT_CHECKPOINT_SEC,
@@ -170,10 +171,12 @@ class AutoTuner:
         # optional so entry-filter tuning still works without it - only the
         # take-profit adjustment needs a live OutcomeTracker to mutate
         self.outcome_tracker = outcome_tracker
-        # optional - only social_watch's min_holder_count tuning needs this,
-        # since that field only exists on SocialWatchConfig (see
-        # holder_count_tuning.py for why this can't apply to sniper at all)
+        # optional - only social_watch's/birdeye_movers' min_holder_count
+        # tuning needs these, since that field doesn't exist on every
+        # strategy's config (see holder_count_tuning.py for why this can't
+        # apply to sniper at all)
         self.social_watch_cfg = social_watch_cfg
+        self.birdeye_movers_cfg = birdeye_movers_cfg
         self.log_path = log_path
         self.interval_sec = interval_sec
         self.checkpoint_sec = checkpoint_sec
@@ -196,6 +199,14 @@ class AutoTuner:
                 changes += decide_min_holder_count(
                     self.log_path,
                     current_min_holder_count=self.social_watch_cfg.min_holder_count,
+                    strategy="social_watch",
+                )
+            if self.birdeye_movers_cfg is not None:
+                changes += decide_min_holder_count(
+                    self.log_path,
+                    current_min_holder_count=self.birdeye_movers_cfg.min_holder_count,
+                    strategy="birdeye_movers",
+                    field_name="birdeye_movers_min_holder_count",
                 )
             for change in changes:
                 await self._apply(change)
@@ -210,6 +221,8 @@ class AutoTuner:
             self.outcome_tracker.take_profit_pct = change["to"]
         elif field == "min_holder_count" and self.social_watch_cfg is not None:
             self.social_watch_cfg.min_holder_count = change["to"]
+        elif field == "birdeye_movers_min_holder_count" and self.birdeye_movers_cfg is not None:
+            self.birdeye_movers_cfg.min_holder_count = change["to"]
         else:
             logger.warning("Onbekend auto-tune veld genegeerd: %s", field)
             return

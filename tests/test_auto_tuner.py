@@ -1,6 +1,15 @@
+import asyncio
 import unittest
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
-from pumpfun_bot.auto_tuner import EXIT_MIN_SAMPLES, MIN_SAMPLES, decide_adjustments, decide_exit_adjustments
+from pumpfun_bot.auto_tuner import (
+    EXIT_MIN_SAMPLES,
+    MIN_SAMPLES,
+    AutoTuner,
+    decide_adjustments,
+    decide_exit_adjustments,
+)
 
 
 def make_bucket(count, median_pct_change):
@@ -154,6 +163,51 @@ class DecideExitAdjustmentsTests(unittest.TestCase):
         stats = make_exit_stats(EXIT_MIN_SAMPLES, 5.0, 90.0)  # below MIN_TAKE_PROFIT_PCT
         changes = decide_exit_adjustments(stats, current_take_profit_pct=50.0)
         self.assertEqual(changes, [])
+
+
+def _make_tuner(**kwargs):
+    defaults = dict(
+        sniper_cfg=SimpleNamespace(require_socials=False),
+        risk=MagicMock(cfg=SimpleNamespace(min_liquidity_sol=5.0)),
+        alerter=MagicMock(send=AsyncMock()),
+    )
+    defaults.update(kwargs)
+    return AutoTuner(**defaults)
+
+
+class ApplyTests(unittest.TestCase):
+    def test_routes_birdeye_movers_min_holder_count_to_its_own_config(self):
+        birdeye_cfg = SimpleNamespace(min_holder_count=1)
+        social_cfg = SimpleNamespace(min_holder_count=1)
+        tuner = _make_tuner(social_watch_cfg=social_cfg, birdeye_movers_cfg=birdeye_cfg)
+
+        asyncio.run(tuner._apply({
+            "field": "birdeye_movers_min_holder_count", "from": 1, "to": 100, "reason": "test",
+        }))
+
+        self.assertEqual(birdeye_cfg.min_holder_count, 100)
+        self.assertEqual(social_cfg.min_holder_count, 1)
+
+    def test_plain_min_holder_count_still_routes_to_social_watch_only(self):
+        birdeye_cfg = SimpleNamespace(min_holder_count=1)
+        social_cfg = SimpleNamespace(min_holder_count=1)
+        tuner = _make_tuner(social_watch_cfg=social_cfg, birdeye_movers_cfg=birdeye_cfg)
+
+        asyncio.run(tuner._apply({
+            "field": "min_holder_count", "from": 1, "to": 100, "reason": "test",
+        }))
+
+        self.assertEqual(social_cfg.min_holder_count, 100)
+        self.assertEqual(birdeye_cfg.min_holder_count, 1)
+
+    def test_birdeye_movers_change_is_a_noop_without_a_configured_target(self):
+        tuner = _make_tuner()  # no birdeye_movers_cfg passed
+
+        asyncio.run(tuner._apply({
+            "field": "birdeye_movers_min_holder_count", "from": 1, "to": 100, "reason": "test",
+        }))
+        # no exception, no alert sent - unroutable change is dropped, not applied blindly
+        tuner.alerter.send.assert_not_called()
 
 
 if __name__ == "__main__":
