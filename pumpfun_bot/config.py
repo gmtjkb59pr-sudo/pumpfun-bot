@@ -84,6 +84,12 @@ class SocialWatchConfig:
     # Window shortened from the original 1h to 5m - user-requested, matches
     # how young these candidates actually are. False = no filter.
     require_positive_momentum_5m: bool = False
+    # user-requested, evidence-based (real dry-run outcomes): losing trades
+    # averaged 216% 5m momentum at buy vs 134% for winners, and win rate
+    # drops sharply above ~100% (80% win at 0-50% momentum, ~25-31% above
+    # 150%) - buying a token already up 100%+ correlates with buying near a
+    # local top. 0 = no ceiling.
+    max_price_change_5m_pct: float = 0
     # user-requested: own position budget, separate from the global
     # risk.max_open_positions shared pool - a burst of buys from another
     # strategy (e.g. birdeye_movers firing all at once on its slow poll)
@@ -229,6 +235,7 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         min_market_cap_usd=sw_raw.get("min_market_cap_usd", 0),
         max_top10_concentration_pct=sw_raw.get("max_top10_concentration_pct", 0),
         require_positive_momentum_5m=sw_raw.get("require_positive_momentum_5m", False),
+        max_price_change_5m_pct=sw_raw.get("max_price_change_5m_pct", 0),
         max_open_positions=sw_raw.get("max_open_positions", 5),
     )
 
