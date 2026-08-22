@@ -329,6 +329,8 @@ class MaxTop10ConcentrationGateTests(unittest.TestCase):
         with patch(
             "pumpfun_bot.strategies.social_watch.HOLDER_COUNT_INDEXING_DELAY_SEC", 0,
         ), patch(
+            "pumpfun_bot.strategies.social_watch.CONCENTRATION_SETTLING_DELAY_SEC", 0,
+        ), patch(
             "pumpfun_bot.strategies.social_watch.fetch_top10_concentration_pct",
             _fake_fetch_top10_concentration_pct,
         ):
@@ -349,6 +351,8 @@ class MaxTop10ConcentrationGateTests(unittest.TestCase):
         with patch(
             "pumpfun_bot.strategies.social_watch.HOLDER_COUNT_INDEXING_DELAY_SEC", 0,
         ), patch(
+            "pumpfun_bot.strategies.social_watch.CONCENTRATION_SETTLING_DELAY_SEC", 0,
+        ), patch(
             "pumpfun_bot.strategies.social_watch.fetch_top10_concentration_pct",
             _fake_fetch_top10_concentration_pct,
         ):
@@ -368,6 +372,8 @@ class MaxTop10ConcentrationGateTests(unittest.TestCase):
 
         with patch(
             "pumpfun_bot.strategies.social_watch.HOLDER_COUNT_INDEXING_DELAY_SEC", 0,
+        ), patch(
+            "pumpfun_bot.strategies.social_watch.CONCENTRATION_SETTLING_DELAY_SEC", 0,
         ), patch(
             "pumpfun_bot.strategies.social_watch.fetch_top10_concentration_pct",
             _failing_fetch_top10_concentration_pct,
@@ -480,6 +486,66 @@ class HolderCountIndexingDelayTests(unittest.TestCase):
             elapsed = time.time() - start
 
         self.assertLess(elapsed, 1.0)
+
+    def test_tops_up_to_the_settling_delay_when_concentration_filter_is_active(self):
+        # right after launch, virtually all supply sits with the deployer/
+        # curve - not an indexing lag, just "no one has traded yet" - so the
+        # concentration check needs its own short settling window too
+        client = FakeClient(trade_events=[{"marketCapSol": 30.0}])
+        strategy, _ = _make_strategy(client, dry_run=True, max_top10_concentration_pct=70)
+
+        concentration_calls = []
+
+        async def _fake_fetch_top10_concentration_pct(mint, rpc_http_url):
+            concentration_calls.append(time.time())
+            return 30.0
+
+        with patch(
+            "pumpfun_bot.strategies.social_watch.CONCENTRATION_SETTLING_DELAY_SEC", 0.05,
+        ), patch(
+            "pumpfun_bot.strategies.social_watch.fetch_top10_concentration_pct",
+            _fake_fetch_top10_concentration_pct,
+        ):
+            start = time.time()
+            asyncio.run(strategy._buy("MINT", {
+                "mint": "MINT", "name": "Test", "symbol": "TEST", "vSolInBondingCurve": 30.0,
+            }, time.time()))
+
+        self.assertEqual(len(concentration_calls), 1)
+        self.assertGreaterEqual(concentration_calls[0] - start, 0.05)
+
+    def test_waits_for_the_longer_of_the_two_delays_when_both_filters_are_active(self):
+        client = FakeClient(trade_events=[{"marketCapSol": 30.0}])
+        strategy, _ = _make_strategy(
+            client, dry_run=True, min_holder_count=16, max_top10_concentration_pct=70,
+        )
+
+        async def _fake_fetch_holder_count(mint, rpc_http_url):
+            return 20
+
+        async def _fake_fetch_top10_concentration_pct(mint, rpc_http_url):
+            return 30.0
+
+        with patch(
+            "pumpfun_bot.strategies.social_watch.HOLDER_COUNT_INDEXING_DELAY_SEC", 0.2,
+        ), patch(
+            "pumpfun_bot.strategies.social_watch.CONCENTRATION_SETTLING_DELAY_SEC", 0.05,
+        ), patch(
+            "pumpfun_bot.strategies.social_watch.fetch_holder_count", _fake_fetch_holder_count,
+        ), patch(
+            "pumpfun_bot.strategies.social_watch.fetch_top10_concentration_pct",
+            _fake_fetch_top10_concentration_pct,
+        ):
+            start = time.time()
+            asyncio.run(strategy._buy("MINT", {
+                "mint": "MINT", "name": "Test", "symbol": "TEST", "vSolInBondingCurve": 30.0,
+            }, time.time()))
+            elapsed = time.time() - start
+
+        # must wait for the longer (holder count, 0.2s) delay, not just the
+        # shorter (concentration, 0.05s) one, and not both added together
+        self.assertGreaterEqual(elapsed, 0.2)
+        self.assertLess(elapsed, 0.3)
 
 
 class FetchFreshRefTests(unittest.TestCase):

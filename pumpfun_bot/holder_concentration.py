@@ -28,6 +28,17 @@ import aiohttp
 
 logger = logging.getLogger("pumpfun_bot.holder_concentration")
 
+# Right after launch, essentially all supply still sits with the bonding
+# curve/deployer - not because of any RPC indexing lag (unlike holder_count's
+# INDEXING_DELAY_SEC), but simply because no one has traded yet. Confirmed
+# live: skipping any settling wait made almost every fresh candidate read
+# ~100% top-10 concentration, which isn't a real bundled/rug signal, just
+# "too early to tell" - give it a short window for real trades to happen
+# first. Deliberately much shorter than HOLDER_COUNT_INDEXING_DELAY_SEC
+# (user-requested speed tradeoff: some signal is better than none, but not
+# worth the full 20s here).
+SETTLING_DELAY_SEC = 6
+
 
 async def fetch_top10_concentration_pct(
     mint: str, rpc_http_url: str, timeout_sec: float = 5.0

@@ -15,6 +15,7 @@ import time
 
 from ..alerts import Alerter
 from ..config import SocialWatchConfig
+from ..holder_concentration import SETTLING_DELAY_SEC as CONCENTRATION_SETTLING_DELAY_SEC
 from ..holder_concentration import fetch_top10_concentration_pct
 from ..holder_count import INDEXING_DELAY_SEC as HOLDER_COUNT_INDEXING_DELAY_SEC
 from ..holder_count import fetch_holder_count
@@ -161,24 +162,33 @@ class SocialWatchStrategy:
             return
 
         # a candidate can get bought on the very FIRST poll cycle if socials
-        # were already present at launch - that can be well under
-        # HOLDER_COUNT_INDEXING_DELAY_SEC after the token's own creation,
-        # too soon for getProgramAccounts' index to have caught up (same lag
-        # confirmed for sniper, just measured from token launch here instead
-        # of our own buy). Top up to that minimum before trusting the count -
-        # confirmed by re-checking a live "0 holders" read minutes later and
-        # finding real holders that were always there, just not indexed yet.
+        # were already present at launch - too soon for either signal below
+        # to be trustworthy yet. Top up to whichever wait the ACTIVE filters
+        # need before trusting their numbers, measured from the token's own
+        # launch (added_ts). Two different reasons, two different windows:
         #
-        # user-requested speed tradeoff: skip this wait entirely when
-        # min_holder_count <= 1 - at that threshold the count barely gates
-        # anything (a stale "0 holders" read is the only thing it could
-        # wrongly block), so the up-to-20s latency isn't buying much
-        # accuracy. Still applied whenever a real threshold is set (e.g. if
-        # auto_tuner.py raises it later), since the logged holder_count also
-        # feeds that tuner's evidence - only the gating case is exempted.
+        # - holder count: an RPC indexing lag (getProgramAccounts hasn't
+        #   caught up yet) - confirmed by re-checking a live "0 holders" read
+        #   minutes later and finding real holders that were always there.
+        #   User-requested speed tradeoff: skipped entirely when
+        #   min_holder_count <= 1, since at that threshold the count barely
+        #   gates anything (see holder_count.py's INDEXING_DELAY_SEC).
+        # - top-10 concentration: not an indexing lag at all - right after
+        #   launch essentially all supply just IS still with the deployer/
+        #   curve, because no one has traded yet. A short settling window
+        #   gives real trades a chance to happen first (see
+        #   holder_concentration.py's SETTLING_DELAY_SEC).
+        #
+        # Only ever wait once, for whichever of these is longer - not both
+        # sequentially.
+        required_delay = 0.0
         if self.cfg.min_holder_count > 1:
+            required_delay = max(required_delay, HOLDER_COUNT_INDEXING_DELAY_SEC)
+        if self.cfg.max_top10_concentration_pct > 0:
+            required_delay = max(required_delay, CONCENTRATION_SETTLING_DELAY_SEC)
+        if required_delay > 0:
             elapsed_since_launch = time.time() - added_ts
-            remaining_delay = HOLDER_COUNT_INDEXING_DELAY_SEC - elapsed_since_launch
+            remaining_delay = required_delay - elapsed_since_launch
             if remaining_delay > 0:
                 await asyncio.sleep(remaining_delay)
 
