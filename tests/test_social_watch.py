@@ -15,21 +15,40 @@ _ORIGINAL_DATA_LOG_PATH = activity_log.DATA_LOG_PATH
 _TEST_LOG_FILE = None
 
 
+_market_cap_patcher = None
+
+
 def setUpModule():
     # bot_state.log_trade() -> activity_log.append_jsonl() always writes to
     # activity_log.DATA_LOG_PATH - the live buy path (dry_run=False) here
     # isn't mocked, so without this every run of this module wrote fake
     # "MINT" trade records into the real, live activity_log.jsonl
-    global _TEST_LOG_FILE
+    global _TEST_LOG_FILE, _market_cap_patcher
     _TEST_LOG_FILE = tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False)
     _TEST_LOG_FILE.close()
     activity_log.DATA_LOG_PATH = Path(_TEST_LOG_FILE.name)
+
+    # fetch_market_cap_usd is called unconditionally inside _buy() (part of
+    # the same asyncio.gather as the holder-count/price-ref lookups) -
+    # default it module-wide to a high value so the many existing tests
+    # here (which don't care about market cap - min_market_cap_usd defaults
+    # to 0/disabled) never make a real network call. Tests that DO care
+    # about market cap override this locally with their own patch.
+    async def _fake_fetch_market_cap_usd(mint):
+        return 1_000_000.0
+
+    _market_cap_patcher = patch(
+        "pumpfun_bot.strategies.social_watch.fetch_market_cap_usd", _fake_fetch_market_cap_usd,
+    )
+    _market_cap_patcher.start()
 
 
 def tearDownModule():
     activity_log.DATA_LOG_PATH = _ORIGINAL_DATA_LOG_PATH
     if _TEST_LOG_FILE is not None:
         Path(_TEST_LOG_FILE.name).unlink(missing_ok=True)
+    if _market_cap_patcher is not None:
+        _market_cap_patcher.stop()
 
 
 class FakeClient:
@@ -62,13 +81,15 @@ class FakeAlerter:
         self.messages.append(message)
 
 
-def _make_strategy(client, *, dry_run=True, outcome_tracker=None, min_holder_count=0):
+def _make_strategy(
+    client, *, dry_run=True, outcome_tracker=None, min_holder_count=0, min_market_cap_usd=0,
+):
     risk = RiskManager(RiskConfig())
     strategy = SocialWatchStrategy(
         client=client,
         cfg=SocialWatchConfig(
             enabled=True, watch_window_sec=60, poll_interval_sec=10,
-            min_holder_count=min_holder_count,
+            min_holder_count=min_holder_count, min_market_cap_usd=min_market_cap_usd,
         ),
         risk=risk,
         alerter=FakeAlerter(),
@@ -185,6 +206,88 @@ class MinHolderCountGateTests(unittest.TestCase):
             "pumpfun_bot.strategies.social_watch.HOLDER_COUNT_INDEXING_DELAY_SEC", 0,
         ), patch(
             "pumpfun_bot.strategies.social_watch.fetch_holder_count", _failing_fetch_holder_count,
+        ):
+            asyncio.run(strategy._buy("MINT", {
+                "mint": "MINT", "name": "Test", "symbol": "TEST", "vSolInBondingCurve": 30.0,
+            }, time.time()))
+
+        self.assertEqual(len(client.buy_calls), 1)
+
+
+class MinMarketCapGateTests(unittest.TestCase):
+    """User-requested after live sessions showed thin/tiny market caps
+    correlated with the worst stop-loss overshoots (a single sell can
+    crater an illiquid curve 30-50% in one trade tick) - min_market_cap_usd
+    must actually be enforced once set."""
+
+    def test_skips_buy_below_min_market_cap(self):
+        client = FakeClient(trade_events=[{"marketCapSol": 30.0}])
+        strategy, risk = _make_strategy(client, dry_run=False, min_market_cap_usd=7000)
+
+        async def _fake_fetch_market_cap_usd(mint):
+            return 3000.0  # below the $7000 minimum
+
+        with patch(
+            "pumpfun_bot.strategies.social_watch.HOLDER_COUNT_INDEXING_DELAY_SEC", 0,
+        ), patch(
+            "pumpfun_bot.strategies.social_watch.fetch_market_cap_usd", _fake_fetch_market_cap_usd,
+        ):
+            asyncio.run(strategy._buy("MINT", {
+                "mint": "MINT", "name": "Test", "symbol": "TEST", "vSolInBondingCurve": 30.0,
+            }, time.time()))
+
+        self.assertEqual(client.buy_calls, [])
+        self.assertAlmostEqual(risk.state.open_exposure_sol, 0.0)
+
+    def test_buys_at_or_above_min_market_cap(self):
+        client = FakeClient(trade_events=[{"marketCapSol": 30.0}])
+        strategy, risk = _make_strategy(client, dry_run=False, min_market_cap_usd=7000)
+
+        async def _fake_fetch_market_cap_usd(mint):
+            return 7000.0
+
+        with patch(
+            "pumpfun_bot.strategies.social_watch.HOLDER_COUNT_INDEXING_DELAY_SEC", 0,
+        ), patch(
+            "pumpfun_bot.strategies.social_watch.fetch_market_cap_usd", _fake_fetch_market_cap_usd,
+        ):
+            asyncio.run(strategy._buy("MINT", {
+                "mint": "MINT", "name": "Test", "symbol": "TEST", "vSolInBondingCurve": 30.0,
+            }, time.time()))
+
+        self.assertEqual(len(client.buy_calls), 1)
+        self.assertAlmostEqual(risk.state.open_exposure_sol, 0.03)
+
+    def test_skips_buy_when_min_market_cap_set_but_lookup_fails(self):
+        client = FakeClient(trade_events=[{"marketCapSol": 30.0}])
+        strategy, risk = _make_strategy(client, dry_run=False, min_market_cap_usd=7000)
+
+        async def _failing_fetch_market_cap_usd(mint):
+            return None
+
+        with patch(
+            "pumpfun_bot.strategies.social_watch.HOLDER_COUNT_INDEXING_DELAY_SEC", 0,
+        ), patch(
+            "pumpfun_bot.strategies.social_watch.fetch_market_cap_usd", _failing_fetch_market_cap_usd,
+        ):
+            asyncio.run(strategy._buy("MINT", {
+                "mint": "MINT", "name": "Test", "symbol": "TEST", "vSolInBondingCurve": 30.0,
+            }, time.time()))
+
+        self.assertEqual(client.buy_calls, [])
+
+    def test_buys_regardless_of_market_cap_when_no_minimum_set(self):
+        # default min_market_cap_usd=0 - the filter is off unless explicitly set
+        client = FakeClient(trade_events=[{"marketCapSol": 30.0}])
+        strategy, risk = _make_strategy(client, dry_run=False, min_market_cap_usd=0)
+
+        async def _failing_fetch_market_cap_usd(mint):
+            return None
+
+        with patch(
+            "pumpfun_bot.strategies.social_watch.HOLDER_COUNT_INDEXING_DELAY_SEC", 0,
+        ), patch(
+            "pumpfun_bot.strategies.social_watch.fetch_market_cap_usd", _failing_fetch_market_cap_usd,
         ):
             asyncio.run(strategy._buy("MINT", {
                 "mint": "MINT", "name": "Test", "symbol": "TEST", "vSolInBondingCurve": 30.0,

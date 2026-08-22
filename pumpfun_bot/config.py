@@ -65,6 +65,11 @@ class SocialWatchConfig:
     # real sample size + margin) once there's evidence for a real threshold -
     # never hand-set this without evidence, see holder_count_tuning.py
     min_holder_count: int = 0
+    # user-requested: skip candidates below this USD market cap - thin/tiny
+    # market caps correlated with the worst stop-loss overshoots tonight
+    # (a single sell can crater an illiquid curve 30-50% in one trade tick).
+    # 0 = no filter.
+    min_market_cap_usd: float = 0
 
 
 @dataclass
@@ -161,6 +166,7 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         trailing_activation_pct=sw_raw.get("trailing_activation_pct", 20),
         trailing_stop_pct=sw_raw.get("trailing_stop_pct", 15),
         min_holder_count=sw_raw.get("min_holder_count", 0),
+        min_market_cap_usd=sw_raw.get("min_market_cap_usd", 0),
     )
 
     ct_raw = strat_raw.get("copytrade", {})

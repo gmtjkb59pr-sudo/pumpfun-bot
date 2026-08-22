@@ -68,6 +68,11 @@ strategies:
     # nooit losser, en pas als er genoeg data is), zie
     # pumpfun_bot/holder_count_tuning.py - niet handmatig zetten zonder bewijs
     min_holder_count: 0
+    # user-requested: skip candidates below this USD market cap - thin/tiny
+    # market caps correlated with the worst stop-loss overshoots in live
+    # testing (a single sell can crater an illiquid curve 30-50% in one
+    # trade tick). 0 = geen filter.
+    min_market_cap_usd: 0
 
   copytrade:
     enabled: false
