@@ -15,7 +15,7 @@ import time
 
 from ..alerts import Alerter
 from ..config import SocialWatchConfig
-from ..dexscreener import fetch_price_change_1h_pct
+from ..dexscreener import fetch_price_change_5m_pct
 from ..holder_concentration import SETTLING_DELAY_SEC as CONCENTRATION_SETTLING_DELAY_SEC
 from ..holder_concentration import fetch_top10_concentration_pct
 from ..holder_count import INDEXING_DELAY_SEC as HOLDER_COUNT_INDEXING_DELAY_SEC
@@ -197,13 +197,13 @@ class SocialWatchStrategy:
         # delay - fetch these synchronously so the values are accurate AT
         # the decision point, instead of a delayed best-effort background log
         (
-            entry_ref, holder_count, market_cap_usd, top10_concentration_pct, price_change_1h_pct,
+            entry_ref, holder_count, market_cap_usd, top10_concentration_pct, price_change_5m_pct,
         ) = await asyncio.gather(
             self._fetch_fresh_ref(mint),
             fetch_holder_count(mint, self.client.rpc_http_url),
             fetch_market_cap_usd(mint),
             fetch_top10_concentration_pct(mint, self.client.rpc_http_url),
-            fetch_price_change_1h_pct(mint),
+            fetch_price_change_5m_pct(mint),
         )
         if entry_ref is None:
             entry_ref = extract_price_ref(event)
@@ -255,23 +255,23 @@ class SocialWatchStrategy:
                 )
                 return
 
-        if self.cfg.require_positive_momentum_1h:
+        if self.cfg.require_positive_momentum_5m:
             # user-requested "movers"-style filter: only buy candidates
             # already gaining, not just fresh with good fundamentals - see
             # dexscreener.py for why this is the ToS-clean data source
             # instead of scraping pump.fun's own Movers tab
-            if price_change_1h_pct is None:
-                logger.info("Social-watch: 1h prijsverandering onbekend voor %s, sla over.", mint)
+            if price_change_5m_pct is None:
+                logger.info("Social-watch: 5m prijsverandering onbekend voor %s, sla over.", mint)
                 return
-            if price_change_1h_pct <= 0:
+            if price_change_5m_pct <= 0:
                 logger.info(
-                    "Social-watch: %s heeft %.1f%% prijsverandering (1h), geen positief "
-                    "momentum, sla over.", mint, price_change_1h_pct,
+                    "Social-watch: %s heeft %.1f%% prijsverandering (5m), geen positief "
+                    "momentum, sla over.", mint, price_change_5m_pct,
                 )
                 return
 
         mcap_str = f"${market_cap_usd:.0f}" if market_cap_usd is not None else "?"
-        momentum_str = f", {price_change_1h_pct:+.1f}% (1h)" if price_change_1h_pct is not None else ""
+        momentum_str = f", {price_change_5m_pct:+.1f}% (5m)" if price_change_5m_pct is not None else ""
         await self.alerter.send(
             f"👥 Social-watch kandidaat: {name} ({symbol}) - {mint} "
             f"(socials gevonden, {holder_count if holder_count is not None else '?'} holders, "
