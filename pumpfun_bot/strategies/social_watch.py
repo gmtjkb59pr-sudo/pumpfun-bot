@@ -15,6 +15,7 @@ import time
 
 from ..alerts import Alerter
 from ..config import SocialWatchConfig
+from ..holder_concentration import fetch_top10_concentration_pct
 from ..holder_count import INDEXING_DELAY_SEC as HOLDER_COUNT_INDEXING_DELAY_SEC
 from ..holder_count import fetch_holder_count
 from ..market_cap import fetch_market_cap_usd
@@ -175,10 +176,11 @@ class SocialWatchStrategy:
         # unlike sniper's instant buy, social_watch already tolerates real
         # delay - fetch these synchronously so the values are accurate AT
         # the decision point, instead of a delayed best-effort background log
-        entry_ref, holder_count, market_cap_usd = await asyncio.gather(
+        entry_ref, holder_count, market_cap_usd, top10_concentration_pct = await asyncio.gather(
             self._fetch_fresh_ref(mint),
             fetch_holder_count(mint, self.client.rpc_http_url),
             fetch_market_cap_usd(mint),
+            fetch_top10_concentration_pct(mint, self.client.rpc_http_url),
         )
         if entry_ref is None:
             entry_ref = extract_price_ref(event)
@@ -211,6 +213,22 @@ class SocialWatchStrategy:
                 logger.info(
                     "Social-watch: %s heeft $%.0f market cap, onder de min_market_cap_usd "
                     "van $%.0f, sla over.", mint, market_cap_usd, self.cfg.min_market_cap_usd,
+                )
+                return
+
+        if self.cfg.max_top10_concentration_pct > 0:
+            # user-requested: a manufactured/bundled launch concentrates the
+            # float in a handful of wallets that can dump together - same
+            # failure mode behind the deep stop-loss overshoots (see
+            # holder_concentration.py)
+            if top10_concentration_pct is None:
+                logger.info("Social-watch: top-10 concentratie onbekend voor %s, sla over.", mint)
+                return
+            if top10_concentration_pct > self.cfg.max_top10_concentration_pct:
+                logger.info(
+                    "Social-watch: %s heeft %.0f%% top-10 concentratie, boven de "
+                    "max_top10_concentration_pct van %.0f%%, sla over.",
+                    mint, top10_concentration_pct, self.cfg.max_top10_concentration_pct,
                 )
                 return
 

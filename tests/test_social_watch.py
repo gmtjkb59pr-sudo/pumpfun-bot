@@ -16,6 +16,7 @@ _TEST_LOG_FILE = None
 
 
 _market_cap_patcher = None
+_concentration_patcher = None
 
 
 def setUpModule():
@@ -23,7 +24,7 @@ def setUpModule():
     # activity_log.DATA_LOG_PATH - the live buy path (dry_run=False) here
     # isn't mocked, so without this every run of this module wrote fake
     # "MINT" trade records into the real, live activity_log.jsonl
-    global _TEST_LOG_FILE, _market_cap_patcher
+    global _TEST_LOG_FILE, _market_cap_patcher, _concentration_patcher
     _TEST_LOG_FILE = tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False)
     _TEST_LOG_FILE.close()
     activity_log.DATA_LOG_PATH = Path(_TEST_LOG_FILE.name)
@@ -42,6 +43,18 @@ def setUpModule():
     )
     _market_cap_patcher.start()
 
+    # same reasoning as above, for fetch_top10_concentration_pct - default
+    # to a low (healthy) value so tests that don't care about concentration
+    # never make a real RPC call.
+    async def _fake_fetch_top10_concentration_pct(mint, rpc_http_url):
+        return 5.0
+
+    _concentration_patcher = patch(
+        "pumpfun_bot.strategies.social_watch.fetch_top10_concentration_pct",
+        _fake_fetch_top10_concentration_pct,
+    )
+    _concentration_patcher.start()
+
 
 def tearDownModule():
     activity_log.DATA_LOG_PATH = _ORIGINAL_DATA_LOG_PATH
@@ -49,6 +62,8 @@ def tearDownModule():
         Path(_TEST_LOG_FILE.name).unlink(missing_ok=True)
     if _market_cap_patcher is not None:
         _market_cap_patcher.stop()
+    if _concentration_patcher is not None:
+        _concentration_patcher.stop()
 
 
 class FakeClient:
@@ -83,6 +98,7 @@ class FakeAlerter:
 
 def _make_strategy(
     client, *, dry_run=True, outcome_tracker=None, min_holder_count=0, min_market_cap_usd=0,
+    max_top10_concentration_pct=0,
 ):
     risk = RiskManager(RiskConfig())
     strategy = SocialWatchStrategy(
@@ -90,6 +106,7 @@ def _make_strategy(
         cfg=SocialWatchConfig(
             enabled=True, watch_window_sec=60, poll_interval_sec=10,
             min_holder_count=min_holder_count, min_market_cap_usd=min_market_cap_usd,
+            max_top10_concentration_pct=max_top10_concentration_pct,
         ),
         risk=risk,
         alerter=FakeAlerter(),
@@ -288,6 +305,92 @@ class MinMarketCapGateTests(unittest.TestCase):
             "pumpfun_bot.strategies.social_watch.HOLDER_COUNT_INDEXING_DELAY_SEC", 0,
         ), patch(
             "pumpfun_bot.strategies.social_watch.fetch_market_cap_usd", _failing_fetch_market_cap_usd,
+        ):
+            asyncio.run(strategy._buy("MINT", {
+                "mint": "MINT", "name": "Test", "symbol": "TEST", "vSolInBondingCurve": 30.0,
+            }, time.time()))
+
+        self.assertEqual(len(client.buy_calls), 1)
+
+
+class MaxTop10ConcentrationGateTests(unittest.TestCase):
+    """User-requested after investigating luminos.capital as a bundled-
+    launch detector - their top-10-concentration band is the one signal
+    cheap enough to compute ourselves via RPC (see holder_concentration.py).
+    max_top10_concentration_pct must actually be enforced once set."""
+
+    def test_skips_buy_above_max_concentration(self):
+        client = FakeClient(trade_events=[{"marketCapSol": 30.0}])
+        strategy, risk = _make_strategy(client, dry_run=False, max_top10_concentration_pct=50)
+
+        async def _fake_fetch_top10_concentration_pct(mint, rpc_http_url):
+            return 75.0  # above the 50% maximum
+
+        with patch(
+            "pumpfun_bot.strategies.social_watch.HOLDER_COUNT_INDEXING_DELAY_SEC", 0,
+        ), patch(
+            "pumpfun_bot.strategies.social_watch.fetch_top10_concentration_pct",
+            _fake_fetch_top10_concentration_pct,
+        ):
+            asyncio.run(strategy._buy("MINT", {
+                "mint": "MINT", "name": "Test", "symbol": "TEST", "vSolInBondingCurve": 30.0,
+            }, time.time()))
+
+        self.assertEqual(client.buy_calls, [])
+        self.assertAlmostEqual(risk.state.open_exposure_sol, 0.0)
+
+    def test_buys_at_or_below_max_concentration(self):
+        client = FakeClient(trade_events=[{"marketCapSol": 30.0}])
+        strategy, risk = _make_strategy(client, dry_run=False, max_top10_concentration_pct=50)
+
+        async def _fake_fetch_top10_concentration_pct(mint, rpc_http_url):
+            return 50.0
+
+        with patch(
+            "pumpfun_bot.strategies.social_watch.HOLDER_COUNT_INDEXING_DELAY_SEC", 0,
+        ), patch(
+            "pumpfun_bot.strategies.social_watch.fetch_top10_concentration_pct",
+            _fake_fetch_top10_concentration_pct,
+        ):
+            asyncio.run(strategy._buy("MINT", {
+                "mint": "MINT", "name": "Test", "symbol": "TEST", "vSolInBondingCurve": 30.0,
+            }, time.time()))
+
+        self.assertEqual(len(client.buy_calls), 1)
+        self.assertAlmostEqual(risk.state.open_exposure_sol, 0.03)
+
+    def test_skips_buy_when_max_concentration_set_but_lookup_fails(self):
+        client = FakeClient(trade_events=[{"marketCapSol": 30.0}])
+        strategy, risk = _make_strategy(client, dry_run=False, max_top10_concentration_pct=50)
+
+        async def _failing_fetch_top10_concentration_pct(mint, rpc_http_url):
+            return None
+
+        with patch(
+            "pumpfun_bot.strategies.social_watch.HOLDER_COUNT_INDEXING_DELAY_SEC", 0,
+        ), patch(
+            "pumpfun_bot.strategies.social_watch.fetch_top10_concentration_pct",
+            _failing_fetch_top10_concentration_pct,
+        ):
+            asyncio.run(strategy._buy("MINT", {
+                "mint": "MINT", "name": "Test", "symbol": "TEST", "vSolInBondingCurve": 30.0,
+            }, time.time()))
+
+        self.assertEqual(client.buy_calls, [])
+
+    def test_buys_regardless_of_concentration_when_no_maximum_set(self):
+        # default max_top10_concentration_pct=0 - the filter is off unless explicitly set
+        client = FakeClient(trade_events=[{"marketCapSol": 30.0}])
+        strategy, risk = _make_strategy(client, dry_run=False, max_top10_concentration_pct=0)
+
+        async def _failing_fetch_top10_concentration_pct(mint, rpc_http_url):
+            return None
+
+        with patch(
+            "pumpfun_bot.strategies.social_watch.HOLDER_COUNT_INDEXING_DELAY_SEC", 0,
+        ), patch(
+            "pumpfun_bot.strategies.social_watch.fetch_top10_concentration_pct",
+            _failing_fetch_top10_concentration_pct,
         ):
             asyncio.run(strategy._buy("MINT", {
                 "mint": "MINT", "name": "Test", "symbol": "TEST", "vSolInBondingCurve": 30.0,
