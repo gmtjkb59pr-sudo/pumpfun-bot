@@ -87,6 +87,28 @@ class SocialWatchConfig:
 
 
 @dataclass
+class BirdeyeMoversConfig:
+    """Discovers already-existing tokens showing a real volume/price spike
+    via Birdeye's trending API - the one gap social_watch structurally
+    cannot cover, since it only ever sees BRAND NEW launches via
+    PumpPortal's subscribeNewToken (see birdeye.py/birdeye_movers.py)."""
+    enabled: bool = False
+    api_key: str = ""
+    # user-requested: Birdeye's free tier is ~1,000 calls/month (30,000 CU
+    # at 30 CU/call) - this cadence keeps well within that even running
+    # 24/7. Do not lower without checking the Birdeye pricing page first.
+    poll_interval_sec: int = 2700
+    trending_limit: int = 20
+    # 0 = no filter, same convention as social_watch's equivalents
+    min_holder_count: int = 0
+    max_top10_concentration_pct: float = 0
+    take_profit_pct: float = 50
+    stop_loss_pct: float = 25
+    trailing_activation_pct: float = 20
+    trailing_stop_pct: float = 15
+
+
+@dataclass
 class CopyTradeConfig:
     enabled: bool = False
     watched_wallets: list = field(default_factory=list)
@@ -114,6 +136,7 @@ class AppConfig:
     risk: RiskConfig
     sniper: SniperConfig
     social_watch: SocialWatchConfig
+    birdeye_movers: BirdeyeMoversConfig
     copytrade: CopyTradeConfig
     market_maker: MarketMakerConfig
     alerts_console: bool
@@ -185,6 +208,21 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         require_positive_momentum_5m=sw_raw.get("require_positive_momentum_5m", False),
     )
 
+    be_raw = strat_raw.get("birdeye_movers", {})
+    be_key_var = be_raw.get("api_key_env_var", "BIRDEYE_API_KEY")
+    birdeye_movers = BirdeyeMoversConfig(
+        enabled=be_raw.get("enabled", False),
+        api_key=os.environ.get(be_key_var, ""),
+        poll_interval_sec=be_raw.get("poll_interval_sec", 2700),
+        trending_limit=be_raw.get("trending_limit", 20),
+        min_holder_count=be_raw.get("min_holder_count", 0),
+        max_top10_concentration_pct=be_raw.get("max_top10_concentration_pct", 0),
+        take_profit_pct=be_raw.get("take_profit_pct", 50),
+        stop_loss_pct=be_raw.get("stop_loss_pct", 25),
+        trailing_activation_pct=be_raw.get("trailing_activation_pct", 20),
+        trailing_stop_pct=be_raw.get("trailing_stop_pct", 15),
+    )
+
     ct_raw = strat_raw.get("copytrade", {})
     copytrade = CopyTradeConfig(
         enabled=ct_raw.get("enabled", False),
@@ -223,6 +261,7 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         risk=risk,
         sniper=sniper,
         social_watch=social_watch,
+        birdeye_movers=birdeye_movers,
         copytrade=copytrade,
         market_maker=market_maker,
         alerts_console=alerts_raw.get("console", True),

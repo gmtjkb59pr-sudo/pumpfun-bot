@@ -35,6 +35,7 @@ from pumpfun_bot.pumpportal_client import PumpPortalClient
 from pumpfun_bot.risk import RiskManager
 from pumpfun_bot.scaled_exit_simulator import ScaledExitSimulator
 from pumpfun_bot.state import bot_state
+from pumpfun_bot.strategies.birdeye_movers import BirdeyeMoversStrategy
 from pumpfun_bot.strategies.copytrade import CopyTradeStrategy
 from pumpfun_bot.strategies.market_maker import MarketMakerStrategy
 from pumpfun_bot.strategies.sniper import SniperStrategy
@@ -157,6 +158,20 @@ async def main() -> None:
         price_tracker=candidate_price_tracker,
         scaled_exit_simulator=scaled_exit_simulator,
     )
+    # user-requested: discovers already-existing tokens with a real volume/
+    # price spike via Birdeye's trending API - social_watch can only ever
+    # see brand-new launches, this covers the gap (see birdeye_movers.py)
+    birdeye_movers = BirdeyeMoversStrategy(
+        client=PumpPortalClient(cfg.pumpportal_ws_url, cfg.pumpportal_trade_api_url,
+                                 cfg.rpc_http_url, keypair, api_key=cfg.pumpportal_api_key),
+        cfg=cfg.birdeye_movers,
+        risk=risk,
+        alerter=alerter,
+        trade_size_sol=cfg.risk.max_sol_per_trade,
+        slippage_pct=cfg.risk.default_slippage_pct,
+        dry_run=cfg.risk.dry_run,
+        outcome_tracker=outcome_tracker,
+    )
     copytrade = CopyTradeStrategy(
         client=PumpPortalClient(cfg.pumpportal_ws_url, cfg.pumpportal_trade_api_url,
                                  cfg.rpc_http_url, keypair, api_key=cfg.pumpportal_api_key),
@@ -177,7 +192,7 @@ async def main() -> None:
         dry_run=cfg.risk.dry_run,
     )
 
-    enabled = [s.cfg.enabled for s in (sniper, social_watch, copytrade, market_maker)]
+    enabled = [s.cfg.enabled for s in (sniper, social_watch, birdeye_movers, copytrade, market_maker)]
     if not any(enabled):
         logger.warning(
             "Geen enkele strategie staat op enabled: true in config.yaml. "
@@ -191,6 +206,7 @@ async def main() -> None:
         strategies_enabled={
             "sniper": cfg.sniper.enabled,
             "social_watch": cfg.social_watch.enabled,
+            "birdeye_movers": cfg.birdeye_movers.enabled,
             "copytrade": cfg.copytrade.enabled,
             "market_maker": cfg.market_maker.enabled,
         },
@@ -228,6 +244,7 @@ async def main() -> None:
     tasks = [
         asyncio.create_task(sniper.run()),
         asyncio.create_task(social_watch.run()),
+        asyncio.create_task(birdeye_movers.run()),
         asyncio.create_task(copytrade.run()),
         asyncio.create_task(market_maker.run()),
         asyncio.create_task(outcome_tracker.run()),
