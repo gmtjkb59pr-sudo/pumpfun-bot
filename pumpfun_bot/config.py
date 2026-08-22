@@ -84,6 +84,13 @@ class SocialWatchConfig:
     # Window shortened from the original 1h to 5m - user-requested, matches
     # how young these candidates actually are. False = no filter.
     require_positive_momentum_5m: bool = False
+    # user-requested: own position budget, separate from the global
+    # risk.max_open_positions shared pool - a burst of buys from another
+    # strategy (e.g. birdeye_movers firing all at once on its slow poll)
+    # can no longer crowd this strategy out entirely. Only enforced in
+    # live mode - dry_run skips the open-positions check altogether so
+    # every qualifying candidate can open a position for outcome data.
+    max_open_positions: int = 5
 
 
 @dataclass
@@ -114,6 +121,14 @@ class BirdeyeMoversConfig:
     stop_loss_pct: float = 25
     trailing_activation_pct: float = 20
     trailing_stop_pct: float = 15
+    # user-requested: own position budget, separate from the global
+    # risk.max_open_positions shared pool - confirmed live that a single
+    # trending-list poll can return several qualifying tokens at once and
+    # instantly claim the whole shared pool, crowding social_watch out.
+    # Only enforced in live mode - dry_run skips the open-positions check
+    # altogether so every qualifying candidate can open a position for
+    # outcome data.
+    max_open_positions: int = 5
 
 
 @dataclass
@@ -214,6 +229,7 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         min_market_cap_usd=sw_raw.get("min_market_cap_usd", 0),
         max_top10_concentration_pct=sw_raw.get("max_top10_concentration_pct", 0),
         require_positive_momentum_5m=sw_raw.get("require_positive_momentum_5m", False),
+        max_open_positions=sw_raw.get("max_open_positions", 5),
     )
 
     be_raw = strat_raw.get("birdeye_movers", {})
@@ -226,6 +242,7 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         min_holder_count=be_raw.get("min_holder_count", 0),
         max_top10_concentration_pct=be_raw.get("max_top10_concentration_pct", 0),
         max_market_cap_usd=be_raw.get("max_market_cap_usd", 20_000_000),
+        max_open_positions=be_raw.get("max_open_positions", 5),
         take_profit_pct=be_raw.get("take_profit_pct", 50),
         stop_loss_pct=be_raw.get("stop_loss_pct", 25),
         trailing_activation_pct=be_raw.get("trailing_activation_pct", 20),

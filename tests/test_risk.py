@@ -80,22 +80,57 @@ class RiskManagerCanTradeTests(unittest.TestCase):
         # open_positions_count comes from the caller (OutcomeTracker.open_
         # position_count() in real usage) - passed directly, not tracked as
         # a separate counter here, so it can't drift from what's actually
-        # held (see docstring on can_trade)
-        risk = make_manager(max_open_positions=5)
+        # held (see docstring on can_trade). Only enforced in live mode -
+        # see DryRunSkipsOpenPositionsCheckTests below for dry_run.
+        risk = make_manager(max_open_positions=5, dry_run=False)
         ok, reason = risk.can_trade(0.01, open_positions_count=5)
         self.assertFalse(ok)
         self.assertIn("open posities", reason)
 
     def test_allows_trade_below_max_open_positions(self):
-        risk = make_manager(max_open_positions=5)
+        risk = make_manager(max_open_positions=5, dry_run=False)
         ok, _ = risk.can_trade(0.01, open_positions_count=4)
         self.assertTrue(ok)
 
     def test_allows_trade_when_open_positions_count_not_provided(self):
         # callers without an OutcomeTracker (or that don't pass it) simply
         # don't get this check applied, rather than being blocked on None
-        risk = make_manager(max_open_positions=5)
+        risk = make_manager(max_open_positions=5, dry_run=False)
         ok, _ = risk.can_trade(0.01)
+        self.assertTrue(ok)
+
+    def test_max_open_positions_override_takes_precedence(self):
+        # user-requested per-strategy position budgets - a strategy's own
+        # cap (passed per-call) overrides the global risk.max_open_positions
+        risk = make_manager(max_open_positions=100, dry_run=False)
+        ok, reason = risk.can_trade(
+            0.01, open_positions_count=2, max_open_positions_override=2,
+        )
+        self.assertFalse(ok)
+        self.assertIn("max is 2", reason)
+
+    def test_falls_back_to_global_cap_when_no_override_given(self):
+        risk = make_manager(max_open_positions=3, dry_run=False)
+        ok, reason = risk.can_trade(0.01, open_positions_count=3)
+        self.assertFalse(ok)
+        self.assertIn("max is 3", reason)
+
+
+class DryRunSkipsOpenPositionsCheckTests(unittest.TestCase):
+    """User-requested: no real capital is at risk in dry-run, so cap
+    nothing and let every qualifying candidate open a position to farm as
+    much outcome data as possible."""
+
+    def test_allows_trade_in_dry_run_even_at_or_above_the_cap(self):
+        risk = make_manager(max_open_positions=5, dry_run=True)
+        ok, _ = risk.can_trade(0.01, open_positions_count=999)
+        self.assertTrue(ok)
+
+    def test_allows_trade_in_dry_run_even_with_a_tight_override(self):
+        risk = make_manager(max_open_positions=5, dry_run=True)
+        ok, _ = risk.can_trade(
+            0.01, open_positions_count=999, max_open_positions_override=1,
+        )
         self.assertTrue(ok)
 
 

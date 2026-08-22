@@ -66,6 +66,7 @@ class RiskManager:
     def can_trade(
         self, sol_amount: float, liquidity_sol: float | None = None,
         open_positions_count: int | None = None,
+        max_open_positions_override: int | None = None,
     ) -> tuple[bool, str]:
         """Controleer of een voorgestelde trade toegestaan is. Geeft (ok, reden).
 
@@ -75,7 +76,21 @@ class RiskManager:
         decremented on every sell can drift from reality (e.g. a buy whose
         track() call returns early never actually gets tracked, so it can
         never be "sold" to free its slot back up) - "is there room" must
-        reflect what's actually held, not what was once assumed opened."""
+        reflect what's actually held, not what was once assumed opened.
+
+        max_open_positions_override: user-requested per-strategy position
+        budget - pass open_positions_count scoped to one strategy (see
+        OutcomeTracker.open_position_count(strategy=...)) together with
+        that strategy's own cap, so e.g. birdeye_movers firing a burst of
+        buys can't crowd social_watch out of the whole shared pool. Falls
+        back to self.cfg.max_open_positions (the old shared-pool behavior)
+        when not given - exposure_sol/daily-loss limits stay global/shared
+        on purpose, those are real wallet-wide budgets, not per-strategy.
+
+        In dry_run, the open-positions check is skipped entirely -
+        user-requested: no real capital is at risk in dry-run, so cap
+        nothing and let every qualifying candidate open a position to
+        farm as much outcome data as possible."""
         self._reset_day_if_needed()
 
         if sol_amount <= 0:
@@ -93,11 +108,16 @@ class RiskManager:
                 f"brengen, max is {self.cfg.max_sol_total_exposure}."
             )
 
-        if open_positions_count is not None and open_positions_count >= self.cfg.max_open_positions:
-            return False, (
-                f"Al {open_positions_count} open posities, max is "
-                f"{self.cfg.max_open_positions}."
+        if not self.cfg.dry_run and open_positions_count is not None:
+            effective_max = (
+                max_open_positions_override
+                if max_open_positions_override is not None
+                else self.cfg.max_open_positions
             )
+            if open_positions_count >= effective_max:
+                return False, (
+                    f"Al {open_positions_count} open posities, max is {effective_max}."
+                )
 
         if self._trades_in_last_hour() >= self.cfg.max_trades_per_hour:
             return False, f"Limiet van {self.cfg.max_trades_per_hour} trades/uur bereikt."

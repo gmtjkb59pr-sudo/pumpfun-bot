@@ -212,6 +212,32 @@ class OpenPositionCountTests(unittest.TestCase):
 
         self.assertEqual(tracker.open_position_count(), 1)
 
+    def test_strategy_filter_counts_only_that_strategys_positions(self):
+        # user-requested per-strategy position budgets - a burst of buys
+        # from one strategy must not be counted against another's cap
+        tracker = OutcomeTracker(ws_url="wss://example.invalid")
+        asyncio.run(tracker.track(
+            "MINT1", "Test", "TEST", entry_ref=100.0, trade_size_sol=0.03, strategy="social_watch",
+        ))
+        asyncio.run(tracker.track(
+            "MINT2", "Test2", "TEST2", entry_ref=100.0, trade_size_sol=0.03, strategy="social_watch",
+        ))
+        asyncio.run(tracker.track(
+            "MINT3", "Test3", "TEST3", entry_ref=100.0, trade_size_sol=0.03, strategy="birdeye_movers",
+        ))
+
+        self.assertEqual(tracker.open_position_count(strategy="social_watch"), 2)
+        self.assertEqual(tracker.open_position_count(strategy="birdeye_movers"), 1)
+        self.assertEqual(tracker.open_position_count(), 3)  # unscoped still counts everything
+
+    def test_positions_tracked_before_the_strategy_field_existed_are_untagged(self):
+        tracker = OutcomeTracker(ws_url="wss://example.invalid")
+        asyncio.run(tracker.track("MINT", "Test", "TEST", entry_ref=100.0, trade_size_sol=0.03))
+
+        self.assertEqual(tracker._pending["MINT"]["strategy"], "")
+        self.assertEqual(tracker.open_position_count(strategy="social_watch"), 0)
+        self.assertEqual(tracker.open_position_count(), 1)
+
 
 class SharedTrackerCollisionTests(unittest.TestCase):
     """Two strategies (sniper, social_watch) share one OutcomeTracker keyed
