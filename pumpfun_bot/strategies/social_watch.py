@@ -14,6 +14,7 @@ import logging
 import time
 
 from ..alerts import Alerter
+from ..candidate_price_tracker import CandidatePriceTracker
 from ..config import SocialWatchConfig
 from ..dexscreener import fetch_price_changes_pct
 from ..holder_concentration import SETTLING_DELAY_SEC as CONCENTRATION_SETTLING_DELAY_SEC
@@ -43,6 +44,7 @@ class SocialWatchStrategy:
         dry_run: bool,
         outcome_tracker: OutcomeTracker | None = None,
         fresh_ref_timeout_sec: float = 5.0,
+        price_tracker: CandidatePriceTracker | None = None,
     ):
         self.client = client
         self.cfg = cfg
@@ -53,6 +55,10 @@ class SocialWatchStrategy:
         self.dry_run = dry_run
         self.outcome_tracker = outcome_tracker
         self.fresh_ref_timeout_sec = fresh_ref_timeout_sec
+        # user-requested: real 1m/2m momentum, shorter than anything
+        # DexScreener's API exposes (see candidate_price_tracker.py) -
+        # optional so tests/callers that don't care about this can omit it
+        self.price_tracker = price_tracker
         self._watching: dict[str, dict] = {}
         self._lock = asyncio.Lock()
 
@@ -76,6 +82,8 @@ class SocialWatchStrategy:
             async with self._lock:
                 if mint not in self._watching:
                     self._watching[mint] = {"event": event, "added_ts": time.time()}
+                    if self.price_tracker is not None:
+                        await self.price_tracker.watch(mint)
 
     async def _poll_watchlist_loop(self) -> None:
         while True:
@@ -100,6 +108,8 @@ class SocialWatchStrategy:
                     "Social-watch: %s kreeg geen socials binnen %ds, laten gaan.",
                     mint, self.cfg.watch_window_sec,
                 )
+                if self.price_tracker is not None:
+                    await self.price_tracker.unwatch(mint)
 
         still_watching = {m: i for m, i in candidates.items() if m not in expired}
         if not still_watching:
@@ -119,6 +129,8 @@ class SocialWatchStrategy:
                     continue
                 self._watching.pop(mint, None)
             await self._buy(mint, info["event"], info["added_ts"])
+            if self.price_tracker is not None:
+                await self.price_tracker.unwatch(mint)
 
     async def _fetch_fresh_ref(self, mint: str) -> float | None:
         """A candidate can sit on the watchlist for up to watch_window_sec -
@@ -288,6 +300,12 @@ class SocialWatchStrategy:
             f"price_change_{window}_pct": (price_changes_pct or {}).get(window)
             for window in ("m5", "h1", "h6", "h24")
         }
+        # 1m/2m come from our own buffered trade ticks, not DexScreener -
+        # that API doesn't expose anything shorter than m5 (see
+        # candidate_price_tracker.py)
+        if self.price_tracker is not None:
+            momentum_meta["price_change_1m_pct"] = self.price_tracker.price_change_pct(mint, 60)
+            momentum_meta["price_change_2m_pct"] = self.price_tracker.price_change_pct(mint, 120)
 
         if self.dry_run:
             logger.info("[DRY RUN] Zou kopen: %s SOL van %s", self.trade_size_sol, mint)
