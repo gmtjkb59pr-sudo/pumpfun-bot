@@ -31,6 +31,12 @@ class CopyTradeStrategy:
         self.max_trade_sol = max_trade_sol
         self.slippage_pct = slippage_pct
         self.dry_run = dry_run
+        # mints currently held via a copytrade buy - in-memory only (resets
+        # on restart), since this is purely to stop mirroring a sell signal
+        # for a mint we never actually bought (see the check in run() below;
+        # confirmed live: watched wallets sell things this bot never bought,
+        # e.g. positions opened before copytrade was enabled this session).
+        self._held: set[str] = set()
 
     async def run(self) -> None:
         if not self.cfg.enabled or not self.cfg.watched_wallets:
@@ -51,6 +57,13 @@ class CopyTradeStrategy:
             action = event.get("txType")  # "buy" of "sell"
             source_sol = event.get("solAmount", 0)
             if not mint or action not in ("buy", "sell"):
+                continue
+
+            if action == "sell" and mint not in self._held:
+                logger.debug(
+                    "Sell-signaal voor %s genegeerd - geen positie via copytrade "
+                    "(nooit gekocht, of al verkocht).", mint,
+                )
                 continue
 
             my_amount = min(
@@ -75,6 +88,9 @@ class CopyTradeStrategy:
                 logger.info("[DRY RUN] Zou %s %s SOL van %s", action, my_amount, mint)
                 if action == "buy":
                     self.risk.register_trade_opened(my_amount)
+                    self._held.add(mint)
+                else:
+                    self._held.discard(mint)
                 bot_state.log_trade("copytrade", action, mint, my_amount, dry_run=True)
                 continue
 
@@ -87,6 +103,9 @@ class CopyTradeStrategy:
                 )
                 if action == "buy":
                     self.risk.register_trade_opened(my_amount)
+                    self._held.add(mint)
+                else:
+                    self._held.discard(mint)
                 bot_state.log_trade(
                     "copytrade", action, mint, my_amount,
                     dry_run=False, tx_signature=result["signature"],
