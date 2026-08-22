@@ -73,6 +73,10 @@ strategies:
     # testing (a single sell can crater an illiquid curve 30-50% in one
     # trade tick). 0 = geen filter.
     min_market_cap_usd: 0
+    # user-requested: eigen positie-budget, los van de gedeelde
+    # risk.max_open_positions pool - alleen live gehandhaafd, dry_run slaat
+    # deze check helemaal over om zoveel mogelijk outcome-data te farmen.
+    max_open_positions: 5
 
   birdeye_movers:
     # Ontdekt al bestaande tokens met een echte volume/prijs-spike via
@@ -90,8 +94,13 @@ strategies:
     stop_loss_pct: 25
     trailing_activation_pct: 20
     trailing_stop_pct: 15
-    min_holder_count: 0
-    max_top10_concentration_pct: 0
+    # user-requested: gelijk aan social_watch's eigen waarden - hetzelfde
+    # bundled/rug-vormige distributierisico geldt ook voor bestaande tokens,
+    # niet alleen gloednieuwe launches
+    min_holder_count: 1
+    max_top10_concentration_pct: 90
+    # user-requested: eigen positie-budget, zie social_watch hierboven
+    max_open_positions: 5
     # bevestigd live: Birdeye's trending lijst (gesorteerd op volumeUSD)
     # bevat ook major/blue-chip tokens (SOL, wrapped ETH, PUMP zelf), niet
     # alleen memecoins - "kopen" van SOL via een pump.fun-achtige trade is

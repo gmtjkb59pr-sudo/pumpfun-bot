@@ -171,10 +171,12 @@ class SocialWatchStrategy:
             return
 
         open_positions_count = (
-            self.outcome_tracker.open_position_count() if self.outcome_tracker is not None else None
+            self.outcome_tracker.open_position_count(strategy="social_watch")
+            if self.outcome_tracker is not None else None
         )
         ok, reason = self.risk.can_trade(
             self.trade_size_sol, liquidity_sol, open_positions_count=open_positions_count,
+            max_open_positions_override=self.cfg.max_open_positions,
         )
         if not ok:
             logger.info("Social-watch: trade geblokkeerd door risk manager: %s", reason)
@@ -330,6 +332,7 @@ class SocialWatchStrategy:
                     stop_loss_pct=self.cfg.stop_loss_pct,
                     trailing_activation_pct=self.cfg.trailing_activation_pct,
                     trailing_stop_pct=self.cfg.trailing_stop_pct,
+                    strategy="social_watch",
                 )
             if self.scaled_exit_simulator is not None and entry_ref is not None:
                 self.scaled_exit_simulator.track(mint, entry_ref, self.trade_size_sol)
@@ -360,6 +363,7 @@ class SocialWatchStrategy:
                     stop_loss_pct=self.cfg.stop_loss_pct,
                     trailing_activation_pct=self.cfg.trailing_activation_pct,
                     trailing_stop_pct=self.cfg.trailing_stop_pct,
+                    strategy="social_watch",
                 )
             if self.scaled_exit_simulator is not None and entry_ref is not None:
                 self.scaled_exit_simulator.track(mint, entry_ref, self.trade_size_sol)

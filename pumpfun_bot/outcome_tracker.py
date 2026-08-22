@@ -221,7 +221,7 @@ class OutcomeTracker:
     def _persist_pending(self) -> None:
         position_store.save(self._pending, self.position_store_path)
 
-    def open_position_count(self) -> int:
+    def open_position_count(self, strategy: str | None = None) -> int:
         """The real, current number of positions actually being tracked -
         the single source of truth for "is there room to buy another",
         rather than a separately-incremented counter that can drift from
@@ -234,8 +234,19 @@ class OutcomeTracker:
         still holds real capital (still counted in RiskManager's exposure,
         unaffected by this), but nothing further can be done for it
         automatically, so it shouldn't also block ALL new buying by sitting
-        in a max_open_positions slot forever."""
-        return sum(1 for info in self._pending.values() if not info.get("sell_paused"))
+        in a max_open_positions slot forever.
+
+        strategy: user-requested per-strategy position budgets - pass a
+        strategy name (as given to track()) to count only that strategy's
+        own open positions, e.g. so a birdeye_movers burst can't crowd
+        social_watch out of a shared pool. None (default) counts across
+        all strategies, the original shared-pool behavior. Positions
+        tracked before the "strategy" field existed have strategy="" and
+        are only ever counted by the unscoped (None) call."""
+        return sum(
+            1 for info in self._pending.values()
+            if not info.get("sell_paused") and (strategy is None or info.get("strategy") == strategy)
+        )
 
     def tracked_mints(self) -> set[str]:
         """The mints currently being tracked - used at startup to reconcile
@@ -258,6 +269,7 @@ class OutcomeTracker:
         stop_loss_pct: float | None = None,
         trailing_activation_pct: float | None = None,
         trailing_stop_pct: float | None = None,
+        strategy: str = "",
     ) -> None:
         """take_profit_pct/stop_loss_pct/trailing_*_pct default to this
         instance's own thresholds - pass explicit values when a DIFFERENT
@@ -265,7 +277,13 @@ class OutcomeTracker:
         own exit thresholds instead of sniper's. Without this, a shared
         OutcomeTracker silently applies only whichever strategy's config it
         was constructed with to every position, regardless of which
-        strategy actually opened it."""
+        strategy actually opened it.
+
+        strategy: user-requested per-strategy position budgets - tags this
+        position so open_position_count(strategy=...) can scope to just
+        this strategy's own open positions later. Optional/blank for
+        callers (sniper, copytrade, market_maker) that don't need their
+        own budget yet - they stay on the original shared-pool count."""
         if entry_ref is None:
             logger.debug("Geen price-ref beschikbaar voor %s, sla outcome-tracking over.", mint)
             return
@@ -308,6 +326,7 @@ class OutcomeTracker:
                 "trailing_stop_pct": (
                     trailing_stop_pct if trailing_stop_pct is not None else self.trailing_stop_pct
                 ),
+                "strategy": strategy,
             }
             self._persist_pending()
 
