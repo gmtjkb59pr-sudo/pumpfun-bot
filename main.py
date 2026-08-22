@@ -26,6 +26,7 @@ from pumpfun_bot.balance_watch import (
     watch_balance_floor,
     watch_max_real_loss,
 )
+from pumpfun_bot.candidate_price_tracker import CandidatePriceTracker
 from pumpfun_bot.config import load_config
 from pumpfun_bot.dashboard_server import start_dashboard_server
 from pumpfun_bot.logger_setup import setup_logging
@@ -126,6 +127,14 @@ async def main() -> None:
         dry_run=cfg.risk.dry_run,
         outcome_tracker=outcome_tracker,
     )
+    # user-requested: real 1m/2m momentum tracked from live trade ticks,
+    # shorter than anything DexScreener's API exposes (see
+    # candidate_price_tracker.py) - explicitly accepted despite the real
+    # PumpPortal subscribeTokenTrade metering cost of watching every
+    # candidate, not just ones that end up bought
+    candidate_price_tracker = CandidatePriceTracker(
+        ws_url=cfg.pumpportal_ws_url, api_key=cfg.pumpportal_api_key,
+    )
     social_watch = SocialWatchStrategy(
         client=PumpPortalClient(cfg.pumpportal_ws_url, cfg.pumpportal_trade_api_url,
                                  cfg.rpc_http_url, keypair, api_key=cfg.pumpportal_api_key),
@@ -136,6 +145,7 @@ async def main() -> None:
         slippage_pct=cfg.risk.default_slippage_pct,
         dry_run=cfg.risk.dry_run,
         outcome_tracker=outcome_tracker,
+        price_tracker=candidate_price_tracker,
     )
     copytrade = CopyTradeStrategy(
         client=PumpPortalClient(cfg.pumpportal_ws_url, cfg.pumpportal_trade_api_url,
@@ -212,6 +222,9 @@ async def main() -> None:
         asyncio.create_task(market_maker.run()),
         asyncio.create_task(outcome_tracker.run()),
     ]
+
+    if cfg.social_watch.enabled:
+        tasks.append(asyncio.create_task(candidate_price_tracker.run()))
 
     if not cfg.risk.dry_run:
         tasks.append(asyncio.create_task(

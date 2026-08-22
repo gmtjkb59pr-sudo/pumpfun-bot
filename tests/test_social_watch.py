@@ -83,12 +83,17 @@ def tearDownModule():
 
 
 class FakeClient:
-    def __init__(self, *, trade_events=None, should_fail_buy=False):
+    def __init__(self, *, trade_events=None, should_fail_buy=False, new_token_events=None):
         # trade_events: list of events yielded by stream_token_trades, per call
         self._trade_events = trade_events if trade_events is not None else []
+        self._new_token_events = new_token_events if new_token_events is not None else []
         self.should_fail_buy = should_fail_buy
         self.buy_calls = []
         self.rpc_http_url = "https://example.invalid/rpc"
+
+    async def stream_new_tokens(self):
+        for event in self._new_token_events:
+            yield event
 
     async def stream_token_trades(self, mints):
         for event in self._trade_events:
@@ -112,9 +117,33 @@ class FakeAlerter:
         self.messages.append(message)
 
 
+class FakePriceTracker:
+    """Stands in for CandidatePriceTracker - records watch()/unwatch() calls
+    and returns pre-set 1m/2m values without any real network activity."""
+
+    def __init__(self, price_change_1m=None, price_change_2m=None):
+        self.watched: list[str] = []
+        self.unwatched: list[str] = []
+        self._price_change_1m = price_change_1m
+        self._price_change_2m = price_change_2m
+
+    async def watch(self, mint):
+        self.watched.append(mint)
+
+    async def unwatch(self, mint):
+        self.unwatched.append(mint)
+
+    def price_change_pct(self, mint, window_sec):
+        if window_sec == 60:
+            return self._price_change_1m
+        if window_sec == 120:
+            return self._price_change_2m
+        return None
+
+
 def _make_strategy(
     client, *, dry_run=True, outcome_tracker=None, min_holder_count=0, min_market_cap_usd=0,
-    max_top10_concentration_pct=0, require_positive_momentum_5m=False,
+    max_top10_concentration_pct=0, require_positive_momentum_5m=False, price_tracker=None,
 ):
     risk = RiskManager(RiskConfig())
     strategy = SocialWatchStrategy(
@@ -132,6 +161,7 @@ def _make_strategy(
         dry_run=dry_run,
         outcome_tracker=outcome_tracker,
         fresh_ref_timeout_sec=0.05,
+        price_tracker=price_tracker,
     )
     return strategy, risk
 
@@ -563,6 +593,107 @@ class MomentumMetaLoggingTests(unittest.TestCase):
         self.assertIsNone(meta["price_change_h1_pct"])
         self.assertIsNone(meta["price_change_h6_pct"])
         self.assertIsNone(meta["price_change_h24_pct"])
+
+
+class PriceTrackerLifecycleTests(unittest.TestCase):
+    """User-requested: real 1m/2m momentum from our own buffered trade
+    ticks (see candidate_price_tracker.py), since DexScreener doesn't
+    expose anything shorter than m5. A candidate must be watch()ed while
+    social_watch is evaluating it, and unwatch()ed once it's no longer a
+    candidate (bought or expired) - price_tracker is optional, so all of
+    this must be skipped cleanly when it's None."""
+
+    def test_watches_a_new_candidate_as_soon_as_it_is_seen(self):
+        price_tracker = FakePriceTracker()
+        client = FakeClient(new_token_events=[
+            {"mint": "MINT", "uri": "https://example.invalid/meta.json", "vSolInBondingCurve": 30.0},
+        ])
+        strategy, _ = _make_strategy(client, price_tracker=price_tracker)
+
+        asyncio.run(strategy.run())
+
+        self.assertEqual(price_tracker.watched, ["MINT"])
+
+    def test_does_not_watch_the_same_candidate_twice(self):
+        price_tracker = FakePriceTracker()
+        client = FakeClient(new_token_events=[
+            {"mint": "MINT", "uri": "https://example.invalid/meta.json", "vSolInBondingCurve": 30.0},
+            {"mint": "MINT", "uri": "https://example.invalid/meta.json", "vSolInBondingCurve": 30.0},
+        ])
+        strategy, _ = _make_strategy(client, price_tracker=price_tracker)
+
+        asyncio.run(strategy.run())
+
+        self.assertEqual(price_tracker.watched, ["MINT"])
+
+    def test_unwatches_a_candidate_that_expires_without_socials(self):
+        price_tracker = FakePriceTracker()
+        client = FakeClient()
+        strategy, _ = _make_strategy(client, price_tracker=price_tracker)
+        strategy._watching["MINT"] = {
+            "event": {"mint": "MINT", "uri": "https://example.invalid/meta.json"},
+            "added_ts": time.time() - 61,
+        }
+
+        asyncio.run(strategy._poll_once())
+
+        self.assertEqual(price_tracker.unwatched, ["MINT"])
+
+    def test_unwatches_a_candidate_after_it_is_bought(self):
+        price_tracker = FakePriceTracker()
+        client = FakeClient(trade_events=[{"marketCapSol": 30.0}])
+        strategy, _ = _make_strategy(client, dry_run=False, price_tracker=price_tracker)
+        strategy._watching["MINT"] = {
+            "event": {
+                "mint": "MINT", "name": "Test", "symbol": "TEST",
+                "uri": "https://example.invalid/meta.json", "vSolInBondingCurve": 30.0,
+            },
+            "added_ts": time.time() - 25,
+        }
+
+        async def _fake_has_socials(uri):
+            return True
+
+        async def _fake_fetch_holder_count(mint, rpc_http_url):
+            return 42
+
+        with patch(
+            "pumpfun_bot.strategies.social_watch.fetch_has_socials", _fake_has_socials,
+        ), patch(
+            "pumpfun_bot.strategies.social_watch.fetch_holder_count", _fake_fetch_holder_count,
+        ):
+            asyncio.run(strategy._poll_once())
+
+        self.assertEqual(price_tracker.unwatched, ["MINT"])
+
+    def test_logs_the_1m_and_2m_momentum_from_the_price_tracker(self):
+        price_tracker = FakePriceTracker(price_change_1m=15.0, price_change_2m=-4.0)
+        client = FakeClient(trade_events=[{"marketCapSol": 30.0}])
+        strategy, _ = _make_strategy(client, dry_run=True, price_tracker=price_tracker)
+
+        asyncio.run(strategy._buy("MINT", {
+            "mint": "MINT", "name": "Test", "symbol": "TEST", "vSolInBondingCurve": 30.0,
+        }, time.time()))
+
+        with open(activity_log.DATA_LOG_PATH, encoding="utf-8") as f:
+            trades = [json.loads(line) for line in f if json.loads(line).get("type") == "trade"]
+        meta = trades[-1]["meta"]
+        self.assertAlmostEqual(meta["price_change_1m_pct"], 15.0)
+        self.assertAlmostEqual(meta["price_change_2m_pct"], -4.0)
+
+    def test_meta_has_no_1m_2m_keys_when_no_price_tracker_is_configured(self):
+        client = FakeClient(trade_events=[{"marketCapSol": 30.0}])
+        strategy, _ = _make_strategy(client, dry_run=True, price_tracker=None)
+
+        asyncio.run(strategy._buy("MINT", {
+            "mint": "MINT", "name": "Test", "symbol": "TEST", "vSolInBondingCurve": 30.0,
+        }, time.time()))
+
+        with open(activity_log.DATA_LOG_PATH, encoding="utf-8") as f:
+            trades = [json.loads(line) for line in f if json.loads(line).get("type") == "trade"]
+        meta = trades[-1]["meta"]
+        self.assertNotIn("price_change_1m_pct", meta)
+        self.assertNotIn("price_change_2m_pct", meta)
 
 
 class HolderCountIndexingDelayTests(unittest.TestCase):
