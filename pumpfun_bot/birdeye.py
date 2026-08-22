@@ -24,6 +24,7 @@ import aiohttp
 logger = logging.getLogger("pumpfun_bot.birdeye")
 
 BIRDEYE_TRENDING_URL = "https://public-api.birdeye.so/defi/token_trending"
+BIRDEYE_TOP_TRADERS_URL = "https://public-api.birdeye.so/defi/v2/tokens/top_traders"
 
 
 async def fetch_trending_tokens(
@@ -58,4 +59,42 @@ async def fetch_trending_tokens(
                 return data.get("data", {}).get("tokens", [])
     except Exception as exc:  # noqa: BLE001
         logger.debug("Kon Birdeye trending tokens niet ophalen: %s", exc)
+        return None
+
+
+async def fetch_top_traders(
+    mint: str,
+    api_key: str,
+    chain: str = "solana",
+    time_frame: str = "all_time",
+    sort_by: str = "total_pnl",
+    sort_type: str = "desc",
+    timeout_sec: float = 10.0,
+) -> list[dict] | None:
+    """Returns the raw list of top-trader dicts for one mint (each with
+    owner/totalPnl/realizedPnl/tags/...), or None if the lookup itself
+    failed. Used by wallet_discovery.py to find real, evidenced-profitable
+    wallets among a token's traders - user-requested, to evaluate as
+    copytrade candidates. Costs 35 CU/call (vs 30 for the trending
+    endpoint) - see wallet_discovery.py for how it paces calls to stay
+    within the free tier's budget."""
+    headers = {"X-API-KEY": api_key, "x-chain": chain}
+    params = {
+        "address": mint, "time_frame": time_frame, "sort_by": sort_by, "sort_type": sort_type,
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                BIRDEYE_TOP_TRADERS_URL, headers=headers, params=params, timeout=timeout_sec,
+            ) as resp:
+                if resp.status != 200:
+                    logger.debug("Birdeye top_traders gaf status %d voor %s", resp.status, mint)
+                    return None
+                data = await resp.json()
+                if not data.get("success"):
+                    logger.debug("Birdeye top_traders antwoordde met success=false voor %s: %s", mint, data)
+                    return None
+                return data.get("data", {}).get("items", [])
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Kon Birdeye top traders niet ophalen voor %s: %s", mint, exc)
         return None
