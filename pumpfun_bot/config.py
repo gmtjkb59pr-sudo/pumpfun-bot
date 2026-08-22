@@ -79,10 +79,11 @@ class SocialWatchConfig:
     # querying them. 0 = no filter.
     max_top10_concentration_pct: float = 0
     # user-requested "movers"-style filter: only buy candidates already
-    # showing positive 1h price momentum on DexScreener (see dexscreener.py
+    # showing positive 5m price momentum on DexScreener (see dexscreener.py
     # for why that's the ToS-clean data source, not pump.fun's own site).
-    # False = no filter.
-    require_positive_momentum_1h: bool = False
+    # Window shortened from the original 1h to 5m - user-requested, matches
+    # how young these candidates actually are. False = no filter.
+    require_positive_momentum_5m: bool = False
 
 
 @dataclass
@@ -181,7 +182,7 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         min_holder_count=sw_raw.get("min_holder_count", 0),
         min_market_cap_usd=sw_raw.get("min_market_cap_usd", 0),
         max_top10_concentration_pct=sw_raw.get("max_top10_concentration_pct", 0),
-        require_positive_momentum_1h=sw_raw.get("require_positive_momentum_1h", False),
+        require_positive_momentum_5m=sw_raw.get("require_positive_momentum_5m", False),
     )
 
     ct_raw = strat_raw.get("copytrade", {})
