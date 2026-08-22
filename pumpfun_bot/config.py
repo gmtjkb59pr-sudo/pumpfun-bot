@@ -70,6 +70,14 @@ class SocialWatchConfig:
     # (a single sell can crater an illiquid curve 30-50% in one trade tick).
     # 0 = no filter.
     min_market_cap_usd: float = 0
+    # user-requested: skip candidates whose top 10 holder accounts control
+    # more than this % of supply - a manufactured/bundled launch concentrates
+    # the float in a handful of wallets that can dump together, same failure
+    # mode behind the deep stop-loss overshoots. Threshold matches Luminos's
+    # (luminos.capital) own published "flag" band for this signal - see
+    # holder_concentration.py for why we compute it ourselves instead of
+    # querying them. 0 = no filter.
+    max_top10_concentration_pct: float = 0
 
 
 @dataclass
@@ -167,6 +175,7 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         trailing_stop_pct=sw_raw.get("trailing_stop_pct", 15),
         min_holder_count=sw_raw.get("min_holder_count", 0),
         min_market_cap_usd=sw_raw.get("min_market_cap_usd", 0),
+        max_top10_concentration_pct=sw_raw.get("max_top10_concentration_pct", 0),
     )
 
     ct_raw = strat_raw.get("copytrade", {})
