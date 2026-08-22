@@ -17,6 +17,7 @@ from ..alerts import Alerter
 from ..config import SocialWatchConfig
 from ..holder_count import INDEXING_DELAY_SEC as HOLDER_COUNT_INDEXING_DELAY_SEC
 from ..holder_count import fetch_holder_count
+from ..market_cap import fetch_market_cap_usd
 from ..outcome_tracker import OutcomeTracker
 from ..price_ref import extract_price_ref
 from ..pumpportal_client import PumpPortalClient
@@ -174,9 +175,10 @@ class SocialWatchStrategy:
         # unlike sniper's instant buy, social_watch already tolerates real
         # delay - fetch these synchronously so the values are accurate AT
         # the decision point, instead of a delayed best-effort background log
-        entry_ref, holder_count = await asyncio.gather(
+        entry_ref, holder_count, market_cap_usd = await asyncio.gather(
             self._fetch_fresh_ref(mint),
             fetch_holder_count(mint, self.client.rpc_http_url),
+            fetch_market_cap_usd(mint),
         )
         if entry_ref is None:
             entry_ref = extract_price_ref(event)
@@ -197,9 +199,26 @@ class SocialWatchStrategy:
             )
             return
 
+        if self.cfg.min_market_cap_usd > 0:
+            # user-requested: thin market caps correlated with the worst
+            # stop-loss overshoots live - a single sell can crater an
+            # illiquid curve 30-50% in one trade tick, and a low market cap
+            # is the clearest available signal for that risk
+            if market_cap_usd is None:
+                logger.info("Social-watch: market cap onbekend voor %s, sla over.", mint)
+                return
+            if market_cap_usd < self.cfg.min_market_cap_usd:
+                logger.info(
+                    "Social-watch: %s heeft $%.0f market cap, onder de min_market_cap_usd "
+                    "van $%.0f, sla over.", mint, market_cap_usd, self.cfg.min_market_cap_usd,
+                )
+                return
+
+        mcap_str = f"${market_cap_usd:.0f}" if market_cap_usd is not None else "?"
         await self.alerter.send(
             f"👥 Social-watch kandidaat: {name} ({symbol}) - {mint} "
-            f"(socials gevonden, {holder_count if holder_count is not None else '?'} holders)"
+            f"(socials gevonden, {holder_count if holder_count is not None else '?'} holders, "
+            f"{mcap_str} mcap)"
         )
 
         if self.dry_run:
