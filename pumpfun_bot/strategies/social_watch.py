@@ -168,10 +168,19 @@ class SocialWatchStrategy:
         # of our own buy). Top up to that minimum before trusting the count -
         # confirmed by re-checking a live "0 holders" read minutes later and
         # finding real holders that were always there, just not indexed yet.
-        elapsed_since_launch = time.time() - added_ts
-        remaining_delay = HOLDER_COUNT_INDEXING_DELAY_SEC - elapsed_since_launch
-        if remaining_delay > 0:
-            await asyncio.sleep(remaining_delay)
+        #
+        # user-requested speed tradeoff: skip this wait entirely when
+        # min_holder_count <= 1 - at that threshold the count barely gates
+        # anything (a stale "0 holders" read is the only thing it could
+        # wrongly block), so the up-to-20s latency isn't buying much
+        # accuracy. Still applied whenever a real threshold is set (e.g. if
+        # auto_tuner.py raises it later), since the logged holder_count also
+        # feeds that tuner's evidence - only the gating case is exempted.
+        if self.cfg.min_holder_count > 1:
+            elapsed_since_launch = time.time() - added_ts
+            remaining_delay = HOLDER_COUNT_INDEXING_DELAY_SEC - elapsed_since_launch
+            if remaining_delay > 0:
+                await asyncio.sleep(remaining_delay)
 
         # unlike sniper's instant buy, social_watch already tolerates real
         # delay - fetch these synchronously so the values are accurate AT

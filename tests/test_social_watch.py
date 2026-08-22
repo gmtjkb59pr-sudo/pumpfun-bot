@@ -405,11 +405,15 @@ class HolderCountIndexingDelayTests(unittest.TestCase):
     for holder count to be real (confirmed live: a mint read 0 holders at
     buy time, then showed real holders minutes later). _buy() must top up
     to that minimum, measured from the token's own launch (added_ts), not
-    skip it just because it already waited watch_window_sec."""
+    skip it just because it already waited watch_window_sec.
+
+    Only applies when min_holder_count > 1 - see the "skip this wait
+    entirely" test below for the user-requested speed exemption at the
+    trivial (<=1) threshold."""
 
     def test_tops_up_to_the_indexing_delay_when_bought_on_first_poll(self):
         client = FakeClient(trade_events=[{"marketCapSol": 30.0}])
-        strategy, _ = _make_strategy(client, dry_run=True)
+        strategy, _ = _make_strategy(client, dry_run=True, min_holder_count=16)
 
         holder_count_calls = []
 
@@ -435,7 +439,7 @@ class HolderCountIndexingDelayTests(unittest.TestCase):
 
     def test_does_not_sleep_when_already_past_the_indexing_delay(self):
         client = FakeClient(trade_events=[{"marketCapSol": 30.0}])
-        strategy, _ = _make_strategy(client, dry_run=True)
+        strategy, _ = _make_strategy(client, dry_run=True, min_holder_count=16)
 
         async def _fake_fetch_holder_count(mint, rpc_http_url):
             return 5
@@ -449,6 +453,30 @@ class HolderCountIndexingDelayTests(unittest.TestCase):
             asyncio.run(strategy._buy("MINT", {
                 "mint": "MINT", "name": "Test", "symbol": "TEST", "vSolInBondingCurve": 30.0,
             }, time.time() - 25))  # already 25s old, past the 20s delay
+            elapsed = time.time() - start
+
+        self.assertLess(elapsed, 1.0)
+
+    def test_skips_the_wait_entirely_when_min_holder_count_is_trivial(self):
+        # user-requested speed tradeoff: at min_holder_count <= 1 the count
+        # barely gates anything, so don't pay the up-to-20s latency for it
+        client = FakeClient(trade_events=[{"marketCapSol": 30.0}])
+        strategy, _ = _make_strategy(client, dry_run=True, min_holder_count=1)
+
+        async def _fake_fetch_holder_count(mint, rpc_http_url):
+            return 5
+
+        with patch(
+            "pumpfun_bot.strategies.social_watch.HOLDER_COUNT_INDEXING_DELAY_SEC", 20,
+        ), patch(
+            "pumpfun_bot.strategies.social_watch.fetch_holder_count", _fake_fetch_holder_count,
+        ):
+            start = time.time()
+            # added_ts == now: on the old behavior this would have to wait
+            # the full 20s before proceeding
+            asyncio.run(strategy._buy("MINT", {
+                "mint": "MINT", "name": "Test", "symbol": "TEST", "vSolInBondingCurve": 30.0,
+            }, time.time()))
             elapsed = time.time() - start
 
         self.assertLess(elapsed, 1.0)
