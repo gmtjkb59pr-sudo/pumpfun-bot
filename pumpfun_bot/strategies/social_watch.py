@@ -15,7 +15,7 @@ import time
 
 from ..alerts import Alerter
 from ..config import SocialWatchConfig
-from ..dexscreener import fetch_price_change_5m_pct
+from ..dexscreener import fetch_price_changes_pct
 from ..holder_concentration import SETTLING_DELAY_SEC as CONCENTRATION_SETTLING_DELAY_SEC
 from ..holder_concentration import fetch_top10_concentration_pct
 from ..holder_count import INDEXING_DELAY_SEC as HOLDER_COUNT_INDEXING_DELAY_SEC
@@ -197,14 +197,17 @@ class SocialWatchStrategy:
         # delay - fetch these synchronously so the values are accurate AT
         # the decision point, instead of a delayed best-effort background log
         (
-            entry_ref, holder_count, market_cap_usd, top10_concentration_pct, price_change_5m_pct,
+            entry_ref, holder_count, market_cap_usd, top10_concentration_pct, price_changes_pct,
         ) = await asyncio.gather(
             self._fetch_fresh_ref(mint),
             fetch_holder_count(mint, self.client.rpc_http_url),
             fetch_market_cap_usd(mint),
             fetch_top10_concentration_pct(mint, self.client.rpc_http_url),
-            fetch_price_change_5m_pct(mint),
+            fetch_price_changes_pct(mint),
         )
+        # only m5 gates the buy decision (user-requested, see dexscreener.py) -
+        # h1/h6/h24 are logged below with the trade but not enforced yet
+        price_change_5m_pct = price_changes_pct.get("m5") if price_changes_pct is not None else None
         if entry_ref is None:
             entry_ref = extract_price_ref(event)
         if holder_count is None:
@@ -278,12 +281,23 @@ class SocialWatchStrategy:
             f"{mcap_str} mcap{momentum_str})"
         )
 
+        # user-requested: log every available momentum window (not just the
+        # m5 one that actually gates the buy) so the best window can be
+        # picked from real outcome data later instead of guessing
+        momentum_meta = {
+            f"price_change_{window}_pct": (price_changes_pct or {}).get(window)
+            for window in ("m5", "h1", "h6", "h24")
+        }
+
         if self.dry_run:
             logger.info("[DRY RUN] Zou kopen: %s SOL van %s", self.trade_size_sol, mint)
             self.risk.register_trade_opened(self.trade_size_sol)
             bot_state.log_trade(
                 "social_watch", "buy", mint, self.trade_size_sol, dry_run=True,
-                meta={"liquidity_sol": liquidity_sol, "has_socials": True, "holder_count": holder_count},
+                meta={
+                    "liquidity_sol": liquidity_sol, "has_socials": True, "holder_count": holder_count,
+                    **momentum_meta,
+                },
             )
             if self.outcome_tracker is not None:
                 await self.outcome_tracker.track(
@@ -309,6 +323,7 @@ class SocialWatchStrategy:
                 meta={
                     "liquidity_sol": liquidity_sol, "has_socials": True,
                     "creator": creator, "holder_count": holder_count,
+                    **momentum_meta,
                 },
             )
             await self.alerter.send(f"✅ Gekocht (social-watch): {symbol} | tx: {result['signature']}")
