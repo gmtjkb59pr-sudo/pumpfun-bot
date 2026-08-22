@@ -92,6 +92,13 @@ strategies:
     trailing_stop_pct: 15
     min_holder_count: 0
     max_top10_concentration_pct: 0
+    # bevestigd live: Birdeye's trending lijst (gesorteerd op volumeUSD)
+    # bevat ook major/blue-chip tokens (SOL, wrapped ETH, PUMP zelf), niet
+    # alleen memecoins - "kopen" van SOL via een pump.fun-achtige trade is
+    # een categoriefout. In tegenstelling tot de filters hierboven staat
+    # deze standaard AAN, ruim boven echte memecoin market caps en ruim
+    # onder die van elke major token.
+    max_market_cap_usd: 20000000
 
   copytrade:
     enabled: false

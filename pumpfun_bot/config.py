@@ -102,6 +102,14 @@ class BirdeyeMoversConfig:
     # 0 = no filter, same convention as social_watch's equivalents
     min_holder_count: int = 0
     max_top10_concentration_pct: float = 0
+    # confirmed live: Birdeye's trending list (sorted by volumeUSD) surfaces
+    # major/blue-chip tokens like SOL, wrapped ETH, and PUMP itself, not
+    # just memecoins - "buying" SOL through a pump.fun-style trade is a
+    # category error (SOL is the base currency, not a bonding-curve token),
+    # so unlike the 0-disables-it filters above, this one defaults ON at a
+    # level clearly above real memecoin market caps and clearly below any
+    # major token's.
+    max_market_cap_usd: float = 20_000_000
     take_profit_pct: float = 50
     stop_loss_pct: float = 25
     trailing_activation_pct: float = 20
@@ -217,6 +225,7 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         trending_limit=be_raw.get("trending_limit", 20),
         min_holder_count=be_raw.get("min_holder_count", 0),
         max_top10_concentration_pct=be_raw.get("max_top10_concentration_pct", 0),
+        max_market_cap_usd=be_raw.get("max_market_cap_usd", 20_000_000),
         take_profit_pct=be_raw.get("take_profit_pct", 50),
         stop_loss_pct=be_raw.get("stop_loss_pct", 25),
         trailing_activation_pct=be_raw.get("trailing_activation_pct", 20),
