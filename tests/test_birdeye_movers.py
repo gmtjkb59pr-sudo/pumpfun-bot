@@ -50,7 +50,7 @@ class FakeAlerter:
 
 def _make_strategy(
     client, *, dry_run=True, outcome_tracker=None, min_holder_count=0,
-    max_top10_concentration_pct=0, api_key="fake-key",
+    max_top10_concentration_pct=0, max_market_cap_usd=20_000_000, api_key="fake-key",
 ):
     risk = RiskManager(RiskConfig())
     strategy = BirdeyeMoversStrategy(
@@ -58,6 +58,7 @@ def _make_strategy(
         cfg=BirdeyeMoversConfig(
             enabled=True, api_key=api_key, poll_interval_sec=2700, trending_limit=20,
             min_holder_count=min_holder_count, max_top10_concentration_pct=max_top10_concentration_pct,
+            max_market_cap_usd=max_market_cap_usd,
         ),
         risk=risk,
         alerter=FakeAlerter(),
@@ -73,6 +74,7 @@ def _token(**overrides):
     base = {
         "address": "MINT", "name": "Test Token", "symbol": "TEST",
         "price": 1.5, "price24hChangePercent": 42.0, "volume24hUSD": 100000.0,
+        "marketcap": 50000.0,  # realistic small-memecoin cap, well under the default ceiling
     }
     base.update(overrides)
     return base
@@ -195,6 +197,48 @@ class ConsiderTests(unittest.TestCase):
         asyncio.run(strategy._consider(_token(address=None)))  # must not raise
 
         self.assertEqual(client.buy_calls, [])
+
+
+class MaxMarketCapGateTests(unittest.TestCase):
+    """Confirmed live: Birdeye's trending list (sorted by volumeUSD)
+    surfaces major/blue-chip tokens (SOL, wrapped ETH, PUMP itself), not
+    just memecoins - "buying" those via a pump.fun-style trade is a
+    category error. Unlike the other 0-disables-it filters, this one
+    defaults ON (see BirdeyeMoversConfig.max_market_cap_usd)."""
+
+    def test_skips_a_token_above_the_market_cap_ceiling(self):
+        client = FakeClient()
+        strategy, risk = _make_strategy(client, dry_run=False, max_market_cap_usd=20_000_000)
+
+        asyncio.run(strategy._consider(_token(marketcap=90_000_000_000)))  # SOL-scale
+
+        self.assertEqual(client.buy_calls, [])
+
+    def test_buys_a_token_at_or_below_the_ceiling(self):
+        client = FakeClient()
+        strategy, risk = _make_strategy(client, dry_run=False, max_market_cap_usd=20_000_000)
+
+        with _DEFAULT_HOLDER_PATCH, _DEFAULT_CONCENTRATION_PATCH:
+            asyncio.run(strategy._consider(_token(marketcap=20_000_000)))
+
+        self.assertEqual(len(client.buy_calls), 1)
+
+    def test_skips_when_market_cap_is_unknown(self):
+        client = FakeClient()
+        strategy, risk = _make_strategy(client, dry_run=False, max_market_cap_usd=20_000_000)
+
+        asyncio.run(strategy._consider(_token(marketcap=None)))
+
+        self.assertEqual(client.buy_calls, [])
+
+    def test_buys_regardless_of_market_cap_when_ceiling_is_disabled(self):
+        client = FakeClient()
+        strategy, risk = _make_strategy(client, dry_run=False, max_market_cap_usd=0)
+
+        with _DEFAULT_HOLDER_PATCH, _DEFAULT_CONCENTRATION_PATCH:
+            asyncio.run(strategy._consider(_token(marketcap=90_000_000_000)))
+
+        self.assertEqual(len(client.buy_calls), 1)
 
 
 class RunGatingTests(unittest.TestCase):

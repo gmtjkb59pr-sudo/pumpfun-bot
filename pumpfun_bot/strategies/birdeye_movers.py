@@ -91,6 +91,21 @@ class BirdeyeMoversStrategy:
         if price_change_pct is None or price_change_pct <= 0:
             return
 
+        if self.cfg.max_market_cap_usd > 0:
+            # confirmed live: Birdeye's trending list (sorted by volumeUSD)
+            # surfaces major/blue-chip tokens like SOL and wrapped ETH, not
+            # just memecoins - "buying" those through a pump.fun-style
+            # trade is a category error, not a real candidate. Checked
+            # before any RPC calls - cheapest possible rejection.
+            market_cap_usd = token.get("marketcap")
+            if market_cap_usd is None or market_cap_usd > self.cfg.max_market_cap_usd:
+                logger.info(
+                    "Birdeye-movers: %s heeft $%s market cap, boven de max_market_cap_usd "
+                    "van $%.0f (of onbekend), sla over.",
+                    token.get("address"), market_cap_usd, self.cfg.max_market_cap_usd,
+                )
+                return
+
         name = token.get("name", "?")
         symbol = token.get("symbol", "?")
 
