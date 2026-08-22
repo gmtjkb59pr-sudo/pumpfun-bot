@@ -153,8 +153,8 @@ class FakeScaledExitSimulator:
 
 def _make_strategy(
     client, *, dry_run=True, outcome_tracker=None, min_holder_count=0, min_market_cap_usd=0,
-    max_top10_concentration_pct=0, require_positive_momentum_5m=False, price_tracker=None,
-    scaled_exit_simulator=None,
+    max_top10_concentration_pct=0, require_positive_momentum_5m=False, max_price_change_5m_pct=0,
+    price_tracker=None, scaled_exit_simulator=None,
 ):
     risk = RiskManager(RiskConfig())
     strategy = SocialWatchStrategy(
@@ -164,6 +164,7 @@ def _make_strategy(
             min_holder_count=min_holder_count, min_market_cap_usd=min_market_cap_usd,
             max_top10_concentration_pct=max_top10_concentration_pct,
             require_positive_momentum_5m=require_positive_momentum_5m,
+            max_price_change_5m_pct=max_price_change_5m_pct,
         ),
         risk=risk,
         alerter=FakeAlerter(),
@@ -543,6 +544,92 @@ class PositiveMomentumGateTests(unittest.TestCase):
         ), patch(
             "pumpfun_bot.strategies.social_watch.fetch_price_changes_pct",
             _failing_fetch_price_changes_pct,
+        ):
+            asyncio.run(strategy._buy("MINT", {
+                "mint": "MINT", "name": "Test", "symbol": "TEST", "vSolInBondingCurve": 30.0,
+            }, time.time()))
+
+        self.assertEqual(len(client.buy_calls), 1)
+
+
+class MaxMomentumGateTests(unittest.TestCase):
+    """User-requested, evidence-based (real dry-run outcomes): losing
+    trades averaged 216% 5m momentum at buy vs 134% for winners, and win
+    rate dropped sharply above ~100% - max_price_change_5m_pct must
+    actually be enforced once set."""
+
+    def test_skips_buy_above_max_momentum(self):
+        client = FakeClient(trade_events=[{"marketCapSol": 30.0}])
+        strategy, risk = _make_strategy(client, dry_run=False, max_price_change_5m_pct=100)
+
+        async def _fake_fetch_price_changes_pct(mint):
+            return {"m5": 150.0, "h1": 150.0, "h6": 150.0, "h24": 150.0}
+
+        with patch(
+            "pumpfun_bot.strategies.social_watch.HOLDER_COUNT_INDEXING_DELAY_SEC", 0,
+        ), patch(
+            "pumpfun_bot.strategies.social_watch.fetch_price_changes_pct",
+            _fake_fetch_price_changes_pct,
+        ):
+            asyncio.run(strategy._buy("MINT", {
+                "mint": "MINT", "name": "Test", "symbol": "TEST", "vSolInBondingCurve": 30.0,
+            }, time.time()))
+
+        self.assertEqual(client.buy_calls, [])
+        self.assertAlmostEqual(risk.state.open_exposure_sol, 0.0)
+
+    def test_buys_at_or_below_max_momentum(self):
+        client = FakeClient(trade_events=[{"marketCapSol": 30.0}])
+        strategy, risk = _make_strategy(client, dry_run=False, max_price_change_5m_pct=100)
+
+        async def _fake_fetch_price_changes_pct(mint):
+            return {"m5": 100.0, "h1": 100.0, "h6": 100.0, "h24": 100.0}
+
+        with patch(
+            "pumpfun_bot.strategies.social_watch.HOLDER_COUNT_INDEXING_DELAY_SEC", 0,
+        ), patch(
+            "pumpfun_bot.strategies.social_watch.fetch_price_changes_pct",
+            _fake_fetch_price_changes_pct,
+        ):
+            asyncio.run(strategy._buy("MINT", {
+                "mint": "MINT", "name": "Test", "symbol": "TEST", "vSolInBondingCurve": 30.0,
+            }, time.time()))
+
+        self.assertEqual(len(client.buy_calls), 1)
+        self.assertAlmostEqual(risk.state.open_exposure_sol, 0.03)
+
+    def test_skips_buy_when_max_momentum_set_but_lookup_fails(self):
+        client = FakeClient(trade_events=[{"marketCapSol": 30.0}])
+        strategy, risk = _make_strategy(client, dry_run=False, max_price_change_5m_pct=100)
+
+        async def _failing_fetch_price_changes_pct(mint):
+            return None
+
+        with patch(
+            "pumpfun_bot.strategies.social_watch.HOLDER_COUNT_INDEXING_DELAY_SEC", 0,
+        ), patch(
+            "pumpfun_bot.strategies.social_watch.fetch_price_changes_pct",
+            _failing_fetch_price_changes_pct,
+        ):
+            asyncio.run(strategy._buy("MINT", {
+                "mint": "MINT", "name": "Test", "symbol": "TEST", "vSolInBondingCurve": 30.0,
+            }, time.time()))
+
+        self.assertEqual(client.buy_calls, [])
+
+    def test_buys_regardless_of_momentum_when_no_ceiling_set(self):
+        # default max_price_change_5m_pct=0 - the filter is off unless explicitly set
+        client = FakeClient(trade_events=[{"marketCapSol": 30.0}])
+        strategy, risk = _make_strategy(client, dry_run=False, max_price_change_5m_pct=0)
+
+        async def _fake_fetch_price_changes_pct(mint):
+            return {"m5": 9000.0, "h1": 9000.0, "h6": 9000.0, "h24": 9000.0}
+
+        with patch(
+            "pumpfun_bot.strategies.social_watch.HOLDER_COUNT_INDEXING_DELAY_SEC", 0,
+        ), patch(
+            "pumpfun_bot.strategies.social_watch.fetch_price_changes_pct",
+            _fake_fetch_price_changes_pct,
         ):
             asyncio.run(strategy._buy("MINT", {
                 "mint": "MINT", "name": "Test", "symbol": "TEST", "vSolInBondingCurve": 30.0,

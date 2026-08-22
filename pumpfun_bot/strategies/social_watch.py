@@ -293,6 +293,24 @@ class SocialWatchStrategy:
                 )
                 return
 
+        if self.cfg.max_price_change_5m_pct > 0:
+            # user-requested, evidence-based (real dry-run outcomes tonight):
+            # losing trades averaged 216% momentum at buy vs 134% for
+            # winners, and win rate drops sharply above ~100% (80% win at
+            # 0-50% momentum down to ~25-31% above 150%) - buying a token
+            # already up 100%+ correlates with buying near a local top, not
+            # catching a real move early
+            if price_change_5m_pct is None:
+                logger.info("Social-watch: 5m prijsverandering onbekend voor %s, sla over.", mint)
+                return
+            if price_change_5m_pct > self.cfg.max_price_change_5m_pct:
+                logger.info(
+                    "Social-watch: %s heeft %.1f%% prijsverandering (5m), boven de "
+                    "max_price_change_5m_pct van %.0f%% (waarschijnlijk al over de piek), "
+                    "sla over.", mint, price_change_5m_pct, self.cfg.max_price_change_5m_pct,
+                )
+                return
+
         mcap_str = f"${market_cap_usd:.0f}" if market_cap_usd is not None else "?"
         momentum_str = f", {price_change_5m_pct:+.1f}% (5m)" if price_change_5m_pct is not None else ""
         await self.alerter.send(
