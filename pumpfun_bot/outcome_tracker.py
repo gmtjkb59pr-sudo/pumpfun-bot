@@ -149,6 +149,7 @@ class OutcomeTracker:
         dry_run: bool = True,
         sell_slippage_pct: float = 10.0,
         position_store_path=None,
+        price_observers: list | None = None,
     ):
         self.ws_url = ws_url
         self.api_key = api_key
@@ -175,6 +176,12 @@ class OutcomeTracker:
         # live get separate files (path_for_mode) so a restart can never
         # load one mode's positions into the other - see position_store.py
         self.position_store_path = position_store_path or position_store.path_for_mode(dry_run)
+        # async callables notified with (mint, ref) on every real price tick
+        # for a currently-open position - purely additive, e.g. for a
+        # parallel counterfactual-strategy simulator (see
+        # scaled_exit_simulator.py) that must never affect real exit
+        # decisions. Empty by default so existing callers are unaffected.
+        self._price_observers = price_observers or []
         self._pending: dict[str, dict] = {}
         # mints that already exited - kept under passive observation (no
         # P&L/exposure effect, already realized) purely to answer "would
@@ -593,9 +600,11 @@ class OutcomeTracker:
         _handle_ws_message so this decision logic can be exercised directly
         in tests."""
         exit_args = None
+        is_pending = False
         async with self._lock:
             info = self._pending.get(mint)
             if info is not None:
+                is_pending = True
                 info["last_ref"] = ref
                 info["last_update_ts"] = time.time()
                 info["has_real_update"] = True
@@ -633,6 +642,9 @@ class OutcomeTracker:
                 post["has_real_update"] = True
         if exit_args:
             await self._attempt_exit(*exit_args)
+        if is_pending:
+            for observer in self._price_observers:
+                await observer(mint, ref)
 
     def _exit_attempt_allowed(self, info: dict) -> bool:
         """Marks an attempt as starting now and returns whether enough time

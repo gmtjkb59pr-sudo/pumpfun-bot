@@ -463,6 +463,63 @@ class TakeProfitStopLossExitTests(unittest.TestCase):
         self.assertFalse(post["has_real_update"])
 
 
+class PriceObserverTests(unittest.TestCase):
+    """price_observers is a purely additive hook (e.g. for
+    scaled_exit_simulator.py's parallel counterfactual strategy) - must
+    never affect real exit decisions, only get notified alongside them."""
+
+    def _make_tracker_with_observer(self, *, entry_ref=100.0):
+        risk = RiskManager(RiskConfig())
+        risk.register_trade_opened(0.05)
+        calls = []
+
+        async def _observer(mint, ref):
+            calls.append((mint, ref))
+
+        tracker = OutcomeTracker(
+            ws_url="wss://example.invalid", risk=risk, price_observers=[_observer],
+        )
+        tracker._pending["MINT"] = {
+            "entry_ts": time.time(),
+            "entry_ref": entry_ref,
+            "last_ref": entry_ref,
+            "peak_ref": entry_ref,
+            "name": "Test Token",
+            "symbol": "TEST",
+            "trade_size_sol": 0.05,
+            "hit": set(),
+            "has_real_update": False,
+        }
+        return tracker, calls
+
+    def test_observer_is_notified_on_a_price_update_for_a_pending_position(self):
+        tracker, calls = self._make_tracker_with_observer()
+        asyncio.run(tracker._handle_price_update("MINT", 110.0))
+        self.assertEqual(calls, [("MINT", 110.0)])
+
+    def test_observer_is_notified_even_when_the_update_triggers_a_real_exit(self):
+        tracker, calls = self._make_tracker_with_observer()
+        asyncio.run(tracker._handle_price_update("MINT", 151.0))  # +51%, take-profit
+        self.assertEqual(calls, [("MINT", 151.0)])
+        self.assertNotIn("MINT", tracker._pending)  # real exit still happened
+
+    def test_observer_is_not_notified_for_an_untracked_mint(self):
+        tracker, calls = self._make_tracker_with_observer()
+        asyncio.run(tracker._handle_price_update("OTHER", 999.0))
+        self.assertEqual(calls, [])
+
+    def test_no_observers_configured_does_not_raise(self):
+        risk = RiskManager(RiskConfig())
+        risk.register_trade_opened(0.05)
+        tracker = OutcomeTracker(ws_url="wss://example.invalid", risk=risk)
+        tracker._pending["MINT"] = {
+            "entry_ts": time.time(), "entry_ref": 100.0, "last_ref": 100.0,
+            "peak_ref": 100.0, "name": "Test", "symbol": "TEST",
+            "trade_size_sol": 0.05, "hit": set(), "has_real_update": False,
+        }
+        asyncio.run(tracker._handle_price_update("MINT", 110.0))  # must not raise
+
+
 class PostExitCheckpointTests(unittest.TestCase):
     def _make_tracker_with_post_exit(self, *, has_real_update: bool, last_ref=180.0):
         tracker = OutcomeTracker(ws_url="wss://example.invalid")

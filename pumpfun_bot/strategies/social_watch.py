@@ -26,6 +26,7 @@ from ..outcome_tracker import OutcomeTracker
 from ..price_ref import extract_price_ref
 from ..pumpportal_client import PumpPortalClient
 from ..risk import RiskManager
+from ..scaled_exit_simulator import ScaledExitSimulator
 from ..social_metadata import fetch_has_socials
 from ..state import bot_state
 
@@ -45,6 +46,7 @@ class SocialWatchStrategy:
         outcome_tracker: OutcomeTracker | None = None,
         fresh_ref_timeout_sec: float = 5.0,
         price_tracker: CandidatePriceTracker | None = None,
+        scaled_exit_simulator: ScaledExitSimulator | None = None,
     ):
         self.client = client
         self.cfg = cfg
@@ -59,6 +61,10 @@ class SocialWatchStrategy:
         # DexScreener's API exposes (see candidate_price_tracker.py) -
         # optional so tests/callers that don't care about this can omit it
         self.price_tracker = price_tracker
+        # user-requested "scaled exit" strategy comparison, run purely as a
+        # parallel observer - never affects the real buy/sell decision (see
+        # scaled_exit_simulator.py)
+        self.scaled_exit_simulator = scaled_exit_simulator
         self._watching: dict[str, dict] = {}
         self._lock = asyncio.Lock()
 
@@ -325,6 +331,8 @@ class SocialWatchStrategy:
                     trailing_activation_pct=self.cfg.trailing_activation_pct,
                     trailing_stop_pct=self.cfg.trailing_stop_pct,
                 )
+            if self.scaled_exit_simulator is not None and entry_ref is not None:
+                self.scaled_exit_simulator.track(mint, entry_ref, self.trade_size_sol)
             return
 
         try:
@@ -353,6 +361,8 @@ class SocialWatchStrategy:
                     trailing_activation_pct=self.cfg.trailing_activation_pct,
                     trailing_stop_pct=self.cfg.trailing_stop_pct,
                 )
+            if self.scaled_exit_simulator is not None and entry_ref is not None:
+                self.scaled_exit_simulator.track(mint, entry_ref, self.trade_size_sol)
         except Exception as exc:  # noqa: BLE001
             logger.exception("Social-watch buy mislukt voor %s: %s", mint, exc)
             await self.risk.report_buy_result(success=False)
