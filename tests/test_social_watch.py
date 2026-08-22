@@ -141,9 +141,20 @@ class FakePriceTracker:
         return None
 
 
+class FakeScaledExitSimulator:
+    """Stands in for ScaledExitSimulator - just records track() calls."""
+
+    def __init__(self):
+        self.tracked: list[tuple] = []
+
+    def track(self, mint, entry_ref, trade_size_sol):
+        self.tracked.append((mint, entry_ref, trade_size_sol))
+
+
 def _make_strategy(
     client, *, dry_run=True, outcome_tracker=None, min_holder_count=0, min_market_cap_usd=0,
     max_top10_concentration_pct=0, require_positive_momentum_5m=False, price_tracker=None,
+    scaled_exit_simulator=None,
 ):
     risk = RiskManager(RiskConfig())
     strategy = SocialWatchStrategy(
@@ -162,6 +173,7 @@ def _make_strategy(
         outcome_tracker=outcome_tracker,
         fresh_ref_timeout_sec=0.05,
         price_tracker=price_tracker,
+        scaled_exit_simulator=scaled_exit_simulator,
     )
     return strategy, risk
 
@@ -694,6 +706,48 @@ class PriceTrackerLifecycleTests(unittest.TestCase):
         meta = trades[-1]["meta"]
         self.assertNotIn("price_change_1m_pct", meta)
         self.assertNotIn("price_change_2m_pct", meta)
+
+
+class ScaledExitSimulatorWiringTests(unittest.TestCase):
+    """User-requested "scaled exit" strategy comparison - social_watch must
+    feed the simulator the exact same entry data as the real OutcomeTracker
+    on every buy, dry-run or live, and skip it cleanly when unconfigured."""
+
+    def test_tracks_the_buy_in_the_simulator_on_a_dry_run_buy(self):
+        simulator = FakeScaledExitSimulator()
+        client = FakeClient(trade_events=[{"marketCapSol": 42.0}])
+        strategy, _ = _make_strategy(client, dry_run=True, scaled_exit_simulator=simulator)
+
+        asyncio.run(strategy._buy("MINT", {
+            "mint": "MINT", "name": "Test", "symbol": "TEST", "vSolInBondingCurve": 30.0,
+        }, time.time()))
+
+        self.assertEqual(len(simulator.tracked), 1)
+        mint, entry_ref, trade_size_sol = simulator.tracked[0]
+        self.assertEqual(mint, "MINT")
+        self.assertAlmostEqual(entry_ref, 42.0)
+        self.assertAlmostEqual(trade_size_sol, 0.03)
+
+    def test_tracks_the_buy_in_the_simulator_on_a_live_buy(self):
+        simulator = FakeScaledExitSimulator()
+        client = FakeClient(trade_events=[{"marketCapSol": 42.0}])
+        strategy, _ = _make_strategy(client, dry_run=False, scaled_exit_simulator=simulator)
+
+        asyncio.run(strategy._buy("MINT", {
+            "mint": "MINT", "name": "Test", "symbol": "TEST", "vSolInBondingCurve": 30.0,
+        }, time.time()))
+
+        self.assertEqual(len(simulator.tracked), 1)
+        self.assertEqual(simulator.tracked[0][0], "MINT")
+
+    def test_does_not_track_when_no_simulator_is_configured(self):
+        client = FakeClient(trade_events=[{"marketCapSol": 42.0}])
+        strategy, _ = _make_strategy(client, dry_run=True, scaled_exit_simulator=None)
+
+        # must not raise even without a simulator configured
+        asyncio.run(strategy._buy("MINT", {
+            "mint": "MINT", "name": "Test", "symbol": "TEST", "vSolInBondingCurve": 30.0,
+        }, time.time()))
 
 
 class HolderCountIndexingDelayTests(unittest.TestCase):

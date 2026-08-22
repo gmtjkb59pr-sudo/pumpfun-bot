@@ -33,6 +33,7 @@ from pumpfun_bot.logger_setup import setup_logging
 from pumpfun_bot.outcome_tracker import OutcomeTracker
 from pumpfun_bot.pumpportal_client import PumpPortalClient
 from pumpfun_bot.risk import RiskManager
+from pumpfun_bot.scaled_exit_simulator import ScaledExitSimulator
 from pumpfun_bot.state import bot_state
 from pumpfun_bot.strategies.copytrade import CopyTradeStrategy
 from pumpfun_bot.strategies.market_maker import MarketMakerStrategy
@@ -95,6 +96,13 @@ async def main() -> None:
     )
     risk = RiskManager(cfg.risk, alerter=alerter)
 
+    # user-requested "scaled exit" strategy comparison (take half off at
+    # +100%, trail the remainder 25% off its peak, wider -50% stop before
+    # any partial take) - runs purely as an observer on OutcomeTracker's
+    # real price ticks, never affects the actual exit decision (see
+    # scaled_exit_simulator.py)
+    scaled_exit_simulator = ScaledExitSimulator()
+
     outcome_tracker = OutcomeTracker(
         ws_url=cfg.pumpportal_ws_url,
         api_key=cfg.pumpportal_api_key,
@@ -107,6 +115,7 @@ async def main() -> None:
         client=client,
         dry_run=cfg.risk.dry_run,
         sell_slippage_pct=cfg.risk.default_slippage_pct,
+        price_observers=[scaled_exit_simulator.on_price_update],
     )
     outcome_tracker.load_pending()
     # wallet<->tracked-positions reconciliation (both directions: stale
@@ -146,6 +155,7 @@ async def main() -> None:
         dry_run=cfg.risk.dry_run,
         outcome_tracker=outcome_tracker,
         price_tracker=candidate_price_tracker,
+        scaled_exit_simulator=scaled_exit_simulator,
     )
     copytrade = CopyTradeStrategy(
         client=PumpPortalClient(cfg.pumpportal_ws_url, cfg.pumpportal_trade_api_url,
@@ -225,6 +235,7 @@ async def main() -> None:
 
     if cfg.social_watch.enabled:
         tasks.append(asyncio.create_task(candidate_price_tracker.run()))
+        tasks.append(asyncio.create_task(scaled_exit_simulator.run()))
 
     if not cfg.risk.dry_run:
         tasks.append(asyncio.create_task(
