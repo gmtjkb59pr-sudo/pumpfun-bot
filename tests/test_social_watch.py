@@ -17,6 +17,7 @@ _TEST_LOG_FILE = None
 
 _market_cap_patcher = None
 _concentration_patcher = None
+_momentum_patcher = None
 
 
 def setUpModule():
@@ -24,7 +25,7 @@ def setUpModule():
     # activity_log.DATA_LOG_PATH - the live buy path (dry_run=False) here
     # isn't mocked, so without this every run of this module wrote fake
     # "MINT" trade records into the real, live activity_log.jsonl
-    global _TEST_LOG_FILE, _market_cap_patcher, _concentration_patcher
+    global _TEST_LOG_FILE, _market_cap_patcher, _concentration_patcher, _momentum_patcher
     _TEST_LOG_FILE = tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False)
     _TEST_LOG_FILE.close()
     activity_log.DATA_LOG_PATH = Path(_TEST_LOG_FILE.name)
@@ -55,6 +56,18 @@ def setUpModule():
     )
     _concentration_patcher.start()
 
+    # same reasoning as above, for fetch_price_change_1h_pct - default to a
+    # positive value so tests that don't care about momentum never make a
+    # real network call.
+    async def _fake_fetch_price_change_1h_pct(mint):
+        return 10.0
+
+    _momentum_patcher = patch(
+        "pumpfun_bot.strategies.social_watch.fetch_price_change_1h_pct",
+        _fake_fetch_price_change_1h_pct,
+    )
+    _momentum_patcher.start()
+
 
 def tearDownModule():
     activity_log.DATA_LOG_PATH = _ORIGINAL_DATA_LOG_PATH
@@ -64,6 +77,8 @@ def tearDownModule():
         _market_cap_patcher.stop()
     if _concentration_patcher is not None:
         _concentration_patcher.stop()
+    if _momentum_patcher is not None:
+        _momentum_patcher.stop()
 
 
 class FakeClient:
@@ -98,7 +113,7 @@ class FakeAlerter:
 
 def _make_strategy(
     client, *, dry_run=True, outcome_tracker=None, min_holder_count=0, min_market_cap_usd=0,
-    max_top10_concentration_pct=0,
+    max_top10_concentration_pct=0, require_positive_momentum_1h=False,
 ):
     risk = RiskManager(RiskConfig())
     strategy = SocialWatchStrategy(
@@ -107,6 +122,7 @@ def _make_strategy(
             enabled=True, watch_window_sec=60, poll_interval_sec=10,
             min_holder_count=min_holder_count, min_market_cap_usd=min_market_cap_usd,
             max_top10_concentration_pct=max_top10_concentration_pct,
+            require_positive_momentum_1h=require_positive_momentum_1h,
         ),
         risk=risk,
         alerter=FakeAlerter(),
@@ -397,6 +413,92 @@ class MaxTop10ConcentrationGateTests(unittest.TestCase):
         ), patch(
             "pumpfun_bot.strategies.social_watch.fetch_top10_concentration_pct",
             _failing_fetch_top10_concentration_pct,
+        ):
+            asyncio.run(strategy._buy("MINT", {
+                "mint": "MINT", "name": "Test", "symbol": "TEST", "vSolInBondingCurve": 30.0,
+            }, time.time()))
+
+        self.assertEqual(len(client.buy_calls), 1)
+
+
+class PositiveMomentumGateTests(unittest.TestCase):
+    """User-requested "movers"-style filter, built on DexScreener's public
+    API after pump.fun's own Movers tab turned out to be ToS-off-limits to
+    scrape (see dexscreener.py). require_positive_momentum_1h must actually
+    be enforced once set."""
+
+    def test_skips_buy_when_momentum_is_not_positive(self):
+        client = FakeClient(trade_events=[{"marketCapSol": 30.0}])
+        strategy, risk = _make_strategy(client, dry_run=False, require_positive_momentum_1h=True)
+
+        async def _fake_fetch_price_change_1h_pct(mint):
+            return 0.0  # flat, not positive
+
+        with patch(
+            "pumpfun_bot.strategies.social_watch.HOLDER_COUNT_INDEXING_DELAY_SEC", 0,
+        ), patch(
+            "pumpfun_bot.strategies.social_watch.fetch_price_change_1h_pct",
+            _fake_fetch_price_change_1h_pct,
+        ):
+            asyncio.run(strategy._buy("MINT", {
+                "mint": "MINT", "name": "Test", "symbol": "TEST", "vSolInBondingCurve": 30.0,
+            }, time.time()))
+
+        self.assertEqual(client.buy_calls, [])
+        self.assertAlmostEqual(risk.state.open_exposure_sol, 0.0)
+
+    def test_buys_when_momentum_is_positive(self):
+        client = FakeClient(trade_events=[{"marketCapSol": 30.0}])
+        strategy, risk = _make_strategy(client, dry_run=False, require_positive_momentum_1h=True)
+
+        async def _fake_fetch_price_change_1h_pct(mint):
+            return 0.1
+
+        with patch(
+            "pumpfun_bot.strategies.social_watch.HOLDER_COUNT_INDEXING_DELAY_SEC", 0,
+        ), patch(
+            "pumpfun_bot.strategies.social_watch.fetch_price_change_1h_pct",
+            _fake_fetch_price_change_1h_pct,
+        ):
+            asyncio.run(strategy._buy("MINT", {
+                "mint": "MINT", "name": "Test", "symbol": "TEST", "vSolInBondingCurve": 30.0,
+            }, time.time()))
+
+        self.assertEqual(len(client.buy_calls), 1)
+        self.assertAlmostEqual(risk.state.open_exposure_sol, 0.03)
+
+    def test_skips_buy_when_momentum_required_but_lookup_fails(self):
+        client = FakeClient(trade_events=[{"marketCapSol": 30.0}])
+        strategy, risk = _make_strategy(client, dry_run=False, require_positive_momentum_1h=True)
+
+        async def _failing_fetch_price_change_1h_pct(mint):
+            return None
+
+        with patch(
+            "pumpfun_bot.strategies.social_watch.HOLDER_COUNT_INDEXING_DELAY_SEC", 0,
+        ), patch(
+            "pumpfun_bot.strategies.social_watch.fetch_price_change_1h_pct",
+            _failing_fetch_price_change_1h_pct,
+        ):
+            asyncio.run(strategy._buy("MINT", {
+                "mint": "MINT", "name": "Test", "symbol": "TEST", "vSolInBondingCurve": 30.0,
+            }, time.time()))
+
+        self.assertEqual(client.buy_calls, [])
+
+    def test_buys_regardless_of_momentum_when_not_required(self):
+        # default require_positive_momentum_1h=False - the filter is off unless explicitly set
+        client = FakeClient(trade_events=[{"marketCapSol": 30.0}])
+        strategy, risk = _make_strategy(client, dry_run=False, require_positive_momentum_1h=False)
+
+        async def _failing_fetch_price_change_1h_pct(mint):
+            return None
+
+        with patch(
+            "pumpfun_bot.strategies.social_watch.HOLDER_COUNT_INDEXING_DELAY_SEC", 0,
+        ), patch(
+            "pumpfun_bot.strategies.social_watch.fetch_price_change_1h_pct",
+            _failing_fetch_price_change_1h_pct,
         ):
             asyncio.run(strategy._buy("MINT", {
                 "mint": "MINT", "name": "Test", "symbol": "TEST", "vSolInBondingCurve": 30.0,
