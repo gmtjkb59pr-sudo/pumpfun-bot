@@ -12,6 +12,7 @@ import time
 from ..activity_log import DATA_LOG_PATH
 from ..alerts import Alerter
 from ..config import SniperConfig
+from ..holder_concentration import fetch_top10_concentration_pct
 from ..holder_count import record_holder_count
 from ..outcome_tracker import OutcomeTracker
 from ..price_ref import extract_price_ref
@@ -23,6 +24,12 @@ from ..wallet_reputation import blocked_wallets
 logger = logging.getLogger("pumpfun_bot.sniper")
 
 WALLET_BLOCKLIST_REFRESH_SEC = 60
+
+# Standard total supply of a pump.fun token - used to turn initialBuy (how
+# many tokens the creator already bought in the creation tx itself) into a
+# %. Ported from an earlier version of this bot's sniper - verify against a
+# live launch if pump.fun ever changes this.
+DEFAULT_TOTAL_SUPPLY = 1_000_000_000
 
 
 class SniperStrategy:
@@ -63,6 +70,18 @@ class SniperStrategy:
             if not has_socials:
                 return False
 
+        # user-requested, ported from an earlier version of this bot's
+        # sniper: free filter (no extra RPC call) - rejects a launch where
+        # the creator's own initialBuy already claims too much of the
+        # supply in the SAME transaction as the token's creation, often a
+        # sign of a planned dump.
+        if self.cfg.max_initial_buy_pct > 0:
+            initial_buy_tokens = event.get("initialBuy")
+            if initial_buy_tokens:
+                initial_buy_pct = (initial_buy_tokens / DEFAULT_TOTAL_SUPPLY) * 100
+                if initial_buy_pct > self.cfg.max_initial_buy_pct:
+                    return False
+
         creator = event.get("traderPublicKey")
         if creator and creator in self.blocked_wallets:
             return False
@@ -92,6 +111,62 @@ class SniperStrategy:
                 logger.warning(message)
                 await self.alerter.send(message)
 
+    async def _holder_concentration_flags_risk(self, mint: str) -> bool:
+        """user-requested, ported from an earlier version of this bot's
+        sniper. CAUTION (see max_top10_concentration_pct's docstring in
+        config.py): sniper checks this within seconds of launch, before
+        holder_concentration.py's own SETTLING_DELAY_SEC has had a chance to
+        pass - unlike social_watch/birdeye_movers/coingecko_movers, which
+        only ever reach this check well after that delay. Costs one extra
+        RPC round-trip; only called at all when enabled via a > 0 threshold."""
+        if self.cfg.max_top10_concentration_pct <= 0:
+            return False
+        top10_concentration_pct = await fetch_top10_concentration_pct(mint, self.client.rpc_http_url)
+        if top10_concentration_pct is None:
+            return False
+        return top10_concentration_pct > self.cfg.max_top10_concentration_pct
+
+    async def _bundle_check_flags_bundle(self, mint: str) -> bool:
+        """user-requested, ported from an earlier version of this bot's
+        sniper: watches the token's live trade stream for
+        bundle_check_window_ms right after launch - if more buys land in
+        that window than bundle_check_max_buys, that's a sign of
+        coordinated insider wallets all buying at once. Deliberately costs
+        the whole window in real time - a conscious trade of sniper's speed
+        advantage for this one extra safety signal, which is why it's off
+        by default."""
+        if not self.cfg.enable_bundle_check:
+            return False
+
+        count = 0
+        deadline = time.monotonic() + (self.cfg.bundle_check_window_ms / 1000)
+        stream = self.client.stream_token_trades([mint])
+        try:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    event = await asyncio.wait_for(stream.__anext__(), timeout=remaining)
+                except (asyncio.TimeoutError, StopAsyncIteration):
+                    break
+                if event.get("txType") == "buy":
+                    count += 1
+                if count > self.cfg.bundle_check_max_buys:
+                    return True
+        except Exception:  # noqa: BLE001
+            logger.exception("Bundle-check mislukt voor %s - filter wordt overgeslagen.", mint)
+            return False
+        finally:
+            aclose = getattr(stream, "aclose", None)
+            if aclose:
+                try:
+                    await aclose()
+                except Exception:  # noqa: BLE001
+                    pass
+
+        return count > self.cfg.bundle_check_max_buys
+
     async def run(self) -> None:
         if not self.cfg.enabled:
             return
@@ -107,6 +182,14 @@ class SniperStrategy:
 
             if not self._passes_filters(event):
                 logger.debug("Token %s (%s) afgewezen door filters.", symbol, mint)
+                continue
+
+            if await self._bundle_check_flags_bundle(mint):
+                logger.info("Sniper: %s (%s) geweerd - lijkt gebundeld (te veel snelle buys).", name, symbol)
+                continue
+
+            if await self._holder_concentration_flags_risk(mint):
+                logger.info("Sniper: %s (%s) geweerd - houder-concentratie te hoog.", name, symbol)
                 continue
 
             liquidity_sol = event.get("vSolInBondingCurve")

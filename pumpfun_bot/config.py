@@ -65,6 +65,36 @@ class SniperConfig:
     # TakeProfitLevel's docstring.
     take_profit_ladder: list = field(default_factory=list)
 
+    # user-requested, ported from an earlier version of this bot's sniper -
+    # scam/insider entry filters, all off (0/False) by default so enabling
+    # sniper doesn't silently change its buy behavior.
+    #
+    # Free (no extra RPC call): rejects a launch where the creator's own
+    # initialBuy already claims more than this % of total supply in the
+    # SAME transaction as the token's creation - often a sign of a planned
+    # dump. 0 = disabled.
+    max_initial_buy_pct: float = 0
+    # Costs one extra RPC round-trip (getTokenSupply + getTokenLargestAccounts)
+    # per candidate that reaches this check. CAUTION, unlike the same field on
+    # social_watch/birdeye_movers/coingecko_movers: those strategies only ever
+    # evaluate this after a watch window or on an already-established token,
+    # giving holder_concentration.py's SETTLING_DELAY_SEC time to pass first.
+    # Sniper buys within seconds of launch with no such delay - essentially
+    # all supply still sits with the bonding curve/deployer at that point
+    # (confirmed live elsewhere in this codebase), so this will read close to
+    # 100% for nearly every candidate unless you're prepared for that. 0 =
+    # disabled.
+    max_top10_concentration_pct: float = 0
+    # Watches the token's live trade stream for bundle_check_window_ms right
+    # after passing the filters above, and rejects it if more than
+    # bundle_check_max_buys buys land in that window - a sign of coordinated
+    # insider wallets all buying at once. Deliberately costs real time (the
+    # whole window), trading sniper's speed advantage for this one extra
+    # safety signal - off by default for that reason.
+    enable_bundle_check: bool = False
+    bundle_check_window_ms: int = 300
+    bundle_check_max_buys: int = 5
+
 
 @dataclass
 class SocialWatchConfig:
@@ -335,6 +365,11 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         trailing_activation_pct=sniper_raw.get("trailing_activation_pct", 20),
         trailing_stop_pct=sniper_raw.get("trailing_stop_pct", 15),
         take_profit_ladder=_parse_take_profit_ladder(sniper_raw.get("take_profit_ladder")),
+        max_initial_buy_pct=sniper_raw.get("max_initial_buy_pct", 0),
+        max_top10_concentration_pct=sniper_raw.get("max_top10_concentration_pct", 0),
+        enable_bundle_check=sniper_raw.get("enable_bundle_check", False),
+        bundle_check_window_ms=sniper_raw.get("bundle_check_window_ms", 300),
+        bundle_check_max_buys=sniper_raw.get("bundle_check_max_buys", 5),
     )
 
     sw_raw = strat_raw.get("social_watch", {})
