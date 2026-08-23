@@ -913,9 +913,22 @@ class OutcomeTracker:
                     # scaled take-profit ladder replaces the single-shot
                     # take_profit_pct trigger entirely for this position -
                     # see TakeProfitLevel's docstring in config.py. Stop-loss
-                    # always applies (closes whatever remains); the trailing
-                    # stop only takes over once every ladder rung has fired,
-                    # to protect the leftover runner.
+                    # always applies (closes whatever remains).
+                    #
+                    # Real bug found live: trailing stop used to only ever
+                    # arm once EVERY ladder rung had fired - a position that
+                    # peaked well past trailing_activation_pct but never
+                    # reached the ladder's first (much higher) rung got NO
+                    # downside protection at all. Confirmed live: peaked at
+                    # +63%, pulled back -37% from that peak with zero exit,
+                    # because the ladder's first rung (2x = +100%) was never
+                    # reached. Trailing stop now arms independently of
+                    # ladder progress - it protects whatever's currently
+                    # held the moment it's armed, the same as it already did
+                    # for every non-ladder position. A ladder rung due on
+                    # the SAME tick still takes priority (checked first,
+                    # via next_level below) - trailing stop only fires when
+                    # no rung is currently due.
                     if pct_change <= -stop_loss_pct:
                         triggered_reason = "stop_loss"
                         sell_fraction_of_remaining = 1.0
@@ -939,8 +952,7 @@ class OutcomeTracker:
                             sell_fraction_of_remaining = next_level["sell_pct"] / 100
                             ladder_level_multiplier = next_level["multiplier"]
                         elif (
-                            len(triggered_levels) >= len(ladder)
-                            and info.get("remaining_fraction", 1.0) > 0
+                            info.get("remaining_fraction", 1.0) > 0
                             and peak_pct_change >= trailing_activation_pct
                             and drawdown_from_peak_pct <= -trailing_stop_pct
                         ):

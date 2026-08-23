@@ -2368,19 +2368,44 @@ class TakeProfitLadderTests(unittest.TestCase):
         self.assertEqual(tracker._post_exit["MINT"]["reason"], "trailing_stop")
         self.assertAlmostEqual(risk.state.open_exposure_sol, 0.0, places=6)
 
-    def test_no_trailing_stop_before_every_rung_has_triggered(self):
-        # only the first rung has fired - a drawdown that WOULD trip the
-        # trailing stop must not close the position early, since the ladder
-        # itself hasn't finished yet
+    def test_trailing_stop_fires_even_with_ladder_rungs_still_untriggered(self):
+        # real bug found live: trailing stop used to only ever arm once
+        # EVERY ladder rung had fired - a position that peaked well past
+        # trailing_activation_pct but never reached a later, much-higher
+        # rung got NO downside protection at all (confirmed live: +63%
+        # peak, -37% pullback from it, zero exit). Trailing stop must
+        # protect whatever's currently held as soon as it arms, regardless
+        # of how many ladder rungs remain untriggered - a same-tick ladder
+        # rung still takes priority (see the next test), but this one has
+        # no rung currently due (5x is still far off), so trailing wins.
         tracker, risk = self._make_tracker(
             dry_run=True, entry_ref=100.0, trade_size_sol=0.05,
             remaining_fraction=0.7, triggered_ladder_levels=[2],
             peak_ref=250.0, trailing_activation_pct=20.0, trailing_stop_pct=15.0,
         )
 
-        asyncio.run(tracker._handle_price_update("MINT", 200.0))  # -20% from peak, still above 2x
+        asyncio.run(tracker._handle_price_update("MINT", 200.0))  # -20% from peak, no rung due here
 
-        self.assertIn("MINT", tracker._pending)  # still open - no trailing stop yet
+        self.assertNotIn("MINT", tracker._pending)  # trailing stop closed it
+        self.assertIn("MINT", tracker._post_exit)
+        self.assertEqual(tracker._post_exit["MINT"]["reason"], "trailing_stop")
+
+    def test_a_same_tick_ladder_rung_still_takes_priority_over_trailing_stop(self):
+        # if a ladder rung is ALSO due on this exact tick, it fires instead
+        # of trailing stop - see _handle_price_update's next_level check,
+        # which runs first
+        tracker, risk = self._make_tracker(
+            dry_run=True, entry_ref=100.0, trade_size_sol=0.05,
+            remaining_fraction=1.0, triggered_ladder_levels=[],
+            peak_ref=250.0, trailing_activation_pct=20.0, trailing_stop_pct=15.0,
+        )
+
+        # +100% = exactly the first rung (2x), AND -20% from the 250 peak -
+        # both conditions are met, the ladder rung must win
+        asyncio.run(tracker._handle_price_update("MINT", 200.0))
+
+        self.assertIn("MINT", tracker._pending)  # partial ladder sell, not a full trailing-stop close
+        self.assertEqual(tracker._pending["MINT"]["triggered_ladder_levels"], [2])
 
     def test_live_rung_sell_calls_client_with_current_value_of_the_slice(self):
         client = FakeClient(should_fail=False, signature="ladder_sig")
