@@ -68,13 +68,14 @@ class RiskManagerCanTradeTests(unittest.TestCase):
         self.assertIn("max_sol_per_trade", reason)
 
     def test_rejects_trade_that_exceeds_total_exposure(self):
-        risk = make_manager(max_sol_total_exposure=0.1)
+        # only enforced live - see DryRunSkipsCapitalLimitsTests for dry_run
+        risk = make_manager(max_sol_total_exposure=0.1, dry_run=False)
         risk.register_trade_opened(0.08)
         ok, _ = risk.can_trade(0.05)
         self.assertFalse(ok)
 
     def test_rejects_when_hourly_trade_limit_reached(self):
-        risk = make_manager(max_trades_per_hour=2)
+        risk = make_manager(max_trades_per_hour=2, dry_run=False)
         risk.register_trade_opened(0.01)
         risk.register_trade_opened(0.01)
         ok, reason = risk.can_trade(0.01)
@@ -82,7 +83,7 @@ class RiskManagerCanTradeTests(unittest.TestCase):
         self.assertIn("trades/uur", reason)
 
     def test_rejects_when_daily_loss_limit_hit(self):
-        risk = make_manager(max_daily_loss_sol=0.1)
+        risk = make_manager(max_daily_loss_sol=0.1, dry_run=False)
         risk.register_trade_closed(0.05, pnl_sol=-0.1)
         ok, reason = risk.can_trade(0.01)
         self.assertFalse(ok)
@@ -150,6 +151,52 @@ class DryRunSkipsOpenPositionsCheckTests(unittest.TestCase):
             0.01, open_positions_count=999, max_open_positions_override=1,
         )
         self.assertTrue(ok)
+
+
+class DryRunSkipsCapitalLimitsTests(unittest.TestCase):
+    """User-requested ("its dry run so please no limits i want to farm
+    information"): confirmed live that the shared max_sol_total_exposure
+    cap was starving social_watch/coingecko_movers of almost every buy
+    opportunity once sniper was also enabled, since sniper alone fires
+    often enough to keep the shared exposure pool saturated. No real
+    capital is at risk in dry-run, so these capital-style limits (unlike
+    max_sol_per_trade and min_liquidity_sol, which still apply - see
+    can_trade's docstring) are skipped entirely in dry-run."""
+
+    def test_allows_trade_in_dry_run_even_above_total_exposure_cap(self):
+        risk = make_manager(max_sol_total_exposure=0.1, dry_run=True)
+        risk.register_trade_opened(0.5)  # already way past the 0.1 cap
+        ok, _ = risk.can_trade(0.05)  # within max_sol_per_trade, which still applies
+        self.assertTrue(ok)
+
+    def test_allows_trade_in_dry_run_even_above_hourly_trade_limit(self):
+        risk = make_manager(max_trades_per_hour=2, dry_run=True)
+        risk.register_trade_opened(0.01)
+        risk.register_trade_opened(0.01)
+        risk.register_trade_opened(0.01)
+        ok, _ = risk.can_trade(0.01)
+        self.assertTrue(ok)
+
+    def test_allows_trade_in_dry_run_even_after_daily_loss_limit_hit(self):
+        risk = make_manager(max_daily_loss_sol=0.1, dry_run=True)
+        risk.register_trade_closed(0.05, pnl_sol=-0.5)
+        ok, _ = risk.can_trade(0.01)
+        self.assertTrue(ok)
+
+    def test_max_sol_per_trade_still_applies_in_dry_run(self):
+        # a capital/exposure limit is not the same as a per-trade sanity
+        # cap - the latter shapes what strategies actually attempt, not how
+        # much simulated capital is "at risk", so it's unaffected
+        risk = make_manager(max_sol_per_trade=0.05, dry_run=True)
+        ok, reason = risk.can_trade(0.06)
+        self.assertFalse(ok)
+        self.assertIn("max_sol_per_trade", reason)
+
+    def test_min_liquidity_still_applies_in_dry_run(self):
+        risk = make_manager(min_liquidity_sol=5, dry_run=True)
+        ok, reason = risk.can_trade(0.01, liquidity_sol=1)
+        self.assertFalse(ok)
+        self.assertIn("Liquiditeit", reason)
 
 
 class RiskManagerStateTests(unittest.TestCase):

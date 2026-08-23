@@ -53,7 +53,11 @@ def _make_strategy(
     max_top10_concentration_pct=0, max_market_cap_usd=20_000_000, api_key="fake-key",
     take_profit_ladder=(),
 ):
-    risk = RiskManager(RiskConfig())
+    # dry_run must match the strategy's own dry_run below - main.py always
+    # constructs both from the same cfg.risk.dry_run - otherwise can_trade's
+    # dry-run capital-limit bypass (see risk.py) reads a stale/mismatched
+    # flag from what these tests are actually exercising.
+    risk = RiskManager(RiskConfig(dry_run=dry_run))
     strategy = BirdeyeMoversStrategy(
         client=client,
         cfg=BirdeyeMoversConfig(
