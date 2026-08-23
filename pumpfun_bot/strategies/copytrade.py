@@ -66,6 +66,17 @@ class CopyTradeStrategy:
                 )
                 continue
 
+            if action == "buy" and mint in self._held:
+                # confirmed live: multiple watched wallets (or the same one
+                # buying in twice) can each fire a separate buy signal for
+                # the same mint within seconds - mirroring every one would
+                # stack several positions' worth of exposure on a single
+                # mint instead of the one capped position intended
+                logger.debug(
+                    "Buy-signaal voor %s genegeerd - al een positie via copytrade.", mint,
+                )
+                continue
+
             my_amount = min(
                 self.max_trade_sol,
                 round(source_sol * (self.cfg.mirror_pct / 100), 4),

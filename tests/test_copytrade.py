@@ -106,5 +106,42 @@ class CopyTradeSellGatingTests(unittest.TestCase):
         mock_state.log_trade.assert_not_called()
 
 
+class CopyTradeBuyDedupTests(unittest.TestCase):
+    def test_a_second_buy_signal_for_an_already_held_mint_is_ignored(self):
+        strategy, client, risk = _make_strategy([
+            _event("buy", "M1"), _event("buy", "M1"), _event("buy", "M1"),
+        ])
+        with patch("pumpfun_bot.strategies.copytrade.bot_state") as mock_state:
+            asyncio.run(strategy.run())
+        self.assertEqual(mock_state.log_trade.call_count, 1)
+
+    def test_a_buy_signal_for_a_different_mint_is_still_mirrored(self):
+        strategy, client, risk = _make_strategy([
+            _event("buy", "M1"), _event("buy", "M2"),
+        ])
+        with patch("pumpfun_bot.strategies.copytrade.bot_state") as mock_state:
+            asyncio.run(strategy.run())
+        mints = [call.args[2] for call in mock_state.log_trade.call_args_list]
+        self.assertEqual(mints, ["M1", "M2"])
+
+    def test_a_buy_after_a_full_round_trip_is_mirrored_again(self):
+        strategy, client, risk = _make_strategy([
+            _event("buy", "M1"), _event("sell", "M1"), _event("buy", "M1"),
+        ])
+        with patch("pumpfun_bot.strategies.copytrade.bot_state") as mock_state:
+            asyncio.run(strategy.run())
+        actions = [call.args[1] for call in mock_state.log_trade.call_args_list]
+        self.assertEqual(actions, ["buy", "sell", "buy"])
+
+    def test_live_mode_a_second_buy_signal_for_an_already_held_mint_is_ignored(self):
+        strategy, client, risk = _make_strategy(
+            [_event("buy", "M1"), _event("buy", "M1")], dry_run=False,
+        )
+        with patch("pumpfun_bot.strategies.copytrade.bot_state") as mock_state:
+            asyncio.run(strategy.run())
+        self.assertEqual(client.build_and_send_trade.await_count, 1)
+        self.assertEqual(mock_state.log_trade.call_count, 1)
+
+
 if __name__ == "__main__":
     unittest.main()
