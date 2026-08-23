@@ -115,6 +115,7 @@ strategies:
       - "VUL_HIER_EEN_WALLET_ADRES_IN"
     mirror_pct: 100             # % van de trade-grootte van de gevolgde wallet die je zelf ook doet
     max_copy_delay_ms: 3000     # negeer signalen die ouder zijn dan dit
+    max_trade_sol: 0            # eigen cap, onafhankelijk van risk.max_sol_per_trade - 0 = gebruik die gedeelde waarde
 
   market_maker:
     enabled: false
