@@ -50,6 +50,7 @@ import websockets
 from . import activity_log, position_store
 from .activity_log import append_jsonl
 from .alerts import Alerter
+from .dexscreener import fetch_price_usd
 from .fees import ROUND_TRIP_PRIORITY_FEE_SOL, net_pct_change_after_fees
 from .price_ref import extract_price_ref
 from .pumpportal_client import authenticated_ws_url
@@ -84,6 +85,18 @@ EXIT_RETRY_COOLDOWN_SEC = 15
 # no real trade event for this mint in this long -> likely dead/rugged, exit
 # well before the full MAX_HOLD_SEC timeout instead of holding a dead token
 STALE_PRICE_TIMEOUT_SEC = 10
+# confirmed live: PumpPortal's subscribeTokenTrade WS feed only covers
+# trades routed through PumpPortal's own indexed venues (bonding curve /
+# PumpSwap), not every venue a mint might actually trade on - a real,
+# heavily-traded token (~$51M/24h volume) received ZERO WS trade events
+# over 15s, and would otherwise be silently abandoned at STALE_PRICE_
+# TIMEOUT_SEC with no exit ever attempted, despite a real market price
+# being available via DexScreener the whole time. A position only ever
+# falls back to this REST poll when it has NEVER received a real WS tick
+# (see _apply_rest_fallback_prices) - a position with working WS data that
+# genuinely goes quiet later is left to the existing stale-price path,
+# since that silence is real signal (likely dead/rugged), not a feed gap.
+REST_FALLBACK_POLL_INTERVAL_SEC = 10
 # PumpPortal's own balance index needs this long to catch up with a real buy
 # before it can build an accurate "sell 100%" quote - confirmed directly:
 # selling sooner reliably comes back SellZeroAmount (their indexer still
@@ -392,6 +405,12 @@ class OutcomeTracker:
                     trailing_stop_pct if trailing_stop_pct is not None else self.trailing_stop_pct
                 ),
                 "strategy": strategy,
+                # see REST_FALLBACK_POLL_INTERVAL_SEC's docstring - set True
+                # once a REST-fallback price has been used for this position
+                # at least once, so it keeps getting REST-polled even after
+                # has_real_update flips True from that same fallback price
+                "rest_fallback_active": False,
+                "last_rest_fallback_ts": 0.0,
             }
             self._persist_pending()
 
@@ -442,8 +461,33 @@ class OutcomeTracker:
             await asyncio.sleep(HOUSEKEEPING_INTERVAL_SEC)
             await self._reconcile_with_wallet_if_due()
             await self._sync_subscription(ws)
+            # before the stale-price check below can give up on a position -
+            # see REST_FALLBACK_POLL_INTERVAL_SEC's docstring for why
+            await self._apply_rest_fallback_prices()
             await self._emit_due_checkpoints()
             await self._emit_post_exit_checkpoints()
+
+    async def _apply_rest_fallback_prices(self) -> None:
+        """Fetches a DexScreener price for any position that has never
+        received a real WS tick (or is already relying on this same
+        fallback), rate-limited per-position to REST_FALLBACK_POLL_INTERVAL_
+        SEC. A position with working WS data is never touched here - zero
+        extra REST calls for the common case."""
+        now = time.time()
+        candidates = []
+        async with self._lock:
+            for mint, info in self._pending.items():
+                needs_fallback = not info["has_real_update"] or info.get("rest_fallback_active")
+                if not needs_fallback:
+                    continue
+                if now - info.get("last_rest_fallback_ts", 0.0) < REST_FALLBACK_POLL_INTERVAL_SEC:
+                    continue
+                info["last_rest_fallback_ts"] = now
+                candidates.append(mint)
+        for mint in candidates:
+            price = await fetch_price_usd(mint)
+            if price is not None:
+                await self._handle_price_update(mint, price, via_rest_fallback=True)
 
     async def _sync_subscription(self, ws) -> None:
         """Adds newly-tracked mints to the live subscription without
@@ -678,11 +722,20 @@ class OutcomeTracker:
             if self.alerter is not None:
                 await self.alerter.send(message)
 
-    async def _handle_price_update(self, mint: str, ref: float) -> None:
+    async def _handle_price_update(
+        self, mint: str, ref: float, via_rest_fallback: bool = False,
+    ) -> None:
         """Records the new price and exits the position immediately if it
         crosses take-profit, stop-loss, or the trailing stop. Separated from
         _handle_ws_message so this decision logic can be exercised directly
-        in tests."""
+        in tests.
+
+        via_rest_fallback: True when `ref` came from _apply_rest_fallback_
+        prices (DexScreener), not a real WS tick - marks the position as
+        needing continued REST polling (rest_fallback_active) even after
+        has_real_update flips True from this same price. A position that
+        DOES get a genuine WS tick clears that flag - real-time WS data is
+        cheaper and preferred whenever it's actually available."""
         exit_args = None
         is_pending = False
         async with self._lock:
@@ -692,6 +745,10 @@ class OutcomeTracker:
                 info["last_ref"] = ref
                 info["last_update_ts"] = time.time()
                 info["has_real_update"] = True
+                if via_rest_fallback:
+                    info["rest_fallback_active"] = True
+                elif info.get("rest_fallback_active"):
+                    info["rest_fallback_active"] = False
                 if ref > info["peak_ref"]:
                     info["peak_ref"] = ref
                 pct_change = ((ref - info["entry_ref"]) / info["entry_ref"]) * 100

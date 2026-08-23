@@ -1,8 +1,16 @@
 """
-Looks up a token's recent price momentum via DexScreener's public API, for
-use as a buy filter (user-requested: only buy candidates already showing
-real upward momentum - a "movers" style signal - rather than just good
-fundamentals at launch).
+Looks up a token's recent price momentum (and, for outcome_tracker.py's
+REST fallback, absolute USD price) via DexScreener's public API. Momentum
+was user-requested: only buy candidates already showing real upward
+momentum - a "movers" style signal - rather than just good fundamentals at
+launch. The absolute-price lookup exists for a different reason: confirmed
+live that PumpPortal's subscribeTokenTrade WS feed only covers trades
+routed through PumpPortal's own indexed venues (bonding curve / PumpSwap),
+NOT every venue a mint might actually trade on - a real, high-volume token
+can receive zero WS trade events despite being genuinely, heavily traded
+elsewhere. Without this fallback, such a position gets silently abandoned
+after STALE_PRICE_TIMEOUT_SEC with no exit ever attempted, even though a
+real market price was available the whole time via a different source.
 
 Investigated replicating pump.fun's own "Movers" tab directly, but their
 Terms of Service explicitly prohibit bots/scripts/crawlers accessing the
@@ -39,11 +47,11 @@ DEXSCREENER_TOKEN_PAIRS_URL = "https://api.dexscreener.com/token-pairs/v1/solana
 PRICE_CHANGE_WINDOWS = ("m5", "h1", "h6", "h24")
 
 
-async def fetch_price_changes_pct(mint: str, timeout_sec: float = 5.0) -> dict[str, float | None] | None:
-    """Returns a dict of {window: price change %} for every window
-    DexScreener reports on the mint's highest-liquidity pair (individual
-    values may be None if that window is missing), or None entirely if
-    unavailable (lookup failure or no pair indexed yet)."""
+async def _fetch_best_pair(mint: str, timeout_sec: float) -> dict | None:
+    """Returns the mint's highest-liquidity pair dict from DexScreener, or
+    None if unavailable (lookup failure or no pair indexed yet) - shared by
+    both public fetch functions below so there's only one place that picks
+    "which pair is authoritative" for a mint."""
     url = DEXSCREENER_TOKEN_PAIRS_URL.format(mint=mint)
     try:
         async with aiohttp.ClientSession() as session:
@@ -55,16 +63,42 @@ async def fetch_price_changes_pct(mint: str, timeout_sec: float = 5.0) -> dict[s
                     return None
                 data = await resp.json()
                 if not data:
-                    # empty list - no pair indexed yet, not "0% change"
+                    # empty list - no pair indexed yet, not "0% change"/"$0"
                     return None
                 pairs = sorted(
                     data, key=lambda p: (p.get("liquidity") or {}).get("usd", 0) or 0, reverse=True,
                 )
-                price_change = pairs[0].get("priceChange") or {}
-                return {
-                    window: (float(price_change[window]) if price_change.get(window) is not None else None)
-                    for window in PRICE_CHANGE_WINDOWS
-                }
+                return pairs[0]
     except Exception as exc:  # noqa: BLE001
-        logger.debug("Kon prijsverandering niet ophalen voor %s: %s", mint, exc)
+        logger.debug("Kon DexScreener pair niet ophalen voor %s: %s", mint, exc)
+        return None
+
+
+async def fetch_price_changes_pct(mint: str, timeout_sec: float = 5.0) -> dict[str, float | None] | None:
+    """Returns a dict of {window: price change %} for every window
+    DexScreener reports on the mint's highest-liquidity pair (individual
+    values may be None if that window is missing), or None entirely if
+    unavailable (lookup failure or no pair indexed yet)."""
+    pair = await _fetch_best_pair(mint, timeout_sec)
+    if pair is None:
+        return None
+    price_change = pair.get("priceChange") or {}
+    return {
+        window: (float(price_change[window]) if price_change.get(window) is not None else None)
+        for window in PRICE_CHANGE_WINDOWS
+    }
+
+
+async def fetch_price_usd(mint: str, timeout_sec: float = 5.0) -> float | None:
+    """Returns the mint's current USD price from DexScreener's highest-
+    liquidity pair, or None if unavailable. Used as a REST fallback price
+    reference (see module docstring) when PumpPortal's WS feed has no data
+    for a mint - never guesses at a missing/unparseable price."""
+    pair = await _fetch_best_pair(mint, timeout_sec)
+    if pair is None:
+        return None
+    price_raw = pair.get("priceUsd")
+    try:
+        return float(price_raw) if price_raw is not None else None
+    except (TypeError, ValueError):
         return None

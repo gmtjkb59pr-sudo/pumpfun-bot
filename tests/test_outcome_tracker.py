@@ -1662,5 +1662,121 @@ class LoadPendingSeedsUntrackedLiquidationTests(unittest.TestCase):
         asyncio.run(tracker._liquidate_untracked_holdings_inner({"DEAD_MINT"}))  # must not raise
 
 
+class RestFallbackPriceTests(unittest.TestCase):
+    """Confirmed live: PumpPortal's subscribeTokenTrade WS feed only covers
+    trades routed through PumpPortal's own indexed venues - a real,
+    heavily-traded token can receive zero WS events ever. Without this
+    fallback such a position is silently abandoned at STALE_PRICE_TIMEOUT_
+    SEC with no exit ever attempted, despite a real price being available
+    via DexScreener the whole time."""
+
+    def _make_tracker(self, *, has_real_update=False, rest_fallback_active=False, entry_ref=100.0):
+        risk = RiskManager(RiskConfig())
+        risk.register_trade_opened(0.05)
+        tracker = OutcomeTracker(ws_url="wss://example.invalid", risk=risk)
+        tracker._pending["MINT"] = {
+            "entry_ts": time.time(),
+            "entry_ref": entry_ref,
+            "last_ref": entry_ref,
+            "peak_ref": entry_ref,
+            "name": "Test Token",
+            "symbol": "TEST",
+            "trade_size_sol": 0.05,
+            "hit": set(),
+            "has_real_update": has_real_update,
+            "last_update_ts": time.time(),
+            "rest_fallback_active": rest_fallback_active,
+            "last_rest_fallback_ts": 0.0,
+        }
+        return tracker, risk
+
+    def test_applies_a_fallback_price_for_a_position_that_never_ticked(self):
+        tracker, risk = self._make_tracker(has_real_update=False)
+
+        async def _fake_fetch(mint):
+            return 150.0  # +50%, would cross a default take-profit
+
+        with patch("pumpfun_bot.outcome_tracker.fetch_price_usd", _fake_fetch):
+            asyncio.run(tracker._apply_rest_fallback_prices())
+
+        # take_profit_pct defaults to 50.0 on the tracker itself - +50% exits
+        self.assertNotIn("MINT", tracker._pending)
+        self.assertAlmostEqual(risk.state.realized_pnl_sol, _net_pnl_sol(0.05, 50.0), places=4)
+
+    def test_marks_rest_fallback_active_on_a_surviving_position(self):
+        tracker, risk = self._make_tracker(has_real_update=False, entry_ref=100.0)
+
+        async def _fake_fetch(mint):
+            return 110.0  # +10%, doesn't cross any threshold
+
+        with patch("pumpfun_bot.outcome_tracker.fetch_price_usd", _fake_fetch):
+            asyncio.run(tracker._apply_rest_fallback_prices())
+
+        self.assertTrue(tracker._pending["MINT"]["has_real_update"])
+        self.assertTrue(tracker._pending["MINT"]["rest_fallback_active"])
+        self.assertEqual(tracker._pending["MINT"]["last_ref"], 110.0)
+
+    def test_does_not_query_a_position_with_working_ws_data(self):
+        tracker, risk = self._make_tracker(has_real_update=True, rest_fallback_active=False)
+        calls = []
+
+        async def _fake_fetch(mint):
+            calls.append(mint)
+            return 999.0
+
+        with patch("pumpfun_bot.outcome_tracker.fetch_price_usd", _fake_fetch):
+            asyncio.run(tracker._apply_rest_fallback_prices())
+
+        self.assertEqual(calls, [])
+
+    def test_keeps_querying_a_position_already_relying_on_fallback(self):
+        # has_real_update is True (set by an earlier fallback price), but
+        # rest_fallback_active says WS still isn't working for this mint
+        tracker, risk = self._make_tracker(has_real_update=True, rest_fallback_active=True)
+        calls = []
+
+        async def _fake_fetch(mint):
+            calls.append(mint)
+            return 105.0
+
+        with patch("pumpfun_bot.outcome_tracker.fetch_price_usd", _fake_fetch):
+            asyncio.run(tracker._apply_rest_fallback_prices())
+
+        self.assertEqual(calls, ["MINT"])
+
+    def test_respects_the_per_position_rate_limit(self):
+        tracker, risk = self._make_tracker(has_real_update=False)
+        tracker._pending["MINT"]["last_rest_fallback_ts"] = time.time()  # just fetched
+        calls = []
+
+        async def _fake_fetch(mint):
+            calls.append(mint)
+            return 110.0
+
+        with patch("pumpfun_bot.outcome_tracker.fetch_price_usd", _fake_fetch):
+            asyncio.run(tracker._apply_rest_fallback_prices())
+
+        self.assertEqual(calls, [])
+
+    def test_a_failed_fallback_lookup_leaves_the_position_unmeasured(self):
+        tracker, risk = self._make_tracker(has_real_update=False)
+
+        async def _failing_fetch(mint):
+            return None
+
+        with patch("pumpfun_bot.outcome_tracker.fetch_price_usd", _failing_fetch):
+            asyncio.run(tracker._apply_rest_fallback_prices())
+
+        self.assertIn("MINT", tracker._pending)
+        self.assertFalse(tracker._pending["MINT"]["has_real_update"])
+
+    def test_a_real_ws_tick_clears_rest_fallback_active(self):
+        tracker, risk = self._make_tracker(has_real_update=True, rest_fallback_active=True)
+
+        asyncio.run(tracker._handle_price_update("MINT", 105.0))  # a genuine WS tick
+
+        self.assertFalse(tracker._pending["MINT"]["rest_fallback_active"])
+
+
 if __name__ == "__main__":
     unittest.main()
