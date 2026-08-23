@@ -25,6 +25,16 @@ price_change_pct() returns None if there isn't yet a buffered tick old
 enough to cover the requested window, exactly like every other
 "unknown, don't guess" filter in this codebase (never returns "0%" for
 missing data).
+
+CONFIRMED LIVE (see price_ref.py's module docstring for the full story -
+this module hit the exact same bug outcome_tracker.py already fixed):
+real logged 1m momentum values here included +356%/-51%/+113% swings on
+brand-new tokens seconds old - not real price moves, the same cross-field
+mismatch (a mint's buffered ticks mixing marketCapSol/vSolInBondingCurve/
+price/etc from different WS events as if they were the same scale). Fixed
+the same way: the FIRST real tick buffered for a mint establishes which
+field to trust, and every later tick for that same mint re-extracts ONLY
+that field - a miss is "no new tick", never a fallback to a different one.
 """
 from __future__ import annotations
 
@@ -35,7 +45,7 @@ import time
 
 import websockets
 
-from .price_ref import extract_price_ref
+from .price_ref import extract_price_ref_for_field, extract_price_ref_with_field
 from .pumpportal_client import authenticated_ws_url
 
 logger = logging.getLogger("pumpfun_bot.candidate_price_tracker")
@@ -53,6 +63,9 @@ class CandidatePriceTracker:
         self.ws_url = ws_url
         self.api_key = api_key
         self._history: dict[str, list[tuple[float, float]]] = {}
+        # which PumpPortal field a mint's buffered ticks are trusted to -
+        # set from the first real tick, see this module's docstring
+        self._price_ref_field: dict[str, str] = {}
         self._watched: set[str] = set()
         self._subscribed_mints: set[str] = set()
         self._lock = asyncio.Lock()
@@ -141,12 +154,27 @@ class CandidatePriceTracker:
         mint = data.get("mint")
         if mint is None:
             return
-        ref = extract_price_ref(data)
-        if ref is None:
-            return
+
         async with self._lock:
             if mint not in self._history:
                 return
+            field = self._price_ref_field.get(mint)
+
+        if field:
+            # already established from an earlier tick - never substitute
+            # a different, scale-incompatible field (see module docstring)
+            ref = extract_price_ref_for_field(data, field)
+        else:
+            ref, field = extract_price_ref_with_field(data)
+
+        if ref is None:
+            return
+
+        async with self._lock:
+            if mint not in self._history:
+                return
+            if mint not in self._price_ref_field and field:
+                self._price_ref_field[mint] = field
             self._history[mint].append((time.time(), ref))
 
     def _prune_old_history(self) -> None:
@@ -155,5 +183,6 @@ class CandidatePriceTracker:
             pruned = [t for t in ticks if t[0] >= cutoff]
             if mint not in self._watched and not pruned:
                 del self._history[mint]
+                self._price_ref_field.pop(mint, None)
             else:
                 self._history[mint] = pruned

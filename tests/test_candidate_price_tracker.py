@@ -130,6 +130,72 @@ class HandleWsMessageTests(unittest.TestCase):
         self.assertEqual(tracker._history["MINT"], [])
 
 
+class PriceRefFieldConsistencyTests(unittest.TestCase):
+    """Real bug found live: logged 1m momentum values included +356%/-51%/
+    +113% swings on tokens seconds old - not real price moves. Root cause:
+    _handle_ws_message used extract_price_ref()'s any-field fallback, so a
+    mint's buffered ticks could mix marketCapSol/vSolInBondingCurve/price/
+    etc from different WS events as if they were the same scale (the exact
+    bug already fixed in outcome_tracker.py). The first real tick for a
+    mint must establish which field to trust; later ticks missing that
+    field must be skipped, never fall back to a different one."""
+
+    def test_first_tick_establishes_the_trusted_field(self):
+        tracker = CandidatePriceTracker(ws_url="wss://example.invalid")
+        asyncio.run(tracker.watch("MINT"))
+
+        asyncio.run(tracker._handle_ws_message(json.dumps({"mint": "MINT", "marketCapSol": 30.0})))
+
+        self.assertEqual(tracker._price_ref_field["MINT"], "marketCapSol")
+        self.assertEqual(tracker._history["MINT"], [(tracker._history["MINT"][0][0], 30.0)])
+
+    def test_a_later_tick_missing_the_established_field_is_ignored(self):
+        tracker = CandidatePriceTracker(ws_url="wss://example.invalid")
+        asyncio.run(tracker.watch("MINT"))
+        asyncio.run(tracker._handle_ws_message(json.dumps({"mint": "MINT", "marketCapSol": 30.0})))
+
+        # no marketCapSol here - only a wildly different-scale "price" field,
+        # exactly the scenario that produced the bogus swings live
+        asyncio.run(tracker._handle_ws_message(json.dumps({"mint": "MINT", "price": 0.00000003})))
+
+        self.assertEqual(len(tracker._history["MINT"]), 1)  # second tick never appended
+
+    def test_a_later_tick_with_the_established_field_is_appended_normally(self):
+        tracker = CandidatePriceTracker(ws_url="wss://example.invalid")
+        asyncio.run(tracker.watch("MINT"))
+        asyncio.run(tracker._handle_ws_message(json.dumps({"mint": "MINT", "marketCapSol": 30.0})))
+
+        asyncio.run(tracker._handle_ws_message(json.dumps({"mint": "MINT", "marketCapSol": 33.0})))
+
+        self.assertEqual(len(tracker._history["MINT"]), 2)
+        self.assertEqual(tracker._history["MINT"][1][1], 33.0)
+
+    def test_ignores_the_wrong_field_even_when_the_right_one_is_also_present(self):
+        tracker = CandidatePriceTracker(ws_url="wss://example.invalid")
+        asyncio.run(tracker.watch("MINT"))
+        asyncio.run(
+            tracker._handle_ws_message(json.dumps({"mint": "MINT", "vSolInBondingCurve": 30.0})),
+        )
+
+        asyncio.run(tracker._handle_ws_message(json.dumps({
+            "mint": "MINT", "marketCapSol": 999.0, "vSolInBondingCurve": 32.0,
+        })))
+
+        self.assertEqual(len(tracker._history["MINT"]), 2)
+        self.assertEqual(tracker._history["MINT"][1][1], 32.0)
+
+    def test_prune_clears_the_trusted_field_once_a_mint_is_fully_dropped(self):
+        tracker = CandidatePriceTracker(ws_url="wss://example.invalid")
+        now = time.time()
+        tracker._watched = set()
+        tracker._history["MINT"] = [(now - 99999, 100.0)]
+        tracker._price_ref_field["MINT"] = "marketCapSol"
+
+        tracker._prune_old_history()
+
+        self.assertNotIn("MINT", tracker._price_ref_field)
+
+
 class FakeWebSocket:
     """Same fake used by test_outcome_tracker.py's SubscriptionSyncTests -
     only .send() calls matter here, the async iteration never actually
