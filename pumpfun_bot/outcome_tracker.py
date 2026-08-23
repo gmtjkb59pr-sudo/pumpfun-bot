@@ -93,16 +93,18 @@ STALE_PRICE_TIMEOUT_SEC = 10
 MIN_SELL_DELAY_SEC = 15
 # after this many consecutive REAL sell failures (not the MIN_SELL_DELAY_SEC
 # defer, which isn't a failure) for the same position, stop auto-retrying and
-# alert instead - confirmed live: a position hit PumpPortal's own program
-# throwing "AnchorError ... Error Code: Overflow" (Custom 6024) on every sell
-# attempt, a deterministic on-chain math error that can never succeed no
-# matter how many times it's retried. Nothing capped that retry loop before -
-# it burned a real priority fee every EXIT_RETRY_COOLDOWN_SEC forever. The
-# position stays tracked and visible (never silently dropped - only wallet
-# reconciliation does that, and only once the wallet genuinely no longer
-# holds it), just no longer auto-retried, so a human can decide how to
-# actually get it out (e.g. a manual swap).
-MAX_CONSECUTIVE_SELL_FAILURES = 5
+# alert instead - confirmed live TWICE now: a position hitting PumpPortal's
+# own program throwing a deterministic on-chain error on every attempt
+# (AnchorError "Overflow", Custom 6024; and separately Custom 6022) that can
+# never succeed no matter how many times it's retried. user-requested:
+# lowered from 5 -> 2 after watching a stuck position burn a real priority
+# fee on every failed attempt - 2 is enough to rule out a one-off transient
+# failure without paying for 3-4 more attempts against a deterministic
+# error. The position stays tracked and visible (never silently dropped -
+# only wallet reconciliation does that, and only once the wallet genuinely
+# no longer holds it), just no longer auto-retried, so a human can decide
+# how to actually get it out (e.g. a manual swap).
+MAX_CONSECUTIVE_SELL_FAILURES = 2
 # how often to reconcile _pending against real wallet holdings - not just
 # once at startup, since drift can happen any time a position gets closed
 # outside the bot's own exit logic (e.g. a manual sale). Found live: a
