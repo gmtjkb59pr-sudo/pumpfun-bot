@@ -198,6 +198,11 @@ class ConsiderTests(unittest.TestCase):
         self.assertAlmostEqual(risk.state.open_exposure_sol, 0.03)
         self.assertIn("MINTpump", outcome_tracker._pending)
         self.assertEqual(outcome_tracker._pending["MINTpump"]["entry_ref"], 0.00042)
+        # confirmed live: a real WS tick's bonding-curve-scale ref applied
+        # to this USD-priced entry_ref produced a nonsensical exit - the
+        # tracker must know this position's entry is USD-denominated so it
+        # can ignore WS ticks and rely on the REST fallback instead
+        self.assertEqual(outcome_tracker._pending["MINTpump"]["price_source"], "usd")
 
     def test_live_buy_sends_a_real_trade(self):
         client = FakeClient()

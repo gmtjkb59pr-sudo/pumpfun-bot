@@ -1778,5 +1778,75 @@ class RestFallbackPriceTests(unittest.TestCase):
         self.assertFalse(tracker._pending["MINT"]["rest_fallback_active"])
 
 
+class PriceSourceUnitMismatchTests(unittest.TestCase):
+    """Confirmed live: a real WS tick's ref (marketCapSol/vSolInBondingCurve/
+    etc - bonding-curve-relative) applied to a birdeye_movers/coingecko_movers
+    position (entry_ref is an absolute USD price from Birdeye/CoinGecko) is
+    an apples-to-oranges unit mismatch - produced a real +850,255,839% exit
+    on a position that had barely moved. price_source="usd" positions must
+    ignore real WS ticks entirely and rely solely on the REST fallback."""
+
+    def _make_tracker(self, *, price_source="usd", entry_ref=2.47e-05):
+        risk = RiskManager(RiskConfig())
+        risk.register_trade_opened(0.05)
+        tracker = OutcomeTracker(ws_url="wss://example.invalid", risk=risk)
+        tracker._pending["MINT"] = {
+            "entry_ts": time.time(),
+            "entry_ref": entry_ref,
+            "last_ref": entry_ref,
+            "peak_ref": entry_ref,
+            "name": "Test Token",
+            "symbol": "TEST",
+            "trade_size_sol": 0.05,
+            "hit": set(),
+            "has_real_update": False,
+            "last_update_ts": time.time(),
+            "price_source": price_source,
+            "rest_fallback_active": False,
+            "last_rest_fallback_ts": 0.0,
+        }
+        return tracker, risk
+
+    def test_a_real_ws_tick_is_ignored_for_a_usd_basis_position(self):
+        tracker, risk = self._make_tracker(price_source="usd", entry_ref=2.47e-05)
+
+        # a real WS tick reporting a bonding-curve-scale value (e.g.
+        # marketCapSol ~= 210) - exactly the scale that produced the bogus
+        # +850,255,839% exit live
+        asyncio.run(tracker._handle_price_update("MINT", 210.0))
+
+        self.assertIn("MINT", tracker._pending)
+        self.assertFalse(tracker._pending["MINT"]["has_real_update"])
+        self.assertEqual(tracker._pending["MINT"]["last_ref"], 2.47e-05)
+        self.assertAlmostEqual(risk.state.realized_pnl_sol, 0.0)
+
+    def test_a_ws_tick_still_applies_normally_for_a_bonding_curve_basis_position(self):
+        tracker, risk = self._make_tracker(price_source="bonding_curve_sol", entry_ref=100.0)
+
+        asyncio.run(tracker._handle_price_update("MINT", 151.0))  # +51%, crosses default +50% TP
+
+        self.assertNotIn("MINT", tracker._pending)  # exited normally
+
+    def test_a_rest_fallback_price_still_applies_for_a_usd_basis_position(self):
+        tracker, risk = self._make_tracker(price_source="usd", entry_ref=2.47e-05)
+
+        asyncio.run(tracker._handle_price_update("MINT", 3.0e-05, via_rest_fallback=True))
+
+        self.assertTrue(tracker._pending["MINT"]["has_real_update"])
+        self.assertEqual(tracker._pending["MINT"]["last_ref"], 3.0e-05)
+
+    def test_usd_basis_position_stays_eligible_for_rest_fallback_even_once_measured(self):
+        tracker, risk = self._make_tracker(price_source="usd", entry_ref=2.47e-05)
+        tracker._pending["MINT"]["has_real_update"] = True  # already measured via an earlier fallback
+
+        async def _fake_fetch(mint):
+            return 2.5e-05
+
+        with patch("pumpfun_bot.outcome_tracker.fetch_price_usd", _fake_fetch):
+            asyncio.run(tracker._apply_rest_fallback_prices())
+
+        self.assertEqual(tracker._pending["MINT"]["last_ref"], 2.5e-05)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -348,6 +348,7 @@ class OutcomeTracker:
         trailing_activation_pct: float | None = None,
         trailing_stop_pct: float | None = None,
         strategy: str = "",
+        price_source: str = "bonding_curve_sol",
     ) -> None:
         """take_profit_pct/stop_loss_pct/trailing_*_pct default to this
         instance's own thresholds - pass explicit values when a DIFFERENT
@@ -361,7 +362,21 @@ class OutcomeTracker:
         position so open_position_count(strategy=...) can scope to just
         this strategy's own open positions later. Optional/blank for
         callers (sniper, copytrade, market_maker) that don't need their
-        own budget yet - they stay on the original shared-pool count."""
+        own budget yet - they stay on the original shared-pool count.
+
+        price_source: confirmed live - sniper/social_watch's entry_ref
+        comes from extract_price_ref() (a bonding-curve-relative SOL-scale
+        proxy: marketCapSol/vSolInBondingCurve/etc), the SAME basis every
+        real WS trade tick is extracted in. birdeye_movers/coingecko_movers'
+        entry_ref instead comes from an external absolute USD price
+        (Birdeye/CoinGecko). Comparing a real WS tick's bonding-curve-scale
+        ref against a USD-scale entry_ref produced a nonsensical exit
+        (+850,255,839% observed live) - not a real price move, an apples-
+        to-oranges unit mismatch. price_source="usd" (set by those two
+        strategies) makes _handle_price_update ignore real WS ticks for
+        this position entirely and rely solely on the REST fallback (see
+        REST_FALLBACK_POLL_INTERVAL_SEC), which is USD-denominated on both
+        ends (entry from Birdeye/CoinGecko, updates from DexScreener)."""
         if entry_ref is None:
             logger.debug("Geen price-ref beschikbaar voor %s, sla outcome-tracking over.", mint)
             return
@@ -405,6 +420,8 @@ class OutcomeTracker:
                     trailing_stop_pct if trailing_stop_pct is not None else self.trailing_stop_pct
                 ),
                 "strategy": strategy,
+                # see track()'s own docstring for the full reasoning
+                "price_source": price_source,
                 # see REST_FALLBACK_POLL_INTERVAL_SEC's docstring - set True
                 # once a REST-fallback price has been used for this position
                 # at least once, so it keeps getting REST-polled even after
@@ -472,12 +489,22 @@ class OutcomeTracker:
         received a real WS tick (or is already relying on this same
         fallback), rate-limited per-position to REST_FALLBACK_POLL_INTERVAL_
         SEC. A position with working WS data is never touched here - zero
-        extra REST calls for the common case."""
+        extra REST calls for the common case.
+
+        Also always polls price_source="usd" positions (birdeye_movers/
+        coingecko_movers), regardless of has_real_update - a real WS tick
+        is never applied to those (see _handle_price_update's unit-mismatch
+        guard), so has_real_update for one of these can ONLY ever have come
+        from this same REST fallback, never a reason to stop polling it."""
         now = time.time()
         candidates = []
         async with self._lock:
             for mint, info in self._pending.items():
-                needs_fallback = not info["has_real_update"] or info.get("rest_fallback_active")
+                needs_fallback = (
+                    not info["has_real_update"]
+                    or info.get("rest_fallback_active")
+                    or info.get("price_source") == "usd"
+                )
                 if not needs_fallback:
                     continue
                 if now - info.get("last_rest_fallback_ts", 0.0) < REST_FALLBACK_POLL_INTERVAL_SEC:
@@ -740,6 +767,15 @@ class OutcomeTracker:
         is_pending = False
         async with self._lock:
             info = self._pending.get(mint)
+            if info is not None and not via_rest_fallback and info.get("price_source") == "usd":
+                # a real WS tick's ref is bonding-curve-scale (marketCapSol/
+                # vSolInBondingCurve/etc) - applying it to a USD-denominated
+                # entry_ref is an apples-to-oranges unit mismatch, confirmed
+                # live to produce a nonsensical exit (+850,255,839% observed
+                # on a real position). Only the REST fallback (USD-scale on
+                # both ends) is a valid update source for this position -
+                # see track()'s price_source docstring.
+                info = None
             if info is not None:
                 is_pending = True
                 info["last_ref"] = ref

@@ -199,6 +199,25 @@ class ConsiderTests(unittest.TestCase):
 
         self.assertAlmostEqual(risk.state.open_exposure_sol, 0.03)
 
+    def test_dry_run_buy_tracks_entry_as_usd_denominated(self):
+        # confirmed live: a real WS tick's bonding-curve-scale ref applied
+        # to this USD-priced entry_ref produced a nonsensical exit - the
+        # tracker must know this position's entry is USD-denominated so it
+        # can ignore WS ticks and rely on the REST fallback instead
+        store_file = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
+        store_file.close()
+        store_path = Path(store_file.name)
+        self.addCleanup(lambda: store_path.unlink(missing_ok=True))
+
+        client = FakeClient()
+        outcome_tracker = OutcomeTracker(ws_url="wss://example.invalid", position_store_path=store_path)
+        strategy, risk = _make_strategy(client, dry_run=True, outcome_tracker=outcome_tracker)
+
+        with _DEFAULT_HOLDER_PATCH, _DEFAULT_CONCENTRATION_PATCH:
+            asyncio.run(strategy._consider(_token()))
+
+        self.assertEqual(outcome_tracker._pending["MINTpump"]["price_source"], "usd")
+
     def test_live_buy_sends_a_real_trade(self):
         client = FakeClient()
         strategy, risk = _make_strategy(client, dry_run=False)
