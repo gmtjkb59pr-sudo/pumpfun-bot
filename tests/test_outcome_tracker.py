@@ -1110,6 +1110,70 @@ class ReconcileWithWalletTests(unittest.TestCase):
         self.assertGreater(tracker._last_wallet_reconcile_ts, time.time() - 1)
 
 
+class RecentlyExitedGraceWindowTests(unittest.TestCase):
+    """Real bug found live (Alpha, social_watch, 2026-08-23): a position
+    exited normally via trailing_stop, its sell fully confirmed on-chain
+    (wallet balance emptied and the token account closed), but the wallet
+    RPC's fetch_wallet_token_mints() still listed the mint as held 8s later
+    - the reconcile poll then treated it as an untracked holding and queued
+    a liquidation attempt, which failed on-chain with SellZeroAmount
+    (Custom 6022) since there was really nothing left to sell. Harmless (no
+    funds stuck), but it burns a real priority fee on a doomed tx. A mint
+    the bot just closed itself must be excluded from the untracked sweep
+    for a grace period to absorb this RPC lag."""
+
+    def test_a_mint_just_closed_by_a_normal_exit_is_not_flagged_untracked(self):
+        risk = RiskManager(RiskConfig())
+        client = FakeClient()
+        tracker = OutcomeTracker(ws_url="wss://example.invalid", risk=risk, client=client, dry_run=False)
+        tracker._recently_closed["JUST_SOLD"] = time.time()
+
+        async def _fake_fetch(wallet_pubkey, rpc_http_url):
+            # stale RPC index still lists it as held right after the sell
+            return {"JUST_SOLD"}
+
+        with patch("pumpfun_bot.outcome_tracker.fetch_wallet_token_mints", _fake_fetch), \
+             patch("pumpfun_bot.outcome_tracker.bot_state") as mock_bot_state:
+            asyncio.run(tracker._reconcile_with_wallet())
+
+        self.assertNotIn("JUST_SOLD", tracker._untracked_liquidation)
+        mock_bot_state.set_untracked_holdings_count.assert_called_once_with(0)
+
+    def test_a_mint_closed_long_ago_falls_out_of_the_grace_window(self):
+        from pumpfun_bot.outcome_tracker import RECENTLY_EXITED_GRACE_SEC
+
+        risk = RiskManager(RiskConfig())
+        client = FakeClient()
+        tracker = OutcomeTracker(ws_url="wss://example.invalid", risk=risk, client=client, dry_run=False)
+        tracker._recently_closed["OLD_SOLD"] = time.time() - RECENTLY_EXITED_GRACE_SEC - 1
+
+        async def _fake_fetch(wallet_pubkey, rpc_http_url):
+            return {"OLD_SOLD"}  # genuinely still held, unrelated to the old exit
+
+        with patch("pumpfun_bot.outcome_tracker.fetch_wallet_token_mints", _fake_fetch), \
+             patch("pumpfun_bot.outcome_tracker.bot_state") as mock_bot_state:
+            asyncio.run(tracker._reconcile_with_wallet())
+
+        # the expired grace entry no longer shields it - flagged untracked
+        # like any other genuine leftover holding
+        mock_bot_state.set_untracked_holdings_count.assert_called_once_with(1)
+
+    def test_an_unrelated_untracked_mint_is_still_flagged_normally(self):
+        risk = RiskManager(RiskConfig())
+        client = FakeClient()
+        tracker = OutcomeTracker(ws_url="wss://example.invalid", risk=risk, client=client, dry_run=False)
+        tracker._recently_closed["JUST_SOLD"] = time.time()
+
+        async def _fake_fetch(wallet_pubkey, rpc_http_url):
+            return {"JUST_SOLD", "SOME_OTHER_LEFTOVER"}
+
+        with patch("pumpfun_bot.outcome_tracker.fetch_wallet_token_mints", _fake_fetch), \
+             patch("pumpfun_bot.outcome_tracker.bot_state") as mock_bot_state:
+            asyncio.run(tracker._reconcile_with_wallet())
+
+        mock_bot_state.set_untracked_holdings_count.assert_called_once_with(1)
+
+
 class LiquidationDispatchTests(unittest.TestCase):
     """Real bug found live: _reconcile_with_wallet() used to await the
     liquidation sweep inline - since a failing sell can take up to 30s to
