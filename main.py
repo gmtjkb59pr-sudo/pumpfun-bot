@@ -178,7 +178,7 @@ async def main() -> None:
         cfg=cfg.copytrade,
         risk=risk,
         alerter=alerter,
-        max_trade_sol=cfg.risk.max_sol_per_trade,
+        max_trade_sol=cfg.copytrade.max_trade_sol or cfg.risk.max_sol_per_trade,
         slippage_pct=cfg.risk.default_slippage_pct,
         dry_run=cfg.risk.dry_run,
     )

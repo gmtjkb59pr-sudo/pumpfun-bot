@@ -143,6 +143,10 @@ class CopyTradeConfig:
     watched_wallets: list = field(default_factory=list)
     mirror_pct: float = 100
     max_copy_delay_ms: int = 3000
+    # user-requested: copytrade's own trade-size cap, independent of the
+    # shared risk.max_sol_per_trade - 0 (default) falls back to that shared
+    # value, unchanged behavior for anyone who hasn't set this explicitly
+    max_trade_sol: float = 0.0
 
 
 @dataclass
@@ -269,6 +273,7 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         watched_wallets=ct_raw.get("watched_wallets", []) or [],
         mirror_pct=ct_raw.get("mirror_pct", 100),
         max_copy_delay_ms=ct_raw.get("max_copy_delay_ms", 3000),
+        max_trade_sol=ct_raw.get("max_trade_sol", 0.0),
     )
 
     mm_raw = strat_raw.get("market_maker", {})
