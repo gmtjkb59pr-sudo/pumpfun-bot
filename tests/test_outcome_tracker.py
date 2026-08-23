@@ -17,6 +17,7 @@ from pumpfun_bot.outcome_tracker import (
     STALE_PRICE_TIMEOUT_SEC,
     OutcomeTracker,
     is_funded_key_rejection,
+    load_confirmed_unsellable_mints,
 )
 from pumpfun_bot.risk import RiskManager
 
@@ -1539,6 +1540,126 @@ class StalePriceExitTests(unittest.TestCase):
         self.assertEqual(client.sell_calls, [("MINT", tracker.sell_slippage_pct)])
         self.assertNotIn("MINT", tracker._pending)
         self.assertAlmostEqual(risk.state.realized_pnl_sol, -ROUND_TRIP_PRIORITY_FEE_SOL)
+
+
+class LoadConfirmedUnsellableMintsTests(unittest.TestCase):
+    """Same per-test log isolation as SellPausedReputationSignalTests above -
+    this reads the log back, unlike most tests in this file which only
+    write to it."""
+
+    def setUp(self):
+        self._module_log_path = activity_log.DATA_LOG_PATH
+        self._test_log_file = tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False)
+        self._test_log_file.close()
+        activity_log.DATA_LOG_PATH = Path(self._test_log_file.name)
+
+    def tearDown(self):
+        activity_log.DATA_LOG_PATH = self._module_log_path
+        Path(self._test_log_file.name).unlink(missing_ok=True)
+
+    def _write(self, records: list[dict]) -> None:
+        with open(activity_log.DATA_LOG_PATH, "w") as f:
+            for record in records:
+                f.write(json.dumps(record) + "\n")
+
+    def test_collects_mints_from_sell_paused_records(self):
+        self._write([
+            {"type": "sell_paused", "mint": "M1"},
+            {"type": "sell_paused", "mint": "M2"},
+            {"type": "exit", "mint": "M3"},  # not a sell_paused record
+        ])
+        self.assertEqual(load_confirmed_unsellable_mints(), {"M1", "M2"})
+
+    def test_dedupes_repeated_sell_paused_records_for_the_same_mint(self):
+        self._write([
+            {"type": "sell_paused", "mint": "M1"},
+            {"type": "sell_paused", "mint": "M1"},
+        ])
+        self.assertEqual(load_confirmed_unsellable_mints(), {"M1"})
+
+    def test_missing_log_file_returns_empty_set(self):
+        Path(activity_log.DATA_LOG_PATH).unlink()
+        self.assertEqual(load_confirmed_unsellable_mints(), set())
+
+    def test_picks_up_a_later_reassignment_of_data_log_path(self):
+        # guards against the exact bug this module had to avoid: a
+        # log_path default bound once at import time would never see
+        # activity_log.DATA_LOG_PATH change after that
+        self._write([{"type": "sell_paused", "mint": "OLD_PATH_MINT"}])
+        other_file = tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False)
+        other_file.close()
+        self.addCleanup(lambda: Path(other_file.name).unlink(missing_ok=True))
+        with open(other_file.name, "w") as f:
+            f.write(json.dumps({"type": "sell_paused", "mint": "NEW_PATH_MINT"}) + "\n")
+
+        activity_log.DATA_LOG_PATH = Path(other_file.name)
+
+        self.assertEqual(load_confirmed_unsellable_mints(), {"NEW_PATH_MINT"})
+
+
+class LoadPendingSeedsUntrackedLiquidationTests(unittest.TestCase):
+    def setUp(self):
+        self._module_log_path = activity_log.DATA_LOG_PATH
+        self._test_log_file = tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False)
+        self._test_log_file.close()
+        activity_log.DATA_LOG_PATH = Path(self._test_log_file.name)
+
+    def tearDown(self):
+        activity_log.DATA_LOG_PATH = self._module_log_path
+        Path(self._test_log_file.name).unlink(missing_ok=True)
+
+    def _write(self, records: list[dict]) -> None:
+        with open(activity_log.DATA_LOG_PATH, "w") as f:
+            for record in records:
+                f.write(json.dumps(record) + "\n")
+
+    def test_live_tracker_pre_pauses_a_previously_confirmed_unsellable_mint(self):
+        self._write([{"type": "sell_paused", "mint": "DEAD_MINT"}])
+        tracker = OutcomeTracker(ws_url="wss://example.invalid", dry_run=False)
+
+        tracker.load_pending()
+
+        self.assertTrue(tracker._untracked_liquidation["DEAD_MINT"]["paused"])
+
+    def test_dry_run_tracker_does_not_seed_from_history(self):
+        # dry-run never touches real holdings at all - see
+        # _liquidate_untracked_holdings_inner's own dry_run/client guard -
+        # so pre-seeding this here would just be dead state
+        self._write([{"type": "sell_paused", "mint": "DEAD_MINT"}])
+        tracker = OutcomeTracker(ws_url="wss://example.invalid", dry_run=True)
+
+        tracker.load_pending()
+
+        self.assertNotIn("DEAD_MINT", tracker._untracked_liquidation)
+
+    def test_a_mint_currently_back_in_pending_is_not_seeded_as_untracked(self):
+        f = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
+        f.close()
+        path = Path(f.name)
+        self.addCleanup(lambda: path.unlink(missing_ok=True))
+        earlier = OutcomeTracker(ws_url="wss://example.invalid", position_store_path=path, dry_run=False)
+        asyncio.run(earlier.track("MINT", "Test", "TEST", entry_ref=100.0, trade_size_sol=0.03))
+        self._write([{"type": "sell_paused", "mint": "MINT"}])
+
+        tracker = OutcomeTracker(ws_url="wss://example.invalid", position_store_path=path, dry_run=False)
+        tracker.load_pending()
+
+        self.assertIn("MINT", tracker._pending)
+        self.assertNotIn("MINT", tracker._untracked_liquidation)
+
+    def test_a_seeded_mint_is_skipped_by_the_liquidation_sweep_without_a_real_attempt(self):
+        self._write([{"type": "sell_paused", "mint": "DEAD_MINT"}])
+
+        class FailingClient:
+            async def build_and_send_full_sell(self, mint, slippage_pct):
+                raise AssertionError("must never attempt a real sell for a pre-paused mint")
+
+        tracker = OutcomeTracker(
+            ws_url="wss://example.invalid", client=FailingClient(), dry_run=False,
+        )
+        tracker.load_pending()
+
+        asyncio.run(tracker._liquidate_untracked_holdings_inner({"DEAD_MINT"}))  # must not raise
 
 
 if __name__ == "__main__":
