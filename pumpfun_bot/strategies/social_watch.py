@@ -111,7 +111,8 @@ class SocialWatchStrategy:
                     self._watching.pop(mint, None)
             for mint in expired:
                 logger.debug(
-                    "Social-watch: %s kreeg geen socials binnen %ds, laten gaan.",
+                    "Social-watch: %s kwalificeerde niet binnen %ds (geen socials, of holder "
+                    "count nooit boven de min_holder_count), laten gaan.",
                     mint, self.cfg.watch_window_sec,
                 )
                 if self.price_tracker is not None:
@@ -129,12 +130,21 @@ class SocialWatchStrategy:
             if not has_socials:
                 continue
             async with self._lock:
-                # may already be gone (expired or bought concurrently)
-                # between the snapshot above and now
+                # may already be gone (expired between the snapshot above
+                # and now) - _buy() itself never removes it concurrently,
+                # _poll_once runs one call at a time
                 if mint not in self._watching:
                     continue
+            done = await self._buy(mint, info["event"], info["added_ts"])
+            if not done:
+                # holder_count wasn't sufficient (or unverifiable) this
+                # poll - user-requested: stays on the watchlist and gets
+                # retried next poll, instead of being dropped after one
+                # shot. The expiry check above still drops it eventually if
+                # it never clears the bar within watch_window_sec.
+                continue
+            async with self._lock:
                 self._watching.pop(mint, None)
-            await self._buy(mint, info["event"], info["added_ts"])
             if self.price_tracker is not None:
                 await self.price_tracker.unwatch(mint)
 
@@ -157,7 +167,22 @@ class SocialWatchStrategy:
         except asyncio.TimeoutError:
             return None
 
-    async def _buy(self, mint: str, event: dict, added_ts: float) -> None:
+    async def _buy(self, mint: str, event: dict, added_ts: float) -> bool:
+        """Returns True once this candidate is DONE - either bought, or
+        terminally rejected (already tracked / risk-blocked / market-cap /
+        concentration / momentum) - the caller (_poll_once) removes it from
+        the watchlist. Returns False only when holder_count is the reason
+        it didn't buy THIS poll and the candidate could still qualify
+        later - user-requested: holder count used to be checked exactly
+        ONCE, the instant socials were first detected, often as early as
+        ~3-20s after launch when almost no real token has accumulated many
+        holders yet regardless of the threshold (confirmed live: 83
+        candidates checked over ~14 min, none cleared even a lowered
+        min_holder_count=70, highest was 51). Now it's rechecked on every
+        subsequent poll instead, up until the watch window itself expires
+        (see _poll_once's existing expiry logic - this doesn't extend how
+        long a candidate is watched, just how many chances its holder count
+        gets within that same window)."""
         name = event.get("name", "?")
         symbol = event.get("symbol", "?")
         liquidity_sol = event.get("vSolInBondingCurve")
@@ -168,7 +193,7 @@ class SocialWatchStrategy:
             # nothing would ever track or exit, since OutcomeTracker keys by
             # mint alone
             logger.info("Social-watch: %s wordt al gevolgd, sla over.", mint)
-            return
+            return True
 
         open_positions_count = (
             self.outcome_tracker.open_position_count(strategy="social_watch")
@@ -181,7 +206,7 @@ class SocialWatchStrategy:
         )
         if not ok:
             logger.info("Social-watch: trade geblokkeerd door risk manager: %s", reason)
-            return
+            return True
 
         # a candidate can get bought on the very FIRST poll cycle if socials
         # were already present at launch - too soon for either signal below
@@ -210,9 +235,12 @@ class SocialWatchStrategy:
             required_delay = max(required_delay, CONCENTRATION_SETTLING_DELAY_SEC)
         if required_delay > 0:
             elapsed_since_launch = time.time() - added_ts
-            remaining_delay = required_delay - elapsed_since_launch
-            if remaining_delay > 0:
-                await asyncio.sleep(remaining_delay)
+            if elapsed_since_launch < required_delay:
+                # too early to trust holder-count/concentration numbers yet -
+                # retry on the next poll instead of blocking this whole poll
+                # cycle asleep (holder_count is now retried across polls
+                # anyway, see this method's docstring)
+                return False
 
         # unlike sniper's instant buy, social_watch already tolerates real
         # delay - fetch these synchronously so the values are accurate AT
@@ -233,20 +261,19 @@ class SocialWatchStrategy:
             entry_ref = extract_price_ref(event)
         if holder_count is None:
             # couldn't verify - not evidence the token is bad, just that the
-            # RPC lookup itself failed
-            logger.debug("Social-watch: kon holder count niet verifiëren voor %s.", mint)
+            # RPC lookup itself failed. Retryable - might succeed next poll.
+            logger.debug("Social-watch: kon holder count niet verifiëren voor %s, probeer opnieuw.", mint)
             if self.cfg.min_holder_count > 0:
                 # a real minimum is set (auto-tuned from evidence, see
                 # holder_count_tuning.py) - an unverifiable count can't be
-                # confirmed to clear that bar, so don't buy blind
-                logger.info("Social-watch: holder count onbekend voor %s, sla over.", mint)
-                return
+                # confirmed to clear that bar, so don't buy blind this poll
+                return False
         elif holder_count < self.cfg.min_holder_count:
             logger.info(
-                "Social-watch: %s heeft %d holders, onder de min_holder_count van %d, sla over.",
-                mint, holder_count, self.cfg.min_holder_count,
+                "Social-watch: %s heeft %d holders, onder de min_holder_count van %d, "
+                "probeer opnieuw volgende poll.", mint, holder_count, self.cfg.min_holder_count,
             )
-            return
+            return False
 
         if self.cfg.min_market_cap_usd > 0:
             # user-requested: thin market caps correlated with the worst
@@ -255,13 +282,13 @@ class SocialWatchStrategy:
             # is the clearest available signal for that risk
             if market_cap_usd is None:
                 logger.info("Social-watch: market cap onbekend voor %s, sla over.", mint)
-                return
+                return True
             if market_cap_usd < self.cfg.min_market_cap_usd:
                 logger.info(
                     "Social-watch: %s heeft $%.0f market cap, onder de min_market_cap_usd "
                     "van $%.0f, sla over.", mint, market_cap_usd, self.cfg.min_market_cap_usd,
                 )
-                return
+                return True
 
         if self.cfg.max_top10_concentration_pct > 0:
             # user-requested: a manufactured/bundled launch concentrates the
@@ -270,14 +297,14 @@ class SocialWatchStrategy:
             # holder_concentration.py)
             if top10_concentration_pct is None:
                 logger.info("Social-watch: top-10 concentratie onbekend voor %s, sla over.", mint)
-                return
+                return True
             if top10_concentration_pct > self.cfg.max_top10_concentration_pct:
                 logger.info(
                     "Social-watch: %s heeft %.0f%% top-10 concentratie, boven de "
                     "max_top10_concentration_pct van %.0f%%, sla over.",
                     mint, top10_concentration_pct, self.cfg.max_top10_concentration_pct,
                 )
-                return
+                return True
 
         if self.cfg.require_positive_momentum_5m:
             # user-requested "movers"-style filter: only buy candidates
@@ -286,13 +313,13 @@ class SocialWatchStrategy:
             # instead of scraping pump.fun's own Movers tab
             if price_change_5m_pct is None:
                 logger.info("Social-watch: 5m prijsverandering onbekend voor %s, sla over.", mint)
-                return
+                return True
             if price_change_5m_pct <= 0:
                 logger.info(
                     "Social-watch: %s heeft %.1f%% prijsverandering (5m), geen positief "
                     "momentum, sla over.", mint, price_change_5m_pct,
                 )
-                return
+                return True
 
         if self.cfg.max_price_change_5m_pct > 0:
             # user-requested, evidence-based (real dry-run outcomes tonight):
@@ -303,14 +330,14 @@ class SocialWatchStrategy:
             # catching a real move early
             if price_change_5m_pct is None:
                 logger.info("Social-watch: 5m prijsverandering onbekend voor %s, sla over.", mint)
-                return
+                return True
             if price_change_5m_pct > self.cfg.max_price_change_5m_pct:
                 logger.info(
                     "Social-watch: %s heeft %.1f%% prijsverandering (5m), boven de "
                     "max_price_change_5m_pct van %.0f%% (waarschijnlijk al over de piek), "
                     "sla over.", mint, price_change_5m_pct, self.cfg.max_price_change_5m_pct,
                 )
-                return
+                return True
 
         mcap_str = f"${market_cap_usd:.0f}" if market_cap_usd is not None else "?"
         momentum_str = f", {price_change_5m_pct:+.1f}% (5m)" if price_change_5m_pct is not None else ""
@@ -356,7 +383,7 @@ class SocialWatchStrategy:
                 )
             if self.scaled_exit_simulator is not None and entry_ref is not None:
                 self.scaled_exit_simulator.track(mint, entry_ref, self.trade_size_sol)
-            return
+            return True
 
         try:
             result = await self.client.build_and_send_trade(
@@ -392,3 +419,4 @@ class SocialWatchStrategy:
             logger.exception("Social-watch buy mislukt voor %s: %s", mint, exc)
             await self.risk.report_buy_result(success=False)
             await self.alerter.send(f"❌ Social-watch buy mislukt voor {symbol}: {exc}")
+        return True
