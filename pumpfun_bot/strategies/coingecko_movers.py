@@ -173,6 +173,7 @@ class CoinGeckoMoversStrategy:
                     trailing_stop_pct=self.cfg.trailing_stop_pct,
                     strategy="coingecko_movers",
                     price_source="usd",
+                    take_profit_ladder=self.cfg.take_profit_ladder,
                 )
             return
 
@@ -197,6 +198,7 @@ class CoinGeckoMoversStrategy:
                     trailing_stop_pct=self.cfg.trailing_stop_pct,
                     strategy="coingecko_movers",
                     price_source="usd",
+                    take_profit_ladder=self.cfg.take_profit_ladder,
                 )
         except Exception as exc:  # noqa: BLE001
             logger.exception("CoinGecko-movers buy mislukt voor %s: %s", mint, exc)

@@ -78,6 +78,12 @@ class FakeClient:
             raise RuntimeError("simulated RPC failure")
         return {"signature": self.signature, "action": "sell", "mint": mint, "amount": "100%"}
 
+    async def build_and_send_trade(self, action, mint, amount_sol, slippage_pct):
+        self.sell_calls.append((mint, slippage_pct, action, amount_sol))
+        if self.should_fail:
+            raise RuntimeError("simulated RPC failure")
+        return {"signature": self.signature, "action": action, "mint": mint, "amount_sol": amount_sol}
+
 
 class PerPositionThresholdTests(unittest.TestCase):
     """sniper and social_watch share one OutcomeTracker instance, which only
@@ -1846,6 +1852,231 @@ class PriceSourceUnitMismatchTests(unittest.TestCase):
             asyncio.run(tracker._apply_rest_fallback_prices())
 
         self.assertEqual(tracker._pending["MINT"]["last_ref"], 2.5e-05)
+
+
+class TakeProfitLadderTests(unittest.TestCase):
+    """Scaled take-profit ladder - ported from an earlier version of this
+    bot's sniper strategy (user-requested, see TakeProfitLevel's docstring
+    in config.py). Each rung sells sell_pct% of whatever's LEFT of the
+    position, not of the original buy; stop-loss always closes everything
+    immediately; the trailing stop only takes over once every rung has
+    fired."""
+
+    LADDER = [
+        {"multiplier": 2, "sell_pct": 30},
+        {"multiplier": 5, "sell_pct": 40},
+    ]
+
+    def _make_tracker(
+        self, *, client=None, dry_run=True, entry_ref=100.0, entry_ts=None,
+        remaining_fraction=1.0, triggered_ladder_levels=None, trade_size_sol=0.05,
+        stop_loss_pct=25.0, trailing_activation_pct=20.0, trailing_stop_pct=15.0,
+        peak_ref=None,
+    ):
+        risk = RiskManager(RiskConfig())
+        risk.register_trade_opened(trade_size_sol)
+        tracker = OutcomeTracker(
+            ws_url="wss://example.invalid", risk=risk, client=client, dry_run=dry_run,
+            take_profit_pct=50.0, stop_loss_pct=stop_loss_pct,
+            trailing_activation_pct=trailing_activation_pct, trailing_stop_pct=trailing_stop_pct,
+        )
+        tracker._pending["MINT"] = {
+            "entry_ts": entry_ts if entry_ts is not None else time.time() - MIN_SELL_DELAY_SEC - 1,
+            "entry_ref": entry_ref,
+            "last_ref": entry_ref,
+            "peak_ref": peak_ref if peak_ref is not None else entry_ref,
+            "name": "Test Token",
+            "symbol": "TEST",
+            "trade_size_sol": trade_size_sol,
+            "hit": set(),
+            "has_real_update": False,
+            "take_profit_ladder": list(self.LADDER),
+            "triggered_ladder_levels": triggered_ladder_levels or [],
+            "remaining_fraction": remaining_fraction,
+        }
+        return tracker, risk
+
+    def test_track_stores_ladder_as_plain_dicts_with_fresh_state(self):
+        from pumpfun_bot.config import TakeProfitLevel
+
+        risk = RiskManager(RiskConfig())
+        tracker = OutcomeTracker(ws_url="wss://example.invalid", risk=risk)
+        asyncio.run(tracker.track(
+            "MINT", "Test Token", "TEST", 100.0, trade_size_sol=0.05,
+            take_profit_ladder=[TakeProfitLevel(multiplier=2, sell_pct=30), TakeProfitLevel(multiplier=5, sell_pct=40)],
+        ))
+
+        pos = tracker._pending["MINT"]
+        self.assertEqual(
+            pos["take_profit_ladder"],
+            [{"multiplier": 2, "sell_pct": 30}, {"multiplier": 5, "sell_pct": 40}],
+        )
+        self.assertEqual(pos["triggered_ladder_levels"], [])
+        self.assertEqual(pos["remaining_fraction"], 1.0)
+
+    def test_empty_ladder_keeps_single_shot_take_profit_behavior(self):
+        # backward compat: no ladder configured -> unchanged from before
+        risk = RiskManager(RiskConfig())
+        risk.register_trade_opened(0.05)
+        tracker = OutcomeTracker(ws_url="wss://example.invalid", risk=risk, take_profit_pct=50.0)
+        tracker._pending["MINT"] = {
+            "entry_ts": time.time(), "entry_ref": 100.0, "last_ref": 100.0, "peak_ref": 100.0,
+            "name": "Test Token", "symbol": "TEST", "trade_size_sol": 0.05,
+            "hit": set(), "has_real_update": False, "take_profit_ladder": [],
+        }
+        asyncio.run(tracker._handle_price_update("MINT", 151.0))  # +51%, crosses +50% TP
+        self.assertNotIn("MINT", tracker._pending)  # closed fully, no ladder involved
+
+    def test_first_rung_fires_partial_sell_and_leaves_position_open(self):
+        tracker, risk = self._make_tracker(dry_run=True, entry_ref=100.0, trade_size_sol=0.05)
+
+        asyncio.run(tracker._handle_price_update("MINT", 200.0))  # 2x -> first rung (30%)
+
+        self.assertIn("MINT", tracker._pending)  # partial, not a full close
+        pos = tracker._pending["MINT"]
+        self.assertAlmostEqual(pos["remaining_fraction"], 0.7, places=6)
+        self.assertEqual(pos["triggered_ladder_levels"], [2])
+        # only 30% of the original 0.05 SOL position's cost basis is released
+        self.assertAlmostEqual(risk.state.open_exposure_sol, 0.05 - 0.015, places=6)
+        self.assertAlmostEqual(risk.state.realized_pnl_sol, _net_pnl_sol(0.015, 100.0), places=6)
+
+    def test_second_rung_fires_off_the_new_remaining_fraction(self):
+        tracker, risk = self._make_tracker(
+            dry_run=True, entry_ref=100.0, trade_size_sol=0.05,
+            remaining_fraction=0.7, triggered_ladder_levels=[2],
+        )
+        risk.state.open_exposure_sol = 0.05 - 0.015  # reflects the first rung already having fired
+
+        asyncio.run(tracker._handle_price_update("MINT", 500.0))  # 5x -> second rung (40% of 0.7 left)
+
+        self.assertIn("MINT", tracker._pending)
+        pos = tracker._pending["MINT"]
+        self.assertAlmostEqual(pos["remaining_fraction"], 0.7 - 0.28, places=6)
+        self.assertEqual(pos["triggered_ladder_levels"], [2, 5])
+        self.assertAlmostEqual(risk.state.open_exposure_sol, 0.05 - 0.015 - 0.014, places=6)
+
+    def test_at_most_one_rung_fires_per_price_update(self):
+        # a price jump that blows straight past both rungs at once still only
+        # triggers the first untriggered one - the next tick catches the rest
+        tracker, risk = self._make_tracker(dry_run=True, entry_ref=100.0, trade_size_sol=0.05)
+
+        asyncio.run(tracker._handle_price_update("MINT", 1000.0))  # 10x - past both 2x and 5x
+
+        self.assertEqual(tracker._pending["MINT"]["triggered_ladder_levels"], [2])
+        self.assertAlmostEqual(tracker._pending["MINT"]["remaining_fraction"], 0.7, places=6)
+
+    def test_stop_loss_closes_everything_left_regardless_of_ladder_progress(self):
+        tracker, risk = self._make_tracker(
+            dry_run=True, entry_ref=100.0, trade_size_sol=0.05,
+            remaining_fraction=0.42, triggered_ladder_levels=[2, 5], stop_loss_pct=25.0,
+        )
+        risk.state.open_exposure_sol = 0.05 * 0.42
+
+        asyncio.run(tracker._handle_price_update("MINT", 70.0))  # -30%, crosses -25% SL
+
+        self.assertNotIn("MINT", tracker._pending)  # fully closed
+        self.assertIn("MINT", tracker._post_exit)
+        self.assertAlmostEqual(risk.state.open_exposure_sol, 0.0, places=6)
+        # PnL scaled to only what was actually still open (42% of the original size)
+        self.assertAlmostEqual(risk.state.realized_pnl_sol, _net_pnl_sol(0.05 * 0.42, -30.0), places=6)
+
+    def test_trailing_stop_protects_the_remainder_once_ladder_is_exhausted(self):
+        tracker, risk = self._make_tracker(
+            dry_run=True, entry_ref=100.0, trade_size_sol=0.05,
+            remaining_fraction=0.42, triggered_ladder_levels=[2, 5],
+            peak_ref=500.0, trailing_activation_pct=20.0, trailing_stop_pct=15.0,
+        )
+        risk.state.open_exposure_sol = 0.05 * 0.42
+
+        # peak was 500 (+400%, past the 20% activation), now down to 400
+        # (-20% from peak, past the 15% trailing stop)
+        asyncio.run(tracker._handle_price_update("MINT", 400.0))
+
+        self.assertNotIn("MINT", tracker._pending)
+        self.assertIn("MINT", tracker._post_exit)
+        self.assertEqual(tracker._post_exit["MINT"]["reason"], "trailing_stop")
+        self.assertAlmostEqual(risk.state.open_exposure_sol, 0.0, places=6)
+
+    def test_no_trailing_stop_before_every_rung_has_triggered(self):
+        # only the first rung has fired - a drawdown that WOULD trip the
+        # trailing stop must not close the position early, since the ladder
+        # itself hasn't finished yet
+        tracker, risk = self._make_tracker(
+            dry_run=True, entry_ref=100.0, trade_size_sol=0.05,
+            remaining_fraction=0.7, triggered_ladder_levels=[2],
+            peak_ref=250.0, trailing_activation_pct=20.0, trailing_stop_pct=15.0,
+        )
+
+        asyncio.run(tracker._handle_price_update("MINT", 200.0))  # -20% from peak, still above 2x
+
+        self.assertIn("MINT", tracker._pending)  # still open - no trailing stop yet
+
+    def test_live_rung_sell_calls_client_with_current_value_of_the_slice(self):
+        client = FakeClient(should_fail=False, signature="ladder_sig")
+        tracker, risk = self._make_tracker(client=client, dry_run=False, entry_ref=100.0, trade_size_sol=0.05)
+
+        asyncio.run(tracker._handle_price_update("MINT", 200.0))  # 2x -> first rung (30%)
+
+        self.assertEqual(len(client.sell_calls), 1)
+        mint, slippage_pct, action, amount_sol = client.sell_calls[0]
+        self.assertEqual(mint, "MINT")
+        self.assertEqual(action, "sell")
+        # slice cost basis 0.015 SOL, now worth 2x that in current terms
+        self.assertAlmostEqual(amount_sol, 0.015 * 2, places=6)
+        self.assertIn("MINT", tracker._pending)
+        self.assertAlmostEqual(tracker._pending["MINT"]["remaining_fraction"], 0.7, places=6)
+
+    def test_failed_live_rung_sell_leaves_remaining_fraction_untouched(self):
+        client = FakeClient(should_fail=True)
+        tracker, risk = self._make_tracker(client=client, dry_run=False, entry_ref=100.0, trade_size_sol=0.05)
+
+        asyncio.run(tracker._handle_price_update("MINT", 200.0))
+
+        self.assertEqual(len(client.sell_calls), 1)
+        self.assertIn("MINT", tracker._pending)
+        self.assertEqual(tracker._pending["MINT"]["remaining_fraction"], 1.0)
+        self.assertEqual(tracker._pending["MINT"]["triggered_ladder_levels"], [])
+        self.assertAlmostEqual(risk.state.open_exposure_sol, 0.05, places=6)  # nothing released
+
+    def test_a_rung_that_would_leave_only_dust_closes_the_position_outright(self):
+        # a final rung with sell_pct=100 (or one that empties out the last
+        # sliver) shouldn't leave a meaningless <=1% remainder open forever
+        tracker, risk = self._make_tracker(
+            dry_run=True, entry_ref=100.0, trade_size_sol=0.05,
+            remaining_fraction=0.42, triggered_ladder_levels=[2, 5],
+        )
+        tracker._pending["MINT"]["take_profit_ladder"] = [
+            {"multiplier": 2, "sell_pct": 30}, {"multiplier": 5, "sell_pct": 40},
+            {"multiplier": 10, "sell_pct": 100},
+        ]
+        risk.state.open_exposure_sol = 0.05 * 0.42
+
+        asyncio.run(tracker._handle_price_update("MINT", 1000.0))  # 10x -> final rung, 100% of what's left
+
+        self.assertNotIn("MINT", tracker._pending)
+        self.assertIn("MINT", tracker._post_exit)
+        self.assertAlmostEqual(risk.state.open_exposure_sol, 0.0, places=6)
+
+    def test_partial_exit_appends_a_partial_jsonl_record(self):
+        import pumpfun_bot.outcome_tracker as outcome_tracker_module
+
+        tracker, risk = self._make_tracker(dry_run=True, entry_ref=100.0, trade_size_sol=0.05)
+
+        captured = []
+        original_append = outcome_tracker_module.append_jsonl
+        outcome_tracker_module.append_jsonl = captured.append
+        try:
+            asyncio.run(tracker._handle_price_update("MINT", 200.0))
+        finally:
+            outcome_tracker_module.append_jsonl = original_append
+
+        exits = [r for r in captured if r["type"] == "exit"]
+        self.assertEqual(len(exits), 1)
+        record = exits[0]
+        self.assertTrue(record["partial"])
+        self.assertEqual(record["ladder_level_multiplier"], 2)
+        self.assertAlmostEqual(record["remaining_fraction_after"], 0.7, places=6)
+        self.assertEqual(record["reason"], "take_profit_ladder")
 
 
 if __name__ == "__main__":

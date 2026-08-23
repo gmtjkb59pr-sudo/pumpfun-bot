@@ -51,6 +51,7 @@ class FakeAlerter:
 def _make_strategy(
     client, *, dry_run=True, outcome_tracker=None, min_holder_count=0,
     max_top10_concentration_pct=0, max_market_cap_usd=20_000_000, api_key="fake-key",
+    take_profit_ladder=(),
 ):
     risk = RiskManager(RiskConfig())
     strategy = BirdeyeMoversStrategy(
@@ -58,7 +59,7 @@ def _make_strategy(
         cfg=BirdeyeMoversConfig(
             enabled=True, api_key=api_key, poll_interval_sec=2700, trending_limit=20,
             min_holder_count=min_holder_count, max_top10_concentration_pct=max_top10_concentration_pct,
-            max_market_cap_usd=max_market_cap_usd,
+            max_market_cap_usd=max_market_cap_usd, take_profit_ladder=list(take_profit_ladder),
         ),
         risk=risk,
         alerter=FakeAlerter(),
@@ -217,6 +218,29 @@ class ConsiderTests(unittest.TestCase):
             asyncio.run(strategy._consider(_token()))
 
         self.assertEqual(outcome_tracker._pending["MINTpump"]["price_source"], "usd")
+
+    def test_dry_run_buy_passes_take_profit_ladder_through_to_the_tracker(self):
+        from pumpfun_bot.config import TakeProfitLevel
+
+        store_file = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
+        store_file.close()
+        store_path = Path(store_file.name)
+        self.addCleanup(lambda: store_path.unlink(missing_ok=True))
+
+        client = FakeClient()
+        outcome_tracker = OutcomeTracker(ws_url="wss://example.invalid", position_store_path=store_path)
+        strategy, risk = _make_strategy(
+            client, dry_run=True, outcome_tracker=outcome_tracker,
+            take_profit_ladder=[TakeProfitLevel(multiplier=2, sell_pct=30)],
+        )
+
+        with _DEFAULT_HOLDER_PATCH, _DEFAULT_CONCENTRATION_PATCH:
+            asyncio.run(strategy._consider(_token()))
+
+        self.assertEqual(
+            outcome_tracker._pending["MINTpump"]["take_profit_ladder"],
+            [{"multiplier": 2, "sell_pct": 30}],
+        )
 
     def test_live_buy_sends_a_real_trade(self):
         client = FakeClient()

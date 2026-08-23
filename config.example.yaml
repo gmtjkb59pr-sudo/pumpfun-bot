@@ -50,6 +50,18 @@ strategies:
     stop_loss_pct: 25
     trailing_activation_pct: 20  # arm the trailing stop once up this much from entry
     trailing_stop_pct: 15        # exit if price falls this much from its peak since entry
+    # user-requested: scaled take-profit ladder - at each multiplier, sell
+    # sell_pct% of whatever's LEFT of the position (not the original size).
+    # Leave empty (default) to keep the single-shot take_profit_pct above.
+    # Once every rung has fired, trailing_stop_pct protects the remainder.
+    # Supported on sniper, social_watch, birdeye_movers, coingecko_movers.
+    # take_profit_ladder:
+    #   - multiplier: 2
+    #     sell_pct: 30
+    #   - multiplier: 5
+    #     sell_pct: 40
+    #   - multiplier: 10
+    #     sell_pct: 50
 
   social_watch:
     # Wacht op socials in plaats van direct te kopen bij launch (zoals
