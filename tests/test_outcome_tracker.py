@@ -13,6 +13,7 @@ from pumpfun_bot.fees import ROUND_TRIP_PRIORITY_FEE_SOL, net_pct_change_after_f
 from pumpfun_bot.outcome_tracker import (
     CHECKPOINTS_SEC,
     MAX_CONSECUTIVE_SELL_FAILURES,
+    MAX_HOLD_SEC,
     MIN_SELL_DELAY_SEC,
     STALE_PRICE_TIMEOUT_SEC,
     OutcomeTracker,
@@ -1821,6 +1822,101 @@ class StalePriceExitTests(unittest.TestCase):
         self.assertEqual(client.sell_calls, [("MINT", tracker.sell_slippage_pct, 100)])
         self.assertNotIn("MINT", tracker._pending)
         self.assertAlmostEqual(risk.state.realized_pnl_sol, -ROUND_TRIP_PRIORITY_FEE_SOL)
+
+
+class PerPositionHoldTimeoutOverrideTests(unittest.TestCase):
+    """User-requested for a moonshot-style strategy meant to hold a
+    position for potentially days/weeks - the shared MAX_HOLD_SEC (15 min)
+    and STALE_PRICE_TIMEOUT_SEC (10s!) constants would force-exit a
+    genuinely healthy long-hold position at the first natural trading lull.
+    track()'s max_hold_sec/stale_price_timeout_sec let one position opt
+    into much longer values without affecting any other tracked position."""
+
+    def test_a_position_past_the_shared_stale_timeout_survives_with_a_longer_override(self):
+        risk = RiskManager(RiskConfig())
+        risk.register_trade_opened(0.02)
+        tracker = OutcomeTracker(ws_url="wss://example.invalid", risk=risk, dry_run=True)
+        tracker._pending["MINT"] = {
+            "entry_ts": time.time() - STALE_PRICE_TIMEOUT_SEC - 1,
+            "entry_ref": 100.0,
+            "last_ref": 112.0,
+            "name": "Test Token",
+            "symbol": "TEST",
+            "trade_size_sol": 0.02,
+            "hit": set(),
+            "has_real_update": True,
+            "last_update_ts": time.time() - STALE_PRICE_TIMEOUT_SEC - 1,
+            "stale_price_timeout_sec": 3600,  # 1 hour - well past the default 10s
+        }
+        asyncio.run(tracker._emit_due_checkpoints())
+
+        self.assertIn("MINT", tracker._pending)  # NOT exited - the override still has hours left
+        self.assertAlmostEqual(risk.state.realized_pnl_sol, 0.0)
+
+    def test_a_position_still_exits_once_its_own_longer_stale_timeout_is_reached(self):
+        risk = RiskManager(RiskConfig())
+        risk.register_trade_opened(0.02)
+        tracker = OutcomeTracker(ws_url="wss://example.invalid", risk=risk, dry_run=True)
+        tracker._pending["MINT"] = {
+            "entry_ts": time.time() - 3601,
+            "entry_ref": 100.0,
+            "last_ref": 112.0,
+            "name": "Test Token",
+            "symbol": "TEST",
+            "trade_size_sol": 0.02,
+            "hit": set(),
+            "has_real_update": True,
+            "last_update_ts": time.time() - 3601,
+            "stale_price_timeout_sec": 3600,
+        }
+        asyncio.run(tracker._emit_due_checkpoints())
+
+        self.assertNotIn("MINT", tracker._pending)  # its own longer timeout has now elapsed
+        self.assertAlmostEqual(risk.state.realized_pnl_sol, _net_pnl_sol(0.02, 12.0), places=4)
+
+    def test_a_position_past_the_shared_max_hold_survives_with_a_longer_override(self):
+        risk = RiskManager(RiskConfig())
+        risk.register_trade_opened(0.02)
+        tracker = OutcomeTracker(ws_url="wss://example.invalid", risk=risk, dry_run=True)
+        tracker._pending["MINT"] = {
+            "entry_ts": time.time() - MAX_HOLD_SEC - 1,
+            "entry_ref": 100.0,
+            "last_ref": 112.0,
+            "name": "Test Token",
+            "symbol": "TEST",
+            "trade_size_sol": 0.02,
+            "hit": set(),
+            "has_real_update": True,
+            # frequent real ticks keep it well under its own stale timeout too
+            "last_update_ts": time.time(),
+            "stale_price_timeout_sec": 86400,
+            "max_hold_sec": 2592000,  # 30 days
+        }
+        asyncio.run(tracker._emit_due_checkpoints())
+
+        self.assertIn("MINT", tracker._pending)  # well past the shared 15-min default, still open
+        self.assertAlmostEqual(risk.state.realized_pnl_sol, 0.0)
+
+    def test_no_override_still_uses_the_shared_constants(self):
+        # backward compat: every existing strategy's positions (no override
+        # keys at all) must behave exactly as before this change
+        risk = RiskManager(RiskConfig())
+        risk.register_trade_opened(0.05)
+        tracker = OutcomeTracker(ws_url="wss://example.invalid", risk=risk, dry_run=True)
+        tracker._pending["MINT"] = {
+            "entry_ts": time.time() - MAX_HOLD_SEC - 1,
+            "entry_ref": 100.0,
+            "last_ref": 112.0,
+            "name": "Test Token",
+            "symbol": "TEST",
+            "trade_size_sol": 0.05,
+            "hit": set(),
+            "has_real_update": True,
+            "last_update_ts": time.time(),
+        }
+        asyncio.run(tracker._emit_due_checkpoints())
+
+        self.assertNotIn("MINT", tracker._pending)  # shared MAX_HOLD_SEC still applies
 
 
 class LoadConfirmedUnsellableMintsTests(unittest.TestCase):
