@@ -119,19 +119,25 @@ class BirdeyeMoversConfig:
     # 0 = no filter, same convention as social_watch's equivalents
     min_holder_count: int = 0
     max_top10_concentration_pct: float = 0
-    # confirmed live TWICE: two real candidates (both up 170-740% over 24h,
-    # market caps in the tens of millions) both failed to buy with a 400
-    # from PumpPortal's trade-local endpoint - they'd already migrated off
-    # pump.fun's bonding curve to a real DEX (Raydium), which happens
-    # automatically once a token's bonding curve graduates at roughly
-    # $69,000 market cap. Above that, this bot literally cannot buy the
-    # token through this pipeline at all, no matter how good the momentum
-    # looks - every candidate above the ceiling was pure wasted evaluation.
-    # Lowered from 20,000,000 (which only ever excluded actual blue chips
-    # like SOL/PUMP/wrapped ETH, nowhere near tight enough) to 100,000 - a
-    # safety margin above the real ~$69k graduation point, not just "below
-    # major-token scale".
-    max_market_cap_usd: float = 100_000
+    # SUPERSEDED, see is_pump_fun_mint() in birdeye_movers.py and
+    # build_and_send_trade's pool="auto" default in pumpportal_client.py.
+    # Originally lowered to 100,000 after two real candidates failed to buy
+    # with a 400 - traced at the time to "migrated past the ~$69k bonding-
+    # curve graduation point, pool='pump' has no route for it anymore".
+    # Later disproven for genuine pump.fun tokens: confirmed live that a
+    # real pump.fun-suffixed mint at ~$260M market cap builds a valid
+    # transaction fine via pool="auto" (fails only under the old hardcoded
+    # pool="pump"). The ACTUAL cause of those two original failures was
+    # that neither mint was a real pump.fun token at all (Birdeye's
+    # trending list is Solana-wide) - now caught by is_pump_fun_mint()
+    # before this check ever runs. A blue-chip "category error" (SOL, PUMP,
+    # wrapped ETH) is also already excluded there, since none of those end
+    # in "pump". With both original justifications gone, market cap no
+    # longer predicts buyability - 0 (disabled) by default. Set a positive
+    # value here only if you want to deliberately avoid chasing tokens that
+    # already pumped a lot (a "how far did it already run" filter, not a
+    # "can we even buy this" one - those are different questions).
+    max_market_cap_usd: float = 0
     take_profit_pct: float = 50
     stop_loss_pct: float = 25
     trailing_activation_pct: float = 20
@@ -175,8 +181,9 @@ class CoinGeckoMoversConfig:
     momentum_window: str = "m5"
     min_holder_count: int = 0
     max_top10_concentration_pct: float = 0
-    # same bonding-curve-graduation-margin reasoning as BirdeyeMoversConfig
-    max_market_cap_usd: float = 100_000
+    # SUPERSEDED - see BirdeyeMoversConfig.max_market_cap_usd's docstring
+    # for the full reasoning. 0 (disabled) by default.
+    max_market_cap_usd: float = 0
     take_profit_pct: float = 50
     stop_loss_pct: float = 25
     trailing_activation_pct: float = 20
@@ -309,7 +316,7 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         trending_limit=be_raw.get("trending_limit", 20),
         min_holder_count=be_raw.get("min_holder_count", 0),
         max_top10_concentration_pct=be_raw.get("max_top10_concentration_pct", 0),
-        max_market_cap_usd=be_raw.get("max_market_cap_usd", 100_000),
+        max_market_cap_usd=be_raw.get("max_market_cap_usd", 0),
         max_open_positions=be_raw.get("max_open_positions", 5),
         trade_size_sol=be_raw.get("trade_size_sol", 0.0),
         take_profit_pct=be_raw.get("take_profit_pct", 50),
@@ -328,7 +335,7 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         momentum_window=cg_raw.get("momentum_window", "m5"),
         min_holder_count=cg_raw.get("min_holder_count", 0),
         max_top10_concentration_pct=cg_raw.get("max_top10_concentration_pct", 0),
-        max_market_cap_usd=cg_raw.get("max_market_cap_usd", 100_000),
+        max_market_cap_usd=cg_raw.get("max_market_cap_usd", 0),
         max_open_positions=cg_raw.get("max_open_positions", 5),
         trade_size_sol=cg_raw.get("trade_size_sol", 0.0),
         take_profit_pct=cg_raw.get("take_profit_pct", 50),

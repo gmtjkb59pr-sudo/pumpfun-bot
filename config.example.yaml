@@ -103,11 +103,12 @@ strategies:
     max_top10_concentration_pct: 90
     # user-requested: eigen positie-budget, zie social_watch hierboven
     max_open_positions: 5
-    # bevestigd live: kandidaten ruim boven pump.fun's echte bonding-curve
-    # graduatie-cap (~$69k) falen om te kopen (400 Bad Request - al
-    # gemigreerd naar een echte DEX). Zie BirdeyeMoversConfig's docstring
-    # in config.py voor de volledige onderbouwing.
-    max_market_cap_usd: 100000
+    # ACHTERHAALD, uitgeschakeld (0) - bevestigd live dat een echte pump.fun-
+    # mint (~$260M market cap) prima een geldige transactie bouwt via
+    # PumpPortal's pool="auto" (nu de standaard). Market cap voorspelt niet
+    # meer of iets koopbaar is - zie BirdeyeMoversConfig's docstring in
+    # config.py voor de volledige onderbouwing.
+    max_market_cap_usd: 0
     # eigen trade-grootte, los van de gedeelde risk.max_sol_per_trade - 0 = gebruik die gedeelde waarde
     trade_size_sol: 0
 
@@ -132,7 +133,8 @@ strategies:
     momentum_window: "m5"
     min_holder_count: 1
     max_top10_concentration_pct: 90
-    max_market_cap_usd: 100000
+    # ACHTERHAALD, uitgeschakeld (0) - zie birdeye_movers' commentaar hierboven
+    max_market_cap_usd: 0
     take_profit_pct: 50
     stop_loss_pct: 25
     trailing_activation_pct: 20
