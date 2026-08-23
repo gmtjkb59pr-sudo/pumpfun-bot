@@ -179,6 +179,34 @@ def _make_strategy(
     return strategy, risk
 
 
+class TradeSizeAboveSharedRiskCapTests(unittest.TestCase):
+    """trade_size_sol can be configured ABOVE the shared risk.max_sol_per_
+    trade (see main.py's `cfg.social_watch.trade_size_sol or
+    cfg.risk.max_sol_per_trade` wiring) - the risk manager must check
+    against this strategy's OWN trade size, not silently reject every
+    trade above some unrelated shared default."""
+
+    def test_buy_above_the_shared_cap_is_not_blocked_by_the_risk_manager(self):
+        client = FakeClient(trade_events=[{"marketCapSol": 30.0}])
+        risk = RiskManager(RiskConfig(max_sol_per_trade=0.015))
+        strategy = SocialWatchStrategy(
+            client=client,
+            cfg=SocialWatchConfig(enabled=True, watch_window_sec=60, poll_interval_sec=10),
+            risk=risk,
+            alerter=FakeAlerter(),
+            trade_size_sol=0.053,  # deliberately above risk.max_sol_per_trade
+            slippage_pct=10,
+            dry_run=False,
+            fresh_ref_timeout_sec=0.05,
+        )
+        asyncio.run(strategy._buy("MINT", {
+            "mint": "MINT", "name": "Test", "symbol": "TEST", "vSolInBondingCurve": 30.0,
+        }, time.time()))
+
+        self.assertEqual(len(client.buy_calls), 1)
+        self.assertAlmostEqual(risk.state.open_exposure_sol, 0.053)
+
+
 class SharedTrackerCollisionTests(unittest.TestCase):
     """If a mint is already held (e.g. by sniper), social_watch must not
     also buy it - OutcomeTracker is shared and keyed by mint alone, so a

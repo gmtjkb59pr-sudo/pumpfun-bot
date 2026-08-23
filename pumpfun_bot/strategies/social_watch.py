@@ -177,6 +177,7 @@ class SocialWatchStrategy:
         ok, reason = self.risk.can_trade(
             self.trade_size_sol, liquidity_sol, open_positions_count=open_positions_count,
             max_open_positions_override=self.cfg.max_open_positions,
+            max_sol_per_trade_override=self.trade_size_sol,
         )
         if not ok:
             logger.info("Social-watch: trade geblokkeerd door risk manager: %s", reason)

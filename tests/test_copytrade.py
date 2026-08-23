@@ -106,6 +106,28 @@ class CopyTradeSellGatingTests(unittest.TestCase):
         mock_state.log_trade.assert_not_called()
 
 
+class CopyTradeRiskOverrideTests(unittest.TestCase):
+    def test_passes_its_own_max_trade_sol_as_the_risk_override(self):
+        client = FakeClient([_event("buy", "M1", sol=5.0)])
+        cfg = CopyTradeConfig(enabled=True, watched_wallets=["W1"], mirror_pct=100, max_copy_delay_ms=3000)
+        risk = MagicMock()
+        risk.can_trade.return_value = (True, "")
+        alerter = MagicMock()
+        alerter.send = AsyncMock()
+        # max_trade_sol (0.032) is deliberately ABOVE what max_sol_per_trade
+        # would allow elsewhere - the whole point of this override is that
+        # the risk manager must check against copytrade's OWN cap, not
+        # silently reject every trade above some unrelated shared value
+        strategy = CopyTradeStrategy(
+            client=client, cfg=cfg, risk=risk, alerter=alerter,
+            max_trade_sol=0.032, slippage_pct=5, dry_run=True,
+        )
+        with patch("pumpfun_bot.strategies.copytrade.bot_state"):
+            asyncio.run(strategy.run())
+        _, kwargs = risk.can_trade.call_args
+        self.assertEqual(kwargs.get("max_sol_per_trade_override"), 0.032)
+
+
 class CopyTradeBuyDedupTests(unittest.TestCase):
     def test_a_second_buy_signal_for_an_already_held_mint_is_ignored(self):
         strategy, client, risk = _make_strategy([

@@ -77,6 +77,8 @@ strategies:
     # risk.max_open_positions pool - alleen live gehandhaafd, dry_run slaat
     # deze check helemaal over om zoveel mogelijk outcome-data te farmen.
     max_open_positions: 5
+    # eigen trade-grootte, los van de gedeelde risk.max_sol_per_trade - 0 = gebruik die gedeelde waarde
+    trade_size_sol: 0
 
   birdeye_movers:
     # Ontdekt al bestaande tokens met een echte volume/prijs-spike via
@@ -108,6 +110,8 @@ strategies:
     # deze standaard AAN, ruim boven echte memecoin market caps en ruim
     # onder die van elke major token.
     max_market_cap_usd: 20000000
+    # eigen trade-grootte, los van de gedeelde risk.max_sol_per_trade - 0 = gebruik die gedeelde waarde
+    trade_size_sol: 0
 
   copytrade:
     enabled: false

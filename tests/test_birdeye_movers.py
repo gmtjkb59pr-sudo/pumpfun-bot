@@ -131,7 +131,12 @@ class ConsiderTests(unittest.TestCase):
     def test_skips_when_risk_manager_blocks(self):
         client = FakeClient()
         strategy, risk = _make_strategy(client, dry_run=False)
-        risk.cfg.max_sol_per_trade = 0.001  # below the strategy's own 0.03 trade size
+        # max_sol_total_exposure, not max_sol_per_trade - the strategy now
+        # passes its own trade_size_sol as a max_sol_per_trade_override (see
+        # TradeSizeAboveSharedRiskCapTests below), so a low shared
+        # max_sol_per_trade alone no longer blocks anything here. Exposure
+        # stays a real, unoverridden shared wallet-wide budget.
+        risk.cfg.max_sol_total_exposure = 0.001
 
         with _DEFAULT_HOLDER_PATCH, _DEFAULT_CONCENTRATION_PATCH:
             asyncio.run(strategy._consider(_token()))
@@ -197,6 +202,26 @@ class ConsiderTests(unittest.TestCase):
         asyncio.run(strategy._consider(_token(address=None)))  # must not raise
 
         self.assertEqual(client.buy_calls, [])
+
+
+class TradeSizeAboveSharedRiskCapTests(unittest.TestCase):
+    """trade_size_sol can be configured ABOVE the shared risk.max_sol_per_
+    trade (see main.py's `cfg.birdeye_movers.trade_size_sol or
+    cfg.risk.max_sol_per_trade` wiring) - the risk manager must check
+    against this strategy's OWN trade size, not silently reject every
+    trade above some unrelated shared default."""
+
+    def test_buy_above_the_shared_cap_is_not_blocked_by_the_risk_manager(self):
+        client = FakeClient()
+        strategy, risk = _make_strategy(client, dry_run=False)
+        strategy.trade_size_sol = 0.053  # deliberately above the shared cap
+        risk.cfg.max_sol_per_trade = 0.015
+
+        with _DEFAULT_HOLDER_PATCH, _DEFAULT_CONCENTRATION_PATCH:
+            asyncio.run(strategy._consider(_token()))
+
+        self.assertEqual(len(client.buy_calls), 1)
+        self.assertAlmostEqual(risk.state.open_exposure_sol, 0.053)
 
 
 class MaxMarketCapGateTests(unittest.TestCase):
