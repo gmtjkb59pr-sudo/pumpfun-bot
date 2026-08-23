@@ -256,6 +256,25 @@ class MaxMarketCapGateTests(unittest.TestCase):
 
         self.assertEqual(client.buy_calls, [])
 
+    def test_default_ceiling_is_the_bonding_curve_graduation_margin_not_blue_chip_scale(self):
+        # confirmed live: candidates well above pump.fun's real ~$69k
+        # bonding-curve graduation cap fail to buy outright (already
+        # migrated to a real DEX) - the ceiling must stay near that
+        # graduation point, not just "below major-token scale" (the old
+        # 20,000,000 default let straight through everything that failed
+        # live tonight)
+        self.assertEqual(BirdeyeMoversConfig().max_market_cap_usd, 100_000)
+
+    def test_a_migrated_looking_candidate_is_now_rejected_by_default(self):
+        client = FakeClient()
+        strategy, risk = _make_strategy(
+            client, dry_run=False, max_market_cap_usd=BirdeyeMoversConfig().max_market_cap_usd,
+        )
+
+        asyncio.run(strategy._consider(_token(marketcap=18_000_000)))  # real observed candidate scale
+
+        self.assertEqual(client.buy_calls, [])
+
     def test_buys_regardless_of_market_cap_when_ceiling_is_disabled(self):
         client = FakeClient()
         strategy, risk = _make_strategy(client, dry_run=False, max_market_cap_usd=0)

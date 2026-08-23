@@ -119,14 +119,19 @@ class BirdeyeMoversConfig:
     # 0 = no filter, same convention as social_watch's equivalents
     min_holder_count: int = 0
     max_top10_concentration_pct: float = 0
-    # confirmed live: Birdeye's trending list (sorted by volumeUSD) surfaces
-    # major/blue-chip tokens like SOL, wrapped ETH, and PUMP itself, not
-    # just memecoins - "buying" SOL through a pump.fun-style trade is a
-    # category error (SOL is the base currency, not a bonding-curve token),
-    # so unlike the 0-disables-it filters above, this one defaults ON at a
-    # level clearly above real memecoin market caps and clearly below any
-    # major token's.
-    max_market_cap_usd: float = 20_000_000
+    # confirmed live TWICE: two real candidates (both up 170-740% over 24h,
+    # market caps in the tens of millions) both failed to buy with a 400
+    # from PumpPortal's trade-local endpoint - they'd already migrated off
+    # pump.fun's bonding curve to a real DEX (Raydium), which happens
+    # automatically once a token's bonding curve graduates at roughly
+    # $69,000 market cap. Above that, this bot literally cannot buy the
+    # token through this pipeline at all, no matter how good the momentum
+    # looks - every candidate above the ceiling was pure wasted evaluation.
+    # Lowered from 20,000,000 (which only ever excluded actual blue chips
+    # like SOL/PUMP/wrapped ETH, nowhere near tight enough) to 100,000 - a
+    # safety margin above the real ~$69k graduation point, not just "below
+    # major-token scale".
+    max_market_cap_usd: float = 100_000
     take_profit_pct: float = 50
     stop_loss_pct: float = 25
     trailing_activation_pct: float = 20
