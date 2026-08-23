@@ -1160,6 +1160,80 @@ class LiquidationDispatchTests(unittest.TestCase):
         asyncio.run(_drive())
 
 
+class UntrackedHoldingsAlertSuppressionTests(unittest.TestCase):
+    """User-requested: the "N token(s) worden niet gevolgd" warning kept
+    re-firing every reconciliation cycle for the SAME mints, forever, once
+    they were already confirmed unsellable (paused) - nothing new to act
+    on, just noise. Only alert when at least one untracked mint hasn't
+    already been confirmed paused. The liquidation sweep itself still runs
+    either way (cheap no-op for already-paused mints) - only the alert is
+    suppressed."""
+
+    class _FakeAlerter:
+        def __init__(self):
+            self.messages = []
+
+        async def send(self, message):
+            self.messages.append(message)
+
+    def _make_tracker(self, *, client=None):
+        return OutcomeTracker(
+            ws_url="wss://example.invalid", client=client, dry_run=False, alerter=self._FakeAlerter(),
+        )
+
+    def test_no_alert_when_every_untracked_mint_is_already_paused(self):
+        client = FakeClient()
+        tracker = self._make_tracker(client=client)
+        tracker._untracked_liquidation["MINT"] = {
+            "consecutive_failures": 2, "last_attempt_ts": 0.0, "paused": True,
+        }
+
+        async def _fake_fetch(wallet_pubkey, rpc_http_url):
+            return {"MINT"}
+
+        async def _drive():
+            with patch("pumpfun_bot.outcome_tracker.fetch_wallet_token_mints", _fake_fetch):
+                await tracker._reconcile_with_wallet()
+
+        asyncio.run(_drive())
+        self.assertEqual(tracker.alerter.messages, [])
+
+    def test_alerts_when_an_untracked_mint_is_not_yet_paused(self):
+        client = FakeClient()
+        tracker = self._make_tracker(client=client)
+
+        async def _fake_fetch(wallet_pubkey, rpc_http_url):
+            return {"MINT"}
+
+        async def _drive():
+            with patch("pumpfun_bot.outcome_tracker.fetch_wallet_token_mints", _fake_fetch):
+                await tracker._reconcile_with_wallet()
+
+        asyncio.run(_drive())
+        self.assertTrue(any("worden niet gevolgd" in m for m in tracker.alerter.messages))
+
+    def test_sweep_still_dispatches_even_when_the_alert_is_suppressed(self):
+        client = FakeClient()
+        tracker = self._make_tracker(client=client)
+        tracker._untracked_liquidation["MINT"] = {
+            "consecutive_failures": 2, "last_attempt_ts": 0.0, "paused": True,
+        }
+
+        async def _fake_fetch(wallet_pubkey, rpc_http_url):
+            return {"MINT"}
+
+        async def _drive():
+            with patch("pumpfun_bot.outcome_tracker.fetch_wallet_token_mints", _fake_fetch):
+                await tracker._reconcile_with_wallet()
+                self.assertIsNotNone(tracker._liquidation_task)
+                await asyncio.wait_for(tracker._liquidation_task, timeout=1.0)
+            # paused mint was never actually re-attempted - the sweep is a
+            # cheap no-op for it, this just confirms dispatch didn't crash
+            self.assertEqual(client.sell_calls, [])
+
+        asyncio.run(_drive())
+
+
 class LiquidateUntrackedHoldingsTests(unittest.TestCase):
     """Untracked wallet holdings (leftovers from earlier sessions/bugs, no
     known entry price) are never auto-adopted as real positions - see

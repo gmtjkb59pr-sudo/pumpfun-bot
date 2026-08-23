@@ -702,13 +702,23 @@ class OutcomeTracker:
             append_jsonl({"type": "sell_paused", "ts": time.time(), "mint": mint})
 
         if untracked:
-            message = (
-                f"⚠️ {len(untracked)} token(s) in de wallet worden niet gevolgd - "
-                f"probeer automatisch te liquideren: {', '.join(sorted(untracked))}"
-            )
-            logger.warning(message)
-            if self.alerter is not None:
-                await self.alerter.send(message)
+            # user-requested: don't keep re-alerting about the SAME mints
+            # every reconciliation cycle once they're already confirmed
+            # unsellable (paused) - nothing new to act on, just noise. Only
+            # surface this when at least one untracked mint is actually
+            # still worth a real attempt.
+            worth_alerting = {
+                m for m in untracked
+                if not self._untracked_liquidation.get(m, {}).get("paused")
+            }
+            if worth_alerting:
+                message = (
+                    f"⚠️ {len(worth_alerting)} token(s) in de wallet worden niet gevolgd - "
+                    f"probeer automatisch te liquideren: {', '.join(sorted(worth_alerting))}"
+                )
+                logger.warning(message)
+                if self.alerter is not None:
+                    await self.alerter.send(message)
             # fired off as a background task, NEVER awaited inline here -
             # confirmed live: awaiting this directly blocked the entire
             # housekeeping loop (checkpoints, stale-price detection,
