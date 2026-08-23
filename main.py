@@ -36,6 +36,7 @@ from pumpfun_bot.risk import RiskManager
 from pumpfun_bot.scaled_exit_simulator import ScaledExitSimulator
 from pumpfun_bot.state import bot_state
 from pumpfun_bot.strategies.birdeye_movers import BirdeyeMoversStrategy
+from pumpfun_bot.strategies.coingecko_movers import CoinGeckoMoversStrategy
 from pumpfun_bot.strategies.copytrade import CopyTradeStrategy
 from pumpfun_bot.strategies.market_maker import MarketMakerStrategy
 from pumpfun_bot.strategies.sniper import SniperStrategy
@@ -172,6 +173,21 @@ async def main() -> None:
         dry_run=cfg.risk.dry_run,
         outcome_tracker=outcome_tracker,
     )
+    # user-requested: same discovery niche as birdeye_movers, but via
+    # CoinGecko's free Demo API plan - much higher call budget lets this
+    # poll every few minutes instead of every 45 and react to a genuinely
+    # short momentum window (see coingecko_movers.py)
+    coingecko_movers = CoinGeckoMoversStrategy(
+        client=PumpPortalClient(cfg.pumpportal_ws_url, cfg.pumpportal_trade_api_url,
+                                 cfg.rpc_http_url, keypair, api_key=cfg.pumpportal_api_key),
+        cfg=cfg.coingecko_movers,
+        risk=risk,
+        alerter=alerter,
+        trade_size_sol=cfg.coingecko_movers.trade_size_sol or cfg.risk.max_sol_per_trade,
+        slippage_pct=cfg.risk.default_slippage_pct,
+        dry_run=cfg.risk.dry_run,
+        outcome_tracker=outcome_tracker,
+    )
     copytrade = CopyTradeStrategy(
         client=PumpPortalClient(cfg.pumpportal_ws_url, cfg.pumpportal_trade_api_url,
                                  cfg.rpc_http_url, keypair, api_key=cfg.pumpportal_api_key),
@@ -192,7 +208,10 @@ async def main() -> None:
         dry_run=cfg.risk.dry_run,
     )
 
-    enabled = [s.cfg.enabled for s in (sniper, social_watch, birdeye_movers, copytrade, market_maker)]
+    enabled = [
+        s.cfg.enabled for s in
+        (sniper, social_watch, birdeye_movers, coingecko_movers, copytrade, market_maker)
+    ]
     if not any(enabled):
         logger.warning(
             "Geen enkele strategie staat op enabled: true in config.yaml. "
@@ -207,6 +226,7 @@ async def main() -> None:
             "sniper": cfg.sniper.enabled,
             "social_watch": cfg.social_watch.enabled,
             "birdeye_movers": cfg.birdeye_movers.enabled,
+            "coingecko_movers": cfg.coingecko_movers.enabled,
             "copytrade": cfg.copytrade.enabled,
             "market_maker": cfg.market_maker.enabled,
         },
@@ -245,6 +265,7 @@ async def main() -> None:
         asyncio.create_task(sniper.run()),
         asyncio.create_task(social_watch.run()),
         asyncio.create_task(birdeye_movers.run()),
+        asyncio.create_task(coingecko_movers.run()),
         asyncio.create_task(copytrade.run()),
         asyncio.create_task(market_maker.run()),
         asyncio.create_task(outcome_tracker.run()),
