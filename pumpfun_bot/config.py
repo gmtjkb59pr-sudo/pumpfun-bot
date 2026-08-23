@@ -97,6 +97,10 @@ class SocialWatchConfig:
     # live mode - dry_run skips the open-positions check altogether so
     # every qualifying candidate can open a position for outcome data.
     max_open_positions: int = 5
+    # user-requested: this strategy's own trade-size cap, independent of the
+    # shared risk.max_sol_per_trade - 0 (default) falls back to that shared
+    # value, unchanged behavior for anyone who hasn't set this explicitly
+    trade_size_sol: float = 0.0
 
 
 @dataclass
@@ -135,6 +139,10 @@ class BirdeyeMoversConfig:
     # altogether so every qualifying candidate can open a position for
     # outcome data.
     max_open_positions: int = 5
+    # user-requested: this strategy's own trade-size cap, independent of the
+    # shared risk.max_sol_per_trade - 0 (default) falls back to that shared
+    # value, unchanged behavior for anyone who hasn't set this explicitly
+    trade_size_sol: float = 0.0
 
 
 @dataclass
@@ -248,6 +256,7 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         require_positive_momentum_5m=sw_raw.get("require_positive_momentum_5m", False),
         max_price_change_5m_pct=sw_raw.get("max_price_change_5m_pct", 0),
         max_open_positions=sw_raw.get("max_open_positions", 5),
+        trade_size_sol=sw_raw.get("trade_size_sol", 0.0),
     )
 
     be_raw = strat_raw.get("birdeye_movers", {})
@@ -261,6 +270,7 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         max_top10_concentration_pct=be_raw.get("max_top10_concentration_pct", 0),
         max_market_cap_usd=be_raw.get("max_market_cap_usd", 20_000_000),
         max_open_positions=be_raw.get("max_open_positions", 5),
+        trade_size_sol=be_raw.get("trade_size_sol", 0.0),
         take_profit_pct=be_raw.get("take_profit_pct", 50),
         stop_loss_pct=be_raw.get("stop_loss_pct", 25),
         trailing_activation_pct=be_raw.get("trailing_activation_pct", 20),

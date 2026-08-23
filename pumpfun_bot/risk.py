@@ -67,6 +67,7 @@ class RiskManager:
         self, sol_amount: float, liquidity_sol: float | None = None,
         open_positions_count: int | None = None,
         max_open_positions_override: int | None = None,
+        max_sol_per_trade_override: float | None = None,
     ) -> tuple[bool, str]:
         """Controleer of een voorgestelde trade toegestaan is. Geeft (ok, reden).
 
@@ -87,6 +88,15 @@ class RiskManager:
         when not given - exposure_sol/daily-loss limits stay global/shared
         on purpose, those are real wallet-wide budgets, not per-strategy.
 
+        max_sol_per_trade_override: user-requested per-strategy trade-size
+        cap (see CopyTradeConfig.trade_size_sol and the equivalent fields
+        on SocialWatchConfig/BirdeyeMoversConfig) - without this, a
+        strategy configured to trade LARGER than the shared
+        risk.max_sol_per_trade would have every one of its trades silently
+        rejected here regardless of its own config, since this check used
+        to only ever compare against the shared value. Falls back to
+        self.cfg.max_sol_per_trade when not given.
+
         In dry_run, the open-positions check is skipped entirely -
         user-requested: no real capital is at risk in dry-run, so cap
         nothing and let every qualifying candidate open a position to
@@ -96,10 +106,15 @@ class RiskManager:
         if sol_amount <= 0:
             return False, "Trade grootte moet positief zijn."
 
-        if sol_amount > self.cfg.max_sol_per_trade:
+        effective_max_sol_per_trade = (
+            max_sol_per_trade_override
+            if max_sol_per_trade_override is not None
+            else self.cfg.max_sol_per_trade
+        )
+        if sol_amount > effective_max_sol_per_trade:
             return False, (
                 f"Trade van {sol_amount} SOL overschrijdt max_sol_per_trade "
-                f"({self.cfg.max_sol_per_trade})."
+                f"({effective_max_sol_per_trade})."
             )
 
         if self.state.open_exposure_sol + sol_amount > self.cfg.max_sol_total_exposure:

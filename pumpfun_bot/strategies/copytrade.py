@@ -85,7 +85,9 @@ class CopyTradeStrategy:
                 continue
 
             liquidity_sol = event.get("vSolInBondingCurve")
-            ok, reason = self.risk.can_trade(my_amount, liquidity_sol)
+            ok, reason = self.risk.can_trade(
+                my_amount, liquidity_sol, max_sol_per_trade_override=self.max_trade_sol,
+            )
             if not ok:
                 logger.info("Copy-trade geblokkeerd door risk manager: %s", reason)
                 continue

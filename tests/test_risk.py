@@ -49,6 +49,24 @@ class RiskManagerCanTradeTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("max_sol_per_trade", reason)
 
+    def test_max_sol_per_trade_override_allows_a_trade_above_the_shared_cap(self):
+        risk = make_manager(max_sol_per_trade=0.015)
+        ok, reason = risk.can_trade(0.05, max_sol_per_trade_override=0.1)
+        self.assertTrue(ok)
+        self.assertEqual(reason, "ok")
+
+    def test_max_sol_per_trade_override_still_rejects_above_its_own_value(self):
+        risk = make_manager(max_sol_per_trade=0.015)
+        ok, reason = risk.can_trade(0.11, max_sol_per_trade_override=0.1)
+        self.assertFalse(ok)
+        self.assertIn("max_sol_per_trade", reason)
+
+    def test_no_override_falls_back_to_the_shared_max_sol_per_trade(self):
+        risk = make_manager(max_sol_per_trade=0.05)
+        ok, reason = risk.can_trade(0.06, max_sol_per_trade_override=None)
+        self.assertFalse(ok)
+        self.assertIn("max_sol_per_trade", reason)
+
     def test_rejects_trade_that_exceeds_total_exposure(self):
         risk = make_manager(max_sol_total_exposure=0.1)
         risk.register_trade_opened(0.08)

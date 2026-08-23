@@ -116,6 +116,7 @@ class BirdeyeMoversStrategy:
         ok, reason = self.risk.can_trade(
             self.trade_size_sol, None, open_positions_count=open_positions_count,
             max_open_positions_override=self.cfg.max_open_positions,
+            max_sol_per_trade_override=self.trade_size_sol,
         )
         if not ok:
             logger.info("Birdeye-movers: trade geblokkeerd door risk manager: %s", reason)
