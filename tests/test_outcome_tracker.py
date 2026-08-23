@@ -1215,6 +1215,36 @@ class LiquidateUntrackedHoldingsTests(unittest.TestCase):
 
         self.assertEqual(len(client.sell_calls), calls_before)  # paused, no further attempts
 
+    def test_falls_back_to_99_percent_before_pausing(self):
+        # user-requested: same fallback as _exit()'s tracked-position path -
+        # untracked holdings hit the identical real Custom 6024 failure mode
+        from pumpfun_bot.outcome_tracker import MAX_CONSECUTIVE_SELL_FAILURES
+
+        client = FakeClient(fail_at_amount_pcts={100})
+        tracker = OutcomeTracker(ws_url="wss://example.invalid", client=client, dry_run=False)
+
+        for _ in range(MAX_CONSECUTIVE_SELL_FAILURES):
+            asyncio.run(tracker._liquidate_untracked_holdings({"UNTRACKED_MINT"}))
+            if "UNTRACKED_MINT" in tracker._untracked_liquidation:
+                tracker._untracked_liquidation["UNTRACKED_MINT"]["last_attempt_ts"] = 0  # bypass cooldown
+
+        self.assertNotIn("UNTRACKED_MINT", tracker._untracked_liquidation)  # cleaned up, not paused
+        self.assertEqual(client.sell_calls[-1][2], 99)
+
+    def test_pauses_normally_when_the_99_percent_fallback_also_fails(self):
+        from pumpfun_bot.outcome_tracker import MAX_CONSECUTIVE_SELL_FAILURES
+
+        client = FakeClient(should_fail=True)  # fails at every amount_pct
+        tracker = OutcomeTracker(ws_url="wss://example.invalid", client=client, dry_run=False)
+
+        for _ in range(MAX_CONSECUTIVE_SELL_FAILURES):
+            asyncio.run(tracker._liquidate_untracked_holdings({"UNTRACKED_MINT"}))
+            tracker._untracked_liquidation["UNTRACKED_MINT"]["last_attempt_ts"] = 0
+
+        self.assertTrue(tracker._untracked_liquidation["UNTRACKED_MINT"]["paused"])
+        self.assertEqual(client.sell_calls[-2][2], 100)
+        self.assertEqual(client.sell_calls[-1][2], 99)
+
     def test_respects_the_retry_cooldown(self):
         client = FakeClient(should_fail=True)
         tracker = OutcomeTracker(ws_url="wss://example.invalid", client=client, dry_run=False)
