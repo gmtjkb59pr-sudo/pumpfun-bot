@@ -767,17 +767,49 @@ class OutcomeTracker:
             except Exception as exc:  # noqa: BLE001
                 state["consecutive_failures"] += 1
                 if state["consecutive_failures"] >= MAX_CONSECUTIVE_SELL_FAILURES:
-                    state["paused"] = True
-                    # already confirmed held (it's only in `untracked` because
-                    # _reconcile_with_wallet found it in the wallet) and now
-                    # confirmed unsellable - same reputation signal as a
-                    # tracked position hitting this, see that code path
-                    append_jsonl({"type": "sell_paused", "ts": time.time(), "mint": mint})
-                    message = (
-                        f"⏸️ Kon niet-getrackte holding {mint} niet liquideren na "
-                        f"{state['consecutive_failures']} pogingen (laatste fout: {exc}) - "
-                        f"gestopt met proberen, controleer handmatig."
-                    )
+                    # same 99% fallback as _exit() (see its docstring for the
+                    # real on-chain Overflow/Custom 6024 this targets) -
+                    # untracked holdings hit the identical failure mode, so
+                    # give them the same one extra shot before pausing
+                    try:
+                        fallback_result = await self.client.build_and_send_full_sell(
+                            mint=mint, slippage_pct=self.sell_slippage_pct, amount_pct=99,
+                        )
+                        del self._untracked_liquidation[mint]
+                        append_jsonl({
+                            "type": "untracked_liquidation",
+                            "ts": time.time(),
+                            "mint": mint,
+                            "tx_signature": fallback_result["signature"],
+                            "amount_pct": 99,
+                        })
+                        message = (
+                            f"🧹 Niet-getrackte holding {mint} geliquideerd via 99% fallback "
+                            f"(100% mislukte {state['consecutive_failures']}x, laatste fout: {exc}) - "
+                            f"tx: {fallback_result['signature']}"
+                        )
+                        logger.warning(message)
+                        if self.alerter is not None:
+                            await self.alerter.send(message)
+                        continue
+                    except Exception as fallback_exc:  # noqa: BLE001
+                        state["paused"] = True
+                        # already confirmed held (it's only in `untracked`
+                        # because _reconcile_with_wallet found it in the
+                        # wallet) and now confirmed unsellable at both 100%
+                        # and 99% - same reputation signal as a tracked
+                        # position hitting this, see that code path
+                        append_jsonl({"type": "sell_paused", "ts": time.time(), "mint": mint})
+                        message = (
+                            f"⏸️ Kon niet-getrackte holding {mint} niet liquideren na "
+                            f"{state['consecutive_failures']} pogingen (laatste fout: {exc}), "
+                            f"99% fallback ook geprobeerd en mislukt ({fallback_exc}) - "
+                            f"gestopt met proberen, controleer handmatig."
+                        )
+                        logger.warning(message)
+                        if self.alerter is not None:
+                            await self.alerter.send(message)
+                        continue
                 else:
                     message = f"❌ Liquidatie mislukt voor niet-getrackte holding {mint}: {exc}"
                 logger.warning(message)
