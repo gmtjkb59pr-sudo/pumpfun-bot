@@ -266,6 +266,50 @@ class SharedTrackerCollisionTests(unittest.TestCase):
             [{"multiplier": 2, "sell_pct": 30}],
         )
 
+    def test_dry_run_buy_records_which_field_the_entry_ref_came_from(self):
+        # user-requested bug fix: a later WS tick must only ever re-extract
+        # this SAME field - see price_ref.py's module docstring for the
+        # bogus -100% exit this prevents
+        import tempfile
+        from pathlib import Path
+
+        store_file = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
+        store_file.close()
+        store_path = Path(store_file.name)
+        self.addCleanup(lambda: store_path.unlink(missing_ok=True))
+
+        client = FakeClient()  # no trade_events -> falls back to the launch event
+        outcome_tracker = OutcomeTracker(ws_url="wss://example.invalid", position_store_path=store_path)
+        strategy, risk = _make_strategy(client, dry_run=True, outcome_tracker=outcome_tracker)
+
+        asyncio.run(strategy._buy("MINT", {
+            "mint": "MINT", "name": "Test", "symbol": "TEST",
+            "vSolInBondingCurve": 30.0, "traderPublicKey": "CREATOR",
+        }, time.time()))
+
+        self.assertEqual(outcome_tracker._pending["MINT"]["price_ref_field"], "vSolInBondingCurve")
+
+    def test_dry_run_buy_records_the_field_from_a_fresh_trade_tick_when_available(self):
+        import tempfile
+        from pathlib import Path
+
+        store_file = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
+        store_file.close()
+        store_path = Path(store_file.name)
+        self.addCleanup(lambda: store_path.unlink(missing_ok=True))
+
+        client = FakeClient(trade_events=[{"marketCapSol": 33.0}])
+        outcome_tracker = OutcomeTracker(ws_url="wss://example.invalid", position_store_path=store_path)
+        strategy, risk = _make_strategy(client, dry_run=True, outcome_tracker=outcome_tracker)
+
+        asyncio.run(strategy._buy("MINT", {
+            "mint": "MINT", "name": "Test", "symbol": "TEST",
+            "vSolInBondingCurve": 30.0, "traderPublicKey": "CREATOR",
+        }, time.time()))
+
+        self.assertEqual(outcome_tracker._pending["MINT"]["entry_ref"], 33.0)
+        self.assertEqual(outcome_tracker._pending["MINT"]["price_ref_field"], "marketCapSol")
+
 
 class MinHolderCountGateTests(unittest.TestCase):
     """min_holder_count is only ever set by auto_tuner.py once there's real
@@ -1042,17 +1086,19 @@ class HolderCountIndexingDelayTests(unittest.TestCase):
 
 
 class FetchFreshRefTests(unittest.TestCase):
-    def test_returns_price_from_first_trade_event(self):
+    def test_returns_price_and_field_from_first_trade_event(self):
         client = FakeClient(trade_events=[{"marketCapSol": 42.0}])
         strategy, _ = _make_strategy(client)
-        ref = asyncio.run(strategy._fetch_fresh_ref("MINT"))
+        ref, field = asyncio.run(strategy._fetch_fresh_ref("MINT"))
         self.assertEqual(ref, 42.0)
+        self.assertEqual(field, "marketCapSol")
 
     def test_falls_back_to_none_when_nothing_arrives_in_time(self):
         client = FakeClient(trade_events=[])
         strategy, _ = _make_strategy(client)
-        ref = asyncio.run(strategy._fetch_fresh_ref("MINT"))
+        ref, field = asyncio.run(strategy._fetch_fresh_ref("MINT"))
         self.assertIsNone(ref)
+        self.assertIsNone(field)
 
 
 class PollOnceTests(unittest.TestCase):

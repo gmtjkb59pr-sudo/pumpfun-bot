@@ -52,7 +52,7 @@ from .activity_log import append_jsonl
 from .alerts import Alerter
 from .dexscreener import fetch_price_usd
 from .fees import ROUND_TRIP_PRIORITY_FEE_SOL, net_pct_change_after_fees
-from .price_ref import extract_price_ref
+from .price_ref import extract_price_ref, extract_price_ref_for_field
 from .pumpportal_client import authenticated_ws_url
 from .risk import RiskManager
 from .state import bot_state
@@ -350,6 +350,7 @@ class OutcomeTracker:
         strategy: str = "",
         price_source: str = "bonding_curve_sol",
         take_profit_ladder: list | None = None,
+        price_ref_field: str | None = None,
     ) -> None:
         """take_profit_pct/stop_loss_pct/trailing_*_pct default to this
         instance's own thresholds - pass explicit values when a DIFFERENT
@@ -377,7 +378,20 @@ class OutcomeTracker:
         strategies) makes _handle_price_update ignore real WS ticks for
         this position entirely and rely solely on the REST fallback (see
         REST_FALLBACK_POLL_INTERVAL_SEC), which is USD-denominated on both
-        ends (entry from Birdeye/CoinGecko, updates from DexScreener)."""
+        ends (entry from Birdeye/CoinGecko, updates from DexScreener).
+
+        price_ref_field: confirmed live - the SAME unit-mismatch failure
+        mode can happen WITHIN price_source="bonding_curve_sol" alone, not
+        just across bonding-curve-vs-USD. A real position exited at exactly
+        -100.0% (twice) 1.7s and 4.9s after buying - not a real crash, its
+        entry_ref came from one PumpPortal field (e.g. marketCapSol) but a
+        later WS trade event for the same mint lacked that field and
+        extract_price_ref() fell through to a different, scale-incompatible
+        one (e.g. price - ~1e9x smaller for a fixed-supply token). Pass
+        whichever field name extract_price_ref_with_field() reported for
+        this entry_ref (see price_ref.py's module docstring) so later WS
+        ticks only ever re-extract that SAME field - see
+        _handle_price_update_from_event()."""
         if entry_ref is None:
             logger.debug("Geen price-ref beschikbaar voor %s, sla outcome-tracking over.", mint)
             return
@@ -423,6 +437,10 @@ class OutcomeTracker:
                 "strategy": strategy,
                 # see track()'s own docstring for the full reasoning
                 "price_source": price_source,
+                # see track()'s price_ref_field docstring - None (e.g. for
+                # price_source="usd" positions, which never accept a real WS
+                # tick anyway) falls back to the old any-field extraction
+                "price_ref_field": price_ref_field,
                 # see REST_FALLBACK_POLL_INTERVAL_SEC's docstring - set True
                 # once a REST-fallback price has been used for this position
                 # at least once, so it keeps getting REST-polled even after
@@ -561,7 +579,24 @@ class OutcomeTracker:
                 )
             return
 
-        ref = extract_price_ref(data)
+        async with self._lock:
+            info = self._pending.get(mint)
+            price_ref_field = info.get("price_ref_field") if info else None
+
+        if price_ref_field:
+            # this position has an established field from its entry
+            # snapshot - never substitute a different, scale-incompatible
+            # one just because this particular event happens to be missing
+            # it (see price_ref.py's module docstring for the bogus -100%
+            # exit this prevents). A miss here means "no update this tick",
+            # not "try a fallback".
+            ref = extract_price_ref_for_field(data, price_ref_field)
+        else:
+            # no tracked position with a recorded field (untracked mint,
+            # post_exit-only, or a position persisted before this fix) -
+            # fall back to the original any-field extraction
+            ref = extract_price_ref(data)
+
         if ref is not None:
             if self._warned_no_access:
                 # a real trade event means the feed is actually
@@ -1012,22 +1047,60 @@ class OutcomeTracker:
                 )
                 failure_count = await self._record_sell_failure(mint)
                 if failure_count >= MAX_CONSECUTIVE_SELL_FAILURES:
-                    message = (
-                        f"⏸️ Automatische verkoop gepauzeerd voor {info['symbol']} ({mint}) - "
-                        f"{failure_count} verkopen op rij mislukt (laatste fout: {exc}). "
-                        f"Waarschijnlijk een blijvende fout die niet opgelost wordt door "
-                        f"opnieuw te proberen. Positie blijft open en getrackt, maar wordt "
-                        f"niet langer automatisch verkocht - controleer handmatig."
-                    )
-                    logger.error(message)
+                    # user-requested fallback, confirmed live on 3 real
+                    # stuck positions: PumpPortal's on-chain program threw a
+                    # deterministic AnchorError ("Overflow", Custom 6024) on
+                    # every single 100% sell attempt - the failure happened
+                    # AFTER a successful GetFees sub-call, right at the
+                    # point of computing the sell amount, consistent with an
+                    # edge case in fully-liquidating a position (a divide/
+                    # overflow at the curve's zero-remaining boundary), not
+                    # a slippage or balance-index problem (those fail
+                    # differently, e.g. SellZeroAmount). Before giving up
+                    # entirely, try once more selling 99% instead of 100% -
+                    # if that clears the same edge case, treat the position
+                    # as closed (a ~1% dust remainder left in the wallet is
+                    # the same threshold the take-profit ladder already
+                    # treats as "close enough", see _exit()'s is_partial
+                    # dust-closes-outright comment). Costs one more real fee
+                    # attempt either way, but could recover an otherwise
+                    # permanently stuck position.
+                    try:
+                        fallback_result = await self.client.build_and_send_full_sell(
+                            mint=mint, slippage_pct=self.sell_slippage_pct, amount_pct=99,
+                        )
+                        tx_signature = fallback_result["signature"]
+                        logger.warning(
+                            "99%% fallback-verkoop GESLAAGD voor %s na %d mislukte 100%% "
+                            "pogingen (laatste fout: %s) - positie wordt als gesloten "
+                            "beschouwd, kleine dust (~1%%) blijft mogelijk achter.",
+                            info["symbol"], failure_count, exc,
+                        )
+                    except Exception as fallback_exc:  # noqa: BLE001
+                        logger.exception(
+                            "99%% fallback-verkoop OOK mislukt voor %s: %s",
+                            info["symbol"], fallback_exc,
+                        )
+                        message = (
+                            f"⏸️ Automatische verkoop gepauzeerd voor {info['symbol']} ({mint}) - "
+                            f"{failure_count} verkopen op rij mislukt (laatste fout: {exc}), "
+                            f"99% fallback ook geprobeerd en mislukt ({fallback_exc}). "
+                            f"Waarschijnlijk een blijvende fout die niet opgelost wordt door "
+                            f"opnieuw te proberen. Positie blijft open en getrackt, maar wordt "
+                            f"niet langer automatisch verkocht - controleer handmatig."
+                        )
+                        logger.error(message)
+                        if self.alerter is not None:
+                            await self.alerter.send(message)
+                        return False
                 else:
                     message = (
                         f"❌ Sell mislukt voor {info['symbol']} ({reason}): {exc} - "
                         f"positie blijft open, wordt opnieuw geprobeerd."
                     )
-                if self.alerter is not None:
-                    await self.alerter.send(message)
-                return False
+                    if self.alerter is not None:
+                        await self.alerter.send(message)
+                    return False
 
         # scales to whatever's actually left when this closes a position
         # that already had ladder rungs partially sold off - remaining_

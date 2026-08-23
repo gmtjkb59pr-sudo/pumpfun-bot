@@ -15,7 +15,7 @@ from ..config import SniperConfig
 from ..holder_concentration import fetch_top10_concentration_pct
 from ..holder_count import record_holder_count
 from ..outcome_tracker import OutcomeTracker
-from ..price_ref import extract_price_ref
+from ..price_ref import extract_price_ref_with_field
 from ..pumpportal_client import PumpPortalClient
 from ..risk import RiskManager
 from ..state import bot_state
@@ -193,6 +193,7 @@ class SniperStrategy:
                 continue
 
             liquidity_sol = event.get("vSolInBondingCurve")
+            entry_ref, price_ref_field = extract_price_ref_with_field(event)
             open_positions_count = (
                 self.outcome_tracker.open_position_count() if self.outcome_tracker is not None else None
             )
@@ -218,13 +219,14 @@ class SniperStrategy:
                 asyncio.create_task(record_holder_count(mint, self.client.rpc_http_url))
                 if self.outcome_tracker is not None:
                     await self.outcome_tracker.track(
-                        mint, name, symbol, extract_price_ref(event),
+                        mint, name, symbol, entry_ref,
                         trade_size_sol=self.trade_size_sol,
                         take_profit_pct=self.cfg.take_profit_pct,
                         stop_loss_pct=self.cfg.stop_loss_pct,
                         trailing_activation_pct=self.cfg.trailing_activation_pct,
                         trailing_stop_pct=self.cfg.trailing_stop_pct,
                         take_profit_ladder=self.cfg.take_profit_ladder,
+                        price_ref_field=price_ref_field,
                     )
                 continue
 
@@ -247,13 +249,14 @@ class SniperStrategy:
                 await self.alerter.send(f"✅ Gekocht: {symbol} | tx: {result['signature']}")
                 if self.outcome_tracker is not None:
                     await self.outcome_tracker.track(
-                        mint, name, symbol, extract_price_ref(event),
+                        mint, name, symbol, entry_ref,
                         trade_size_sol=self.trade_size_sol,
                         take_profit_pct=self.cfg.take_profit_pct,
                         stop_loss_pct=self.cfg.stop_loss_pct,
                         trailing_activation_pct=self.cfg.trailing_activation_pct,
                         trailing_stop_pct=self.cfg.trailing_stop_pct,
                         take_profit_ladder=self.cfg.take_profit_ladder,
+                        price_ref_field=price_ref_field,
                     )
             except Exception as exc:  # noqa: BLE001
                 logger.exception("Snipe buy mislukt voor %s: %s", mint, exc)

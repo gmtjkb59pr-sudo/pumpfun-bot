@@ -23,7 +23,7 @@ from ..holder_count import INDEXING_DELAY_SEC as HOLDER_COUNT_INDEXING_DELAY_SEC
 from ..holder_count import fetch_holder_count
 from ..market_cap import fetch_market_cap_usd
 from ..outcome_tracker import OutcomeTracker
-from ..price_ref import extract_price_ref
+from ..price_ref import extract_price_ref_with_field
 from ..pumpportal_client import PumpPortalClient
 from ..risk import RiskManager
 from ..scaled_exit_simulator import ScaledExitSimulator
@@ -148,24 +148,29 @@ class SocialWatchStrategy:
             if self.price_tracker is not None:
                 await self.price_tracker.unwatch(mint)
 
-    async def _fetch_fresh_ref(self, mint: str) -> float | None:
+    async def _fetch_fresh_ref(self, mint: str) -> tuple[float | None, str | None]:
         """A candidate can sit on the watchlist for up to watch_window_sec -
         buying off the stale launch-time price snapshot would silently
         mis-price entry_ref for every exit threshold that follows, so grab
         one live trade update right before buying instead. Falls back to
-        None (caller uses the launch snapshot) if nothing arrives in time -
-        an illiquid token might not trade again before we act."""
-        async def _one() -> float | None:
+        (None, None) (caller uses the launch snapshot) if nothing arrives
+        in time - an illiquid token might not trade again before we act.
+
+        Also returns which PumpPortal field supplied the value - see
+        price_ref.py's module docstring: a later WS tick missing that same
+        field must never fall back to a different, scale-incompatible one,
+        confirmed live to otherwise produce a bogus ~-100% "crash" exit."""
+        async def _one() -> tuple[float | None, str | None]:
             async for trade_event in self.client.stream_token_trades([mint]):
-                ref = extract_price_ref(trade_event)
+                ref, field = extract_price_ref_with_field(trade_event)
                 if ref is not None:
-                    return ref
-            return None
+                    return ref, field
+            return None, None
 
         try:
             return await asyncio.wait_for(_one(), timeout=self.fresh_ref_timeout_sec)
         except asyncio.TimeoutError:
-            return None
+            return None, None
 
     async def _buy(self, mint: str, event: dict, added_ts: float) -> bool:
         """Returns True once this candidate is DONE - either bought, or
@@ -246,7 +251,8 @@ class SocialWatchStrategy:
         # delay - fetch these synchronously so the values are accurate AT
         # the decision point, instead of a delayed best-effort background log
         (
-            entry_ref, holder_count, market_cap_usd, top10_concentration_pct, price_changes_pct,
+            (entry_ref, price_ref_field), holder_count, market_cap_usd, top10_concentration_pct,
+            price_changes_pct,
         ) = await asyncio.gather(
             self._fetch_fresh_ref(mint),
             fetch_holder_count(mint, self.client.rpc_http_url),
@@ -258,7 +264,7 @@ class SocialWatchStrategy:
         # h1/h6/h24 are logged below with the trade but not enforced yet
         price_change_5m_pct = price_changes_pct.get("m5") if price_changes_pct is not None else None
         if entry_ref is None:
-            entry_ref = extract_price_ref(event)
+            entry_ref, price_ref_field = extract_price_ref_with_field(event)
         if holder_count is None:
             # couldn't verify - not evidence the token is bad, just that the
             # RPC lookup itself failed. Retryable - might succeed next poll.
@@ -380,6 +386,7 @@ class SocialWatchStrategy:
                     trailing_stop_pct=self.cfg.trailing_stop_pct,
                     strategy="social_watch",
                     take_profit_ladder=self.cfg.take_profit_ladder,
+                    price_ref_field=price_ref_field,
                 )
             if self.scaled_exit_simulator is not None and entry_ref is not None:
                 self.scaled_exit_simulator.track(mint, entry_ref, self.trade_size_sol)
@@ -412,6 +419,7 @@ class SocialWatchStrategy:
                     trailing_stop_pct=self.cfg.trailing_stop_pct,
                     strategy="social_watch",
                     take_profit_ladder=self.cfg.take_profit_ladder,
+                    price_ref_field=price_ref_field,
                 )
             if self.scaled_exit_simulator is not None and entry_ref is not None:
                 self.scaled_exit_simulator.track(mint, entry_ref, self.trade_size_sol)
