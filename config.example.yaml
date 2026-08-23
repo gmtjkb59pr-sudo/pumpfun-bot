@@ -175,6 +175,57 @@ strategies:
     max_open_positions: 5
     trade_size_sol: 0
 
+  moonshot_hunter:
+    # user-requested: a deliberately different bet from every strategy
+    # above - those all cut losses fast and lock in profit early. This one
+    # instead aims at the rare 100-1000x pump.fun outlier: wide stop-loss,
+    # a take-profit ladder that only takes SMALL profit at huge multiples
+    # so most of the position keeps riding, and a hold time measured in
+    # days/weeks instead of minutes. Discovers candidates the same way
+    # social_watch does (new launches, wait for socials), just with much
+    # stricter/inverted thresholds - see MoonshotHunterConfig's docstring
+    # in config.py for the full reasoning, including the honest caveat:
+    # there is NO reliable early signal for a true viral 1000x, this is a
+    # small, deliberately isolated lottery-ticket allocation, not a
+    # strategy expected to have a proven edge like social_watch's
+    # evidence-based filters.
+    enabled: false
+    watch_window_sec: 60
+    poll_interval_sec: 3
+    # much stricter than social_watch's own bar - a real viral candidate
+    # should be pulling in holders unusually fast
+    min_holder_count: 300
+    max_top10_concentration_pct: 70
+    # INVERTED from every other strategy's ceiling on this same field -
+    # this REQUIRES already-explosive momentum instead of avoiding it, as
+    # the closest available proxy for "this might be going viral right now"
+    min_price_change_5m_pct: 100
+    stop_loss_pct: 70
+    trailing_activation_pct: 300
+    trailing_stop_pct: 35
+    # small early rungs so most of the position keeps riding toward the
+    # actual moonshot target
+    take_profit_ladder:
+      - multiplier: 10
+        sell_pct: 10
+      - multiplier: 50
+        sell_pct: 15
+      - multiplier: 200
+        sell_pct: 20
+    # 30 days - the shared 15-min timeout every other strategy uses would
+    # kill this one immediately, see OutcomeTracker.track()'s docstring
+    max_hold_sec: 2592000
+    # 6 hours - much longer than the shared 10s default, but still a real
+    # backstop against a token that's genuinely gone completely dead
+    stale_price_timeout_sec: 21600
+    # "coin of the month" framing - one bet at a time
+    max_open_positions: 1
+    # don't let this fire back-to-back bets on the same bad day
+    min_seconds_between_buys: 21600
+    # deliberately small, fixed, and separate from normal trade sizing -
+    # this is capital you're fully prepared to lose entirely
+    trade_size_sol: 0.02
+
   copytrade:
     enabled: false
     watched_wallets:

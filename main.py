@@ -37,6 +37,7 @@ from pumpfun_bot.scaled_exit_simulator import ScaledExitSimulator
 from pumpfun_bot.state import bot_state
 from pumpfun_bot.strategies.birdeye_movers import BirdeyeMoversStrategy
 from pumpfun_bot.strategies.coingecko_movers import CoinGeckoMoversStrategy
+from pumpfun_bot.strategies.moonshot_hunter import MoonshotHunterStrategy
 from pumpfun_bot.strategies.copytrade import CopyTradeStrategy
 from pumpfun_bot.strategies.market_maker import MarketMakerStrategy
 from pumpfun_bot.strategies.sniper import SniperStrategy
@@ -188,6 +189,24 @@ async def main() -> None:
         dry_run=cfg.risk.dry_run,
         outcome_tracker=outcome_tracker,
     )
+    # user-requested: a deliberately different bet from every strategy
+    # above - wide stop-loss, a ladder that only takes small profit at
+    # huge multiples, and a hold time measured in days/weeks instead of
+    # minutes, aiming at the rare 100-1000x outlier (see moonshot_hunter.py
+    # and MoonshotHunterConfig's docstring in config.py for the full
+    # reasoning, including the honest caveat that this has no proven edge
+    # like social_watch's evidence-based filters).
+    moonshot_hunter = MoonshotHunterStrategy(
+        client=PumpPortalClient(cfg.pumpportal_ws_url, cfg.pumpportal_trade_api_url,
+                                 cfg.rpc_http_url, keypair, api_key=cfg.pumpportal_api_key),
+        cfg=cfg.moonshot_hunter,
+        risk=risk,
+        alerter=alerter,
+        trade_size_sol=cfg.moonshot_hunter.trade_size_sol or cfg.risk.max_sol_per_trade,
+        slippage_pct=cfg.risk.default_slippage_pct,
+        dry_run=cfg.risk.dry_run,
+        outcome_tracker=outcome_tracker,
+    )
     copytrade = CopyTradeStrategy(
         client=PumpPortalClient(cfg.pumpportal_ws_url, cfg.pumpportal_trade_api_url,
                                  cfg.rpc_http_url, keypair, api_key=cfg.pumpportal_api_key),
@@ -210,7 +229,7 @@ async def main() -> None:
 
     enabled = [
         s.cfg.enabled for s in
-        (sniper, social_watch, birdeye_movers, coingecko_movers, copytrade, market_maker)
+        (sniper, social_watch, birdeye_movers, coingecko_movers, moonshot_hunter, copytrade, market_maker)
     ]
     if not any(enabled):
         logger.warning(
@@ -227,6 +246,7 @@ async def main() -> None:
             "social_watch": cfg.social_watch.enabled,
             "birdeye_movers": cfg.birdeye_movers.enabled,
             "coingecko_movers": cfg.coingecko_movers.enabled,
+            "moonshot_hunter": cfg.moonshot_hunter.enabled,
             "copytrade": cfg.copytrade.enabled,
             "market_maker": cfg.market_maker.enabled,
         },
@@ -266,6 +286,7 @@ async def main() -> None:
         asyncio.create_task(social_watch.run()),
         asyncio.create_task(birdeye_movers.run()),
         asyncio.create_task(coingecko_movers.run()),
+        asyncio.create_task(moonshot_hunter.run()),
         asyncio.create_task(copytrade.run()),
         asyncio.create_task(market_maker.run()),
         asyncio.create_task(outcome_tracker.run()),

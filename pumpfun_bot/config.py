@@ -254,6 +254,67 @@ class CoinGeckoMoversConfig:
 
 
 @dataclass
+class MoonshotHunterConfig:
+    """User-requested: a deliberately different, low-frequency bet - most
+    strategies in this bot cut losses fast and lock in profit early
+    (tight stop_loss/take_profit, 15-min max hold). This one instead aims
+    at the rare 100-1000x pump.fun outlier, discovering candidates the
+    SAME way social_watch does (watch new launches, wait for socials
+    within watch_window_sec) but with much stricter/inverted filters and a
+    completely different exit shape - wide stop-loss, a ladder that only
+    starts taking (small) profit at huge multiples so most of the position
+    keeps riding, and a hold time measured in days/weeks instead of
+    minutes (see OutcomeTracker.track()'s max_hold_sec/
+    stale_price_timeout_sec docstring for why the shared 15-min/10s
+    defaults would kill this strategy at the first natural trading lull).
+
+    Explicitly NOT expected to have a proven edge like social_watch's
+    evidence-based filters - there's no reliable early signal for a true
+    viral 1000x, this is a small, deliberately isolated lottery-ticket
+    allocation, not a strategy to size like the others."""
+    enabled: bool = False
+    watch_window_sec: int = 60
+    poll_interval_sec: int = 3
+    # much stricter than social_watch's own bar - a real viral candidate
+    # should be pulling in holders unusually fast, not just clearing the
+    # minimum quality bar
+    min_holder_count: int = 300
+    max_top10_concentration_pct: float = 70
+    # INVERTED from every other strategy's max_price_change_5m_pct ceiling
+    # (which avoids buying something that already pumped) - here we
+    # instead REQUIRE it, as the closest available proxy for "this is
+    # already going viral right now". 0 = no floor (not recommended).
+    min_price_change_5m_pct: float = 100
+    stop_loss_pct: float = 70
+    trailing_activation_pct: float = 300
+    trailing_stop_pct: float = 35
+    # small early rungs so most of the position keeps riding toward the
+    # actual moonshot target - see TakeProfitLevel's docstring in config.py
+    take_profit_ladder: list = field(default_factory=lambda: [
+        TakeProfitLevel(multiplier=10, sell_pct=10),
+        TakeProfitLevel(multiplier=50, sell_pct=15),
+        TakeProfitLevel(multiplier=200, sell_pct=20),
+    ])
+    # 30 days - see OutcomeTracker.track()'s docstring for why the shared
+    # 15-min MAX_HOLD_SEC constant doesn't apply here
+    max_hold_sec: float = 2_592_000
+    # 6 hours - much longer than the shared 10s STALE_PRICE_TIMEOUT_SEC,
+    # but still a real backstop: a token with genuinely zero trades for 6
+    # straight hours is very unlikely to still moonshot
+    stale_price_timeout_sec: float = 21_600
+    # "coin of the month" framing - one bet at a time, not a volume
+    # strategy. Only enforced live - dry_run skips the open-positions
+    # check like every other strategy here, to farm outcome data.
+    max_open_positions: int = 1
+    # user-requested: don't let this fire back-to-back bets on the same
+    # bad day - a real cooldown between attempts, not just max_open_positions
+    min_seconds_between_buys: float = 21_600
+    # deliberately small, fixed, and separate from normal trade sizing -
+    # this is capital you're fully prepared to lose entirely
+    trade_size_sol: float = 0.02
+
+
+@dataclass
 class CopyTradeConfig:
     enabled: bool = False
     watched_wallets: list = field(default_factory=list)
@@ -287,6 +348,7 @@ class AppConfig:
     social_watch: SocialWatchConfig
     birdeye_movers: BirdeyeMoversConfig
     coingecko_movers: CoinGeckoMoversConfig
+    moonshot_hunter: MoonshotHunterConfig
     copytrade: CopyTradeConfig
     market_maker: MarketMakerConfig
     alerts_console: bool
@@ -430,6 +492,44 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         take_profit_ladder=_parse_take_profit_ladder(cg_raw.get("take_profit_ladder")),
     )
 
+    mh_raw = strat_raw.get("moonshot_hunter", {})
+    mh_defaults = MoonshotHunterConfig()
+    moonshot_hunter = MoonshotHunterConfig(
+        enabled=mh_raw.get("enabled", False),
+        watch_window_sec=mh_raw.get("watch_window_sec", mh_defaults.watch_window_sec),
+        poll_interval_sec=mh_raw.get("poll_interval_sec", mh_defaults.poll_interval_sec),
+        min_holder_count=mh_raw.get("min_holder_count", mh_defaults.min_holder_count),
+        max_top10_concentration_pct=mh_raw.get(
+            "max_top10_concentration_pct", mh_defaults.max_top10_concentration_pct,
+        ),
+        min_price_change_5m_pct=mh_raw.get(
+            "min_price_change_5m_pct", mh_defaults.min_price_change_5m_pct,
+        ),
+        stop_loss_pct=mh_raw.get("stop_loss_pct", mh_defaults.stop_loss_pct),
+        trailing_activation_pct=mh_raw.get(
+            "trailing_activation_pct", mh_defaults.trailing_activation_pct,
+        ),
+        trailing_stop_pct=mh_raw.get("trailing_stop_pct", mh_defaults.trailing_stop_pct),
+        # unlike every other strategy's empty-ladder-means-no-ladder
+        # convention, the ladder IS this strategy's whole exit design (see
+        # MoonshotHunterConfig's docstring - there's no take_profit_pct
+        # fallback field at all) - an omitted YAML value falls back to the
+        # dataclass's own built-in ladder, not an empty one
+        take_profit_ladder=(
+            _parse_take_profit_ladder(mh_raw.get("take_profit_ladder"))
+            or mh_defaults.take_profit_ladder
+        ),
+        max_hold_sec=mh_raw.get("max_hold_sec", mh_defaults.max_hold_sec),
+        stale_price_timeout_sec=mh_raw.get(
+            "stale_price_timeout_sec", mh_defaults.stale_price_timeout_sec,
+        ),
+        max_open_positions=mh_raw.get("max_open_positions", mh_defaults.max_open_positions),
+        min_seconds_between_buys=mh_raw.get(
+            "min_seconds_between_buys", mh_defaults.min_seconds_between_buys,
+        ),
+        trade_size_sol=mh_raw.get("trade_size_sol", mh_defaults.trade_size_sol),
+    )
+
     ct_raw = strat_raw.get("copytrade", {})
     copytrade = CopyTradeConfig(
         enabled=ct_raw.get("enabled", False),
@@ -471,6 +571,7 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         social_watch=social_watch,
         birdeye_movers=birdeye_movers,
         coingecko_movers=coingecko_movers,
+        moonshot_hunter=moonshot_hunter,
         copytrade=copytrade,
         market_maker=market_maker,
         alerts_console=alerts_raw.get("console", True),

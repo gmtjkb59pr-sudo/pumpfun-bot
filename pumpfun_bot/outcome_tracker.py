@@ -351,6 +351,8 @@ class OutcomeTracker:
         price_source: str = "bonding_curve_sol",
         take_profit_ladder: list | None = None,
         price_ref_field: str | None = None,
+        max_hold_sec: float | None = None,
+        stale_price_timeout_sec: float | None = None,
     ) -> None:
         """take_profit_pct/stop_loss_pct/trailing_*_pct default to this
         instance's own thresholds - pass explicit values when a DIFFERENT
@@ -391,7 +393,16 @@ class OutcomeTracker:
         whichever field name extract_price_ref_with_field() reported for
         this entry_ref (see price_ref.py's module docstring) so later WS
         ticks only ever re-extract that SAME field - see
-        _handle_price_update_from_event()."""
+        _handle_price_update_from_event().
+
+        max_hold_sec/stale_price_timeout_sec: user-requested for a
+        moonshot-style strategy meant to hold a position for potentially
+        days/weeks aiming at a huge multiple - the module-level MAX_HOLD_SEC
+        (15 min) and STALE_PRICE_TIMEOUT_SEC (10s!) defaults exist for
+        fast-moving sniper/social_watch positions and would force-exit a
+        genuinely healthy long-hold position the moment it saw one natural
+        trading lull. None (default) keeps the existing shared-constant
+        behavior for every other strategy unchanged."""
         if entry_ref is None:
             logger.debug("Geen price-ref beschikbaar voor %s, sla outcome-tracking over.", mint)
             return
@@ -434,6 +445,11 @@ class OutcomeTracker:
                 "trailing_stop_pct": (
                     trailing_stop_pct if trailing_stop_pct is not None else self.trailing_stop_pct
                 ),
+                # see track()'s max_hold_sec/stale_price_timeout_sec docstring -
+                # None (the default for every existing strategy) falls back to
+                # the shared MAX_HOLD_SEC/STALE_PRICE_TIMEOUT_SEC constants
+                "max_hold_sec": max_hold_sec,
+                "stale_price_timeout_sec": stale_price_timeout_sec,
                 "strategy": strategy,
                 # see track()'s own docstring for the full reasoning
                 "price_source": price_source,
@@ -1337,8 +1353,9 @@ class OutcomeTracker:
                     })
                     info["hit"].add(cp)
 
+                stale_price_timeout_sec = info.get("stale_price_timeout_sec") or STALE_PRICE_TIMEOUT_SEC
                 last_update_age = now - info.get("last_update_ts", info["entry_ts"])
-                if last_update_age >= STALE_PRICE_TIMEOUT_SEC:
+                if last_update_age >= stale_price_timeout_sec:
                     # no real trade event for STALE_PRICE_TIMEOUT_SEC - likely
                     # dead/rugged, don't wait for the full MAX_HOLD_SEC timeout
                     if info["has_real_update"]:
@@ -1356,13 +1373,14 @@ class OutcomeTracker:
                                 "LIVE positie %s (%s) heeft na %ds nog geen koersdata - "
                                 "forceer verkoop blind (stale), resultaat wordt als "
                                 "'unmeasured' gelogd.",
-                                info["symbol"], mint, STALE_PRICE_TIMEOUT_SEC,
+                                info["symbol"], mint, stale_price_timeout_sec,
                             )
-                            no_data_warnings.append((info["symbol"], STALE_PRICE_TIMEOUT_SEC))
+                            no_data_warnings.append((info["symbol"], stale_price_timeout_sec))
                         to_timeout_exit.append((mint, dict(info), "stale_price_unmeasured", None))
                     continue
 
-                if age >= MAX_HOLD_SEC:
+                max_hold_sec = info.get("max_hold_sec") or MAX_HOLD_SEC
+                if age >= max_hold_sec:
                     if info["has_real_update"]:
                         if self._exit_attempt_allowed(info):
                             pct_change = round(
@@ -1385,9 +1403,9 @@ class OutcomeTracker:
                             logger.error(
                                 "LIVE positie %s (%s) heeft na %ds nog geen koersdata - "
                                 "forceer verkoop blind, resultaat wordt als 'unmeasured' gelogd.",
-                                info["symbol"], mint, MAX_HOLD_SEC,
+                                info["symbol"], mint, max_hold_sec,
                             )
-                            no_data_warnings.append((info["symbol"], MAX_HOLD_SEC))
+                            no_data_warnings.append((info["symbol"], max_hold_sec))
                         to_timeout_exit.append((mint, dict(info), "timeout_unmeasured", None))
             for mint in finished_mints:
                 del self._pending[mint]
