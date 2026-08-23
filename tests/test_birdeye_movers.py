@@ -279,24 +279,27 @@ class MaxMarketCapGateTests(unittest.TestCase):
 
         self.assertEqual(client.buy_calls, [])
 
-    def test_default_ceiling_is_the_bonding_curve_graduation_margin_not_blue_chip_scale(self):
-        # confirmed live: candidates well above pump.fun's real ~$69k
-        # bonding-curve graduation cap fail to buy outright (already
-        # migrated to a real DEX) - the ceiling must stay near that
-        # graduation point, not just "below major-token scale" (the old
-        # 20,000,000 default let straight through everything that failed
-        # live tonight)
-        self.assertEqual(BirdeyeMoversConfig().max_market_cap_usd, 100_000)
+    def test_default_ceiling_is_disabled_now_that_pool_auto_handles_buyability(self):
+        # SUPERSEDED: confirmed live that a REAL pump.fun-suffixed mint at
+        # ~$260M market cap builds a valid transaction fine via pool="auto"
+        # (only pool="pump" fails for it) - the original ~$69k graduation
+        # ceiling was working around a routing limitation that no longer
+        # exists (see pumpportal_client.py's pool="auto" default). Market
+        # cap no longer predicts buyability for a real pump.fun token, so
+        # the default is 0 (disabled) - is_pump_fun_mint() is what actually
+        # excludes blue chips (SOL/PUMP/wrapped ETH never end in "pump").
+        self.assertEqual(BirdeyeMoversConfig().max_market_cap_usd, 0)
 
-    def test_a_migrated_looking_candidate_is_now_rejected_by_default(self):
+    def test_a_migrated_looking_candidate_is_bought_by_default_now(self):
         client = FakeClient()
         strategy, risk = _make_strategy(
             client, dry_run=False, max_market_cap_usd=BirdeyeMoversConfig().max_market_cap_usd,
         )
 
-        asyncio.run(strategy._consider(_token(marketcap=18_000_000)))  # real observed candidate scale
+        with _DEFAULT_HOLDER_PATCH, _DEFAULT_CONCENTRATION_PATCH:
+            asyncio.run(strategy._consider(_token(marketcap=18_000_000)))  # real observed candidate scale
 
-        self.assertEqual(client.buy_calls, [])
+        self.assertEqual(len(client.buy_calls), 1)
 
     def test_buys_regardless_of_market_cap_when_ceiling_is_disabled(self):
         client = FakeClient()

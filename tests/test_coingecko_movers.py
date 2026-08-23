@@ -259,8 +259,11 @@ class MaxMarketCapGateTests(unittest.TestCase):
 
         self.assertEqual(client.buy_calls, [])
 
-    def test_default_ceiling_matches_birdeye_movers_graduation_margin(self):
-        self.assertEqual(CoinGeckoMoversConfig().max_market_cap_usd, 100_000)
+    def test_default_ceiling_is_disabled_now_that_pool_auto_handles_buyability(self):
+        # see the equivalent test in test_birdeye_movers.py for the full
+        # reasoning - market cap no longer predicts buyability for a real
+        # pump.fun token now that pool="auto" is the default
+        self.assertEqual(CoinGeckoMoversConfig().max_market_cap_usd, 0)
 
     def test_buys_regardless_of_market_cap_when_ceiling_is_disabled(self):
         client = FakeClient()
