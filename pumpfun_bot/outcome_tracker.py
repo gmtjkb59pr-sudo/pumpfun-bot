@@ -349,6 +349,7 @@ class OutcomeTracker:
         trailing_stop_pct: float | None = None,
         strategy: str = "",
         price_source: str = "bonding_curve_sol",
+        take_profit_ladder: list | None = None,
     ) -> None:
         """take_profit_pct/stop_loss_pct/trailing_*_pct default to this
         instance's own thresholds - pass explicit values when a DIFFERENT
@@ -428,6 +429,18 @@ class OutcomeTracker:
                 # has_real_update flips True from that same fallback price
                 "rest_fallback_active": False,
                 "last_rest_fallback_ts": 0.0,
+                # user-requested: scaled take-profit ladder (see
+                # TakeProfitLevel's docstring in config.py). Empty list keeps
+                # the existing single-shot take_profit_pct behavior in
+                # _handle_price_update unchanged. Stored as plain dicts (not
+                # TakeProfitLevel instances) so position_store.py's JSON
+                # persistence round-trips this without a custom encoder.
+                "take_profit_ladder": (
+                    [{"multiplier": lvl.multiplier, "sell_pct": lvl.sell_pct} for lvl in take_profit_ladder]
+                    if take_profit_ladder else []
+                ),
+                "triggered_ladder_levels": [],
+                "remaining_fraction": 1.0,
             }
             self._persist_pending()
 
@@ -799,8 +812,48 @@ class OutcomeTracker:
                 trailing_activation_pct = info.get("trailing_activation_pct", self.trailing_activation_pct)
                 trailing_stop_pct = info.get("trailing_stop_pct", self.trailing_stop_pct)
 
+                ladder = info.get("take_profit_ladder") or []
                 triggered_reason = None
-                if pct_change >= take_profit_pct:
+                sell_fraction_of_remaining = 1.0
+                ladder_level_multiplier = None
+                if ladder:
+                    # scaled take-profit ladder replaces the single-shot
+                    # take_profit_pct trigger entirely for this position -
+                    # see TakeProfitLevel's docstring in config.py. Stop-loss
+                    # always applies (closes whatever remains); the trailing
+                    # stop only takes over once every ladder rung has fired,
+                    # to protect the leftover runner.
+                    if pct_change <= -stop_loss_pct:
+                        triggered_reason = "stop_loss"
+                        sell_fraction_of_remaining = 1.0
+                    else:
+                        current_multiplier = 1 + (pct_change / 100)
+                        triggered_levels = info.get("triggered_ladder_levels") or []
+                        next_level = next(
+                            (
+                                lvl for lvl in ladder
+                                if lvl["multiplier"] not in triggered_levels
+                                and current_multiplier >= lvl["multiplier"]
+                            ),
+                            None,
+                        )
+                        if next_level is not None:
+                            # at most one rung per price update - real ticks
+                            # arrive often enough to catch up quickly, and
+                            # this keeps a single tick from ever triggering
+                            # two partial sells at once
+                            triggered_reason = "take_profit_ladder"
+                            sell_fraction_of_remaining = next_level["sell_pct"] / 100
+                            ladder_level_multiplier = next_level["multiplier"]
+                        elif (
+                            len(triggered_levels) >= len(ladder)
+                            and info.get("remaining_fraction", 1.0) > 0
+                            and peak_pct_change >= trailing_activation_pct
+                            and drawdown_from_peak_pct <= -trailing_stop_pct
+                        ):
+                            triggered_reason = "trailing_stop"
+                            sell_fraction_of_remaining = 1.0
+                elif pct_change >= take_profit_pct:
                     triggered_reason = "take_profit"
                 elif pct_change <= -stop_loss_pct:
                     triggered_reason = "stop_loss"
@@ -810,7 +863,10 @@ class OutcomeTracker:
                 ):
                     triggered_reason = "trailing_stop"
                 if triggered_reason and self._exit_attempt_allowed(info):
-                    exit_args = (mint, dict(info), triggered_reason, pct_change)
+                    exit_args = (
+                        mint, dict(info), triggered_reason, pct_change,
+                        sell_fraction_of_remaining, ladder_level_multiplier,
+                    )
                 self._persist_pending()
 
             post = self._post_exit.get(mint)
@@ -871,21 +927,55 @@ class OutcomeTracker:
             self._persist_pending()
             return count
 
-    async def _attempt_exit(self, mint: str, info: dict, reason: str, pct_change: float) -> None:
+    async def _attempt_exit(
+        self, mint: str, info: dict, reason: str, pct_change: float,
+        sell_fraction_of_remaining: float = 1.0, ladder_level_multiplier: float | None = None,
+    ) -> None:
         """Calls _exit() and only removes the mint from _pending if it
-        actually closed - a failed real sell leaves it exactly as it was."""
-        closed = await self._exit(mint, info, reason, pct_change)
+        actually closed - a failed real sell leaves it exactly as it was.
+        A partial ladder sell (_exit() returning False by design, not
+        failure) also leaves it tracked - see _exit()'s docstring."""
+        closed = await self._exit(
+            mint, info, reason, pct_change, sell_fraction_of_remaining, ladder_level_multiplier,
+        )
         if closed:
             async with self._lock:
                 self._pending.pop(mint, None)
                 self._persist_pending()
 
-    async def _exit(self, mint: str, info: dict, reason: str, pct_change: float) -> bool:
-        """Returns True if the position is now closed (simulated close, or a
-        real sell that actually succeeded). Returns False if a real sell was
-        attempted and failed - the caller must leave the position tracked."""
+    async def _exit(
+        self, mint: str, info: dict, reason: str, pct_change: float,
+        sell_fraction_of_remaining: float = 1.0, ladder_level_multiplier: float | None = None,
+    ) -> bool:
+        """Returns True if the position is now fully closed (simulated
+        close, or a real sell that actually succeeded). Returns False both
+        when a real sell was attempted and failed (caller must leave the
+        position tracked, unchanged) AND when a ladder rung fired a partial
+        sell that succeeded (caller must also leave the position tracked,
+        but now with a reduced remaining_fraction) - the caller can't tell
+        these apart from the return value alone, which is fine: both cases
+        want the same "don't pop it" behavior.
+
+        sell_fraction_of_remaining: fraction of whatever's currently left of
+        the position to sell now (1.0 = everything, the default/non-ladder
+        behavior). A ladder rung passes next_level["sell_pct"] / 100 here -
+        see _handle_price_update's ladder branch."""
+        remaining_fraction = info.get("remaining_fraction", 1.0)
+        sold_fraction_of_original = remaining_fraction * sell_fraction_of_remaining
+        new_remaining_fraction = remaining_fraction - sold_fraction_of_original
+        # a rung that would leave only dust behind (<=1% of the original
+        # position) closes the position outright instead - avoids a
+        # meaningless tiny remainder lingering until timeout
+        is_partial = sell_fraction_of_remaining < 0.999999 and new_remaining_fraction > 0.01
+
         pct_change = round(pct_change, 2) if pct_change is not None else None
         tx_signature = ""
+
+        if is_partial:
+            return await self._partial_exit(
+                mint, info, reason, pct_change, sold_fraction_of_original,
+                new_remaining_fraction, ladder_level_multiplier,
+            )
 
         if not self.dry_run:
             if self.client is None:
@@ -939,14 +1029,19 @@ class OutcomeTracker:
                     await self.alerter.send(message)
                 return False
 
-        if self.risk is not None and info["trade_size_sol"]:
+        # scales to whatever's actually left when this closes a position
+        # that already had ladder rungs partially sold off - remaining_
+        # fraction defaults to 1.0 (the full original size) for every
+        # position that never had a ladder, so this is a no-op for them
+        effective_trade_size_sol = round(info["trade_size_sol"] * remaining_fraction, 9)
+        if self.risk is not None and effective_trade_size_sol:
             # pct_change is None for a blind forced sell (timeout_unmeasured -
             # never got price data) - pnl is genuinely unknown, so record 0
             # rather than guessing, but still release the exposure slot since
             # the position really is closing
             if pct_change is not None:
                 net_pct = net_pct_change_after_fees(pct_change)
-                pnl_sol = round(info["trade_size_sol"] * (net_pct / 100), 6)
+                pnl_sol = round(effective_trade_size_sol * (net_pct / 100), 6)
             else:
                 pnl_sol = 0.0
             if not self.dry_run:
@@ -954,7 +1049,7 @@ class OutcomeTracker:
                 # with a real priority fee attached - subtract that actual
                 # on-chain cost so the dashboard's P&L matches the wallet
                 pnl_sol = round(pnl_sol - ROUND_TRIP_PRIORITY_FEE_SOL, 6)
-            self.risk.register_trade_closed(info["trade_size_sol"], pnl_sol)
+            self.risk.register_trade_closed(effective_trade_size_sol, pnl_sol)
         append_jsonl({
             "type": "exit",
             "ts": time.time(),
@@ -964,7 +1059,7 @@ class OutcomeTracker:
             "reason": reason,
             "pct_change": pct_change,
             "measured": pct_change is not None,
-            "trade_size_sol": info["trade_size_sol"],
+            "trade_size_sol": effective_trade_size_sol,
             "dry_run": self.dry_run,
             "tx_signature": tx_signature,
         })
@@ -993,6 +1088,104 @@ class OutcomeTracker:
                 "has_real_update": False,
             }
         return True
+
+    async def _partial_exit(
+        self, mint: str, info: dict, reason: str, pct_change: float | None,
+        sold_fraction_of_original: float, new_remaining_fraction: float,
+        ladder_level_multiplier: float | None,
+    ) -> bool:
+        """Sells one ladder rung's worth of the position and leaves the rest
+        open and tracked - always returns False (never pops the position;
+        _attempt_exit only pops on a fully-closed True). Mutates the REAL
+        self._pending[mint] entry (info here is a dict(info) copy handed
+        around as exit_args, not the live tracked state) so the reduced
+        remaining_fraction and newly-triggered rung actually stick.
+
+        Sizes the real sell in CURRENT SOL terms (slice_cost_sol_at_entry *
+        multiplier), since PumpPortal's amount_sol for a sell means "tokens
+        worth this much SOL right now" - selling the ORIGINAL entry-time SOL
+        cost of this slice would undersell the actual token quantity after
+        the price moved up (which is why a rung fired at all)."""
+        slice_cost_sol_at_entry = info["trade_size_sol"] * sold_fraction_of_original
+        multiplier = 1 + ((pct_change or 0.0) / 100)
+        current_slice_value_sol = round(slice_cost_sol_at_entry * multiplier, 9)
+        tx_signature = ""
+
+        if not self.dry_run:
+            if self.client is None:
+                logger.error(
+                    "LIVE modus maar geen trading client ingesteld op de outcome-tracker - "
+                    "kan take-profit ladder rung niet verkopen voor %s. Positie blijft open.",
+                    info["symbol"],
+                )
+                return False
+            time_since_entry = time.time() - info["entry_ts"]
+            if time_since_entry < MIN_SELL_DELAY_SEC:
+                logger.debug(
+                    "Ladder-sell voor %s uitgesteld - pas %.0fs sinds aankoop (min %ds).",
+                    info["symbol"], time_since_entry, MIN_SELL_DELAY_SEC,
+                )
+                return False
+            try:
+                result = await self.client.build_and_send_trade(
+                    action="sell", mint=mint, amount_sol=current_slice_value_sol,
+                    slippage_pct=self.sell_slippage_pct,
+                )
+                tx_signature = result["signature"]
+            except Exception as exc:  # noqa: BLE001
+                logger.exception(
+                    "ECHTE ladder-sell mislukt voor %s (%s, multiplier=%s): %s - "
+                    "positie blijft open, wordt over %ds opnieuw geprobeerd.",
+                    info["symbol"], mint, ladder_level_multiplier, exc, EXIT_RETRY_COOLDOWN_SEC,
+                )
+                await self._record_sell_failure(mint)
+                if self.alerter is not None:
+                    await self.alerter.send(
+                        f"❌ Ladder-sell mislukt voor {info['symbol']} "
+                        f"({ladder_level_multiplier}x): {exc} - positie blijft open."
+                    )
+                return False
+
+        if self.risk is not None and slice_cost_sol_at_entry:
+            net_pct = net_pct_change_after_fees(pct_change) if pct_change is not None else 0.0
+            pnl_sol = round(slice_cost_sol_at_entry * (net_pct / 100), 6)
+            self.risk.register_trade_closed(slice_cost_sol_at_entry, pnl_sol)
+
+        append_jsonl({
+            "type": "exit",
+            "ts": time.time(),
+            "mint": mint,
+            "name": info["name"],
+            "symbol": info["symbol"],
+            "reason": reason,
+            "pct_change": round(pct_change, 2) if pct_change is not None else None,
+            "measured": pct_change is not None,
+            "trade_size_sol": round(slice_cost_sol_at_entry, 9),
+            "dry_run": self.dry_run,
+            "tx_signature": tx_signature,
+            "partial": True,
+            "ladder_level_multiplier": ladder_level_multiplier,
+            "remaining_fraction_after": round(new_remaining_fraction, 6),
+        })
+        if self.alerter is not None:
+            prefix = "[DRY RUN] " if self.dry_run else ""
+            pct_str = f"{pct_change:+.1f}%" if pct_change is not None else "onbekend"
+            await self.alerter.send(
+                f"{prefix}🪜 Ladder take-profit ({ladder_level_multiplier}x): "
+                f"{info['name']} ({info['symbol']}) @ {pct_str} - "
+                f"{round(new_remaining_fraction * 100, 1)}% resteert"
+            )
+
+        async with self._lock:
+            real_info = self._pending.get(mint)
+            if real_info is not None:
+                real_info["remaining_fraction"] = new_remaining_fraction
+                if ladder_level_multiplier is not None:
+                    real_info["triggered_ladder_levels"] = (
+                        real_info.get("triggered_ladder_levels") or []
+                    ) + [ladder_level_multiplier]
+                self._persist_pending()
+        return False
 
     async def _emit_due_checkpoints(self) -> None:
         now = time.time()

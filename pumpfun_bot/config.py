@@ -36,6 +36,21 @@ class RiskConfig:
 
 
 @dataclass
+class TakeProfitLevel:
+    """One rung of a scaled take-profit ladder: at `multiplier`x the entry
+    price, sell `sell_pct`% of whatever's LEFT of the position at that
+    moment (not of the original buy) - user-requested, ported from an
+    earlier version of this bot's sniper strategy after
+    scaled_exit_simulator.py's parallel counterfactual observer had been
+    quietly modeling a similar idea (take partial profit, trail the rest)
+    without ever being the REAL exit logic. See OutcomeTracker.track()'s
+    take_profit_ladder docstring for how this replaces the single-shot
+    take_profit_pct when non-empty."""
+    multiplier: float
+    sell_pct: float
+
+
+@dataclass
 class SniperConfig:
     enabled: bool = False
     min_token_age_seconds: int = 0
@@ -45,6 +60,10 @@ class SniperConfig:
     stop_loss_pct: float = 25
     trailing_activation_pct: float = 20
     trailing_stop_pct: float = 15
+    # user-requested: scaled take-profit ladder - empty (default) keeps the
+    # existing single-shot take_profit_pct behavior unchanged. See
+    # TakeProfitLevel's docstring.
+    take_profit_ladder: list = field(default_factory=list)
 
 
 @dataclass
@@ -61,6 +80,10 @@ class SocialWatchConfig:
     stop_loss_pct: float = 25
     trailing_activation_pct: float = 20
     trailing_stop_pct: float = 15
+    # user-requested: scaled take-profit ladder - empty (default) keeps the
+    # existing single-shot take_profit_pct behavior unchanged. See
+    # TakeProfitLevel's docstring.
+    take_profit_ladder: list = field(default_factory=list)
     # 0 = no filter. Only auto_tuner.py raises this (tighten-only, gated on
     # real sample size + margin) once there's evidence for a real threshold -
     # never hand-set this without evidence, see holder_count_tuning.py
@@ -142,6 +165,10 @@ class BirdeyeMoversConfig:
     stop_loss_pct: float = 25
     trailing_activation_pct: float = 20
     trailing_stop_pct: float = 15
+    # user-requested: scaled take-profit ladder - empty (default) keeps the
+    # existing single-shot take_profit_pct behavior unchanged. See
+    # TakeProfitLevel's docstring.
+    take_profit_ladder: list = field(default_factory=list)
     # user-requested: own position budget, separate from the global
     # risk.max_open_positions shared pool - confirmed live that a single
     # trending-list poll can return several qualifying tokens at once and
@@ -188,6 +215,10 @@ class CoinGeckoMoversConfig:
     stop_loss_pct: float = 25
     trailing_activation_pct: float = 20
     trailing_stop_pct: float = 15
+    # user-requested: scaled take-profit ladder - empty (default) keeps the
+    # existing single-shot take_profit_pct behavior unchanged. See
+    # TakeProfitLevel's docstring.
+    take_profit_ladder: list = field(default_factory=list)
     max_open_positions: int = 5
     trade_size_sol: float = 0.0
 
@@ -243,6 +274,22 @@ class AppConfig:
     okx_passphrase: str = ""
 
 
+def _parse_take_profit_ladder(raw_levels: list | None) -> list[TakeProfitLevel]:
+    """Parses a strategy's own take_profit_ladder YAML list into
+    TakeProfitLevel instances, sorted ascending by multiplier - the order
+    OutcomeTracker's ladder logic assumes when checking which levels a
+    price update has newly crossed. Missing/malformed - never guesses a
+    default multiplier/sell_pct, a broken ladder entry should fail loudly
+    (KeyError) rather than silently trade with a wrong threshold."""
+    if not raw_levels:
+        return []
+    levels = [
+        TakeProfitLevel(multiplier=lvl["multiplier"], sell_pct=lvl["sell_pct"])
+        for lvl in raw_levels
+    ]
+    return sorted(levels, key=lambda lvl: lvl.multiplier)
+
+
 def load_config(path: str = "config.yaml") -> AppConfig:
     cfg_path = Path(path)
     if not cfg_path.exists():
@@ -287,6 +334,7 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         stop_loss_pct=sniper_raw.get("stop_loss_pct", 25),
         trailing_activation_pct=sniper_raw.get("trailing_activation_pct", 20),
         trailing_stop_pct=sniper_raw.get("trailing_stop_pct", 15),
+        take_profit_ladder=_parse_take_profit_ladder(sniper_raw.get("take_profit_ladder")),
     )
 
     sw_raw = strat_raw.get("social_watch", {})
@@ -305,6 +353,7 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         max_price_change_5m_pct=sw_raw.get("max_price_change_5m_pct", 0),
         max_open_positions=sw_raw.get("max_open_positions", 5),
         trade_size_sol=sw_raw.get("trade_size_sol", 0.0),
+        take_profit_ladder=_parse_take_profit_ladder(sw_raw.get("take_profit_ladder")),
     )
 
     be_raw = strat_raw.get("birdeye_movers", {})
@@ -323,6 +372,7 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         stop_loss_pct=be_raw.get("stop_loss_pct", 25),
         trailing_activation_pct=be_raw.get("trailing_activation_pct", 20),
         trailing_stop_pct=be_raw.get("trailing_stop_pct", 15),
+        take_profit_ladder=_parse_take_profit_ladder(be_raw.get("take_profit_ladder")),
     )
 
     cg_raw = strat_raw.get("coingecko_movers", {})
@@ -342,6 +392,7 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         stop_loss_pct=cg_raw.get("stop_loss_pct", 25),
         trailing_activation_pct=cg_raw.get("trailing_activation_pct", 20),
         trailing_stop_pct=cg_raw.get("trailing_stop_pct", 15),
+        take_profit_ladder=_parse_take_profit_ladder(cg_raw.get("take_profit_ladder")),
     )
 
     ct_raw = strat_raw.get("copytrade", {})

@@ -154,7 +154,7 @@ class FakeScaledExitSimulator:
 def _make_strategy(
     client, *, dry_run=True, outcome_tracker=None, min_holder_count=0, min_market_cap_usd=0,
     max_top10_concentration_pct=0, require_positive_momentum_5m=False, max_price_change_5m_pct=0,
-    price_tracker=None, scaled_exit_simulator=None,
+    price_tracker=None, scaled_exit_simulator=None, take_profit_ladder=(),
 ):
     risk = RiskManager(RiskConfig())
     strategy = SocialWatchStrategy(
@@ -165,6 +165,7 @@ def _make_strategy(
             max_top10_concentration_pct=max_top10_concentration_pct,
             require_positive_momentum_5m=require_positive_momentum_5m,
             max_price_change_5m_pct=max_price_change_5m_pct,
+            take_profit_ladder=list(take_profit_ladder),
         ),
         risk=risk,
         alerter=FakeAlerter(),
@@ -236,6 +237,34 @@ class SharedTrackerCollisionTests(unittest.TestCase):
 
         self.assertEqual(client.buy_calls, [])
         self.assertAlmostEqual(risk.state.open_exposure_sol, 0.0)
+
+    def test_dry_run_buy_passes_take_profit_ladder_through_to_the_tracker(self):
+        import tempfile
+        from pathlib import Path
+
+        from pumpfun_bot.config import TakeProfitLevel
+
+        store_file = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
+        store_file.close()
+        store_path = Path(store_file.name)
+        self.addCleanup(lambda: store_path.unlink(missing_ok=True))
+
+        client = FakeClient()
+        outcome_tracker = OutcomeTracker(ws_url="wss://example.invalid", position_store_path=store_path)
+        strategy, risk = _make_strategy(
+            client, dry_run=True, outcome_tracker=outcome_tracker,
+            take_profit_ladder=[TakeProfitLevel(multiplier=2, sell_pct=30)],
+        )
+
+        asyncio.run(strategy._buy("MINT", {
+            "mint": "MINT", "name": "Test", "symbol": "TEST",
+            "vSolInBondingCurve": 30.0, "traderPublicKey": "CREATOR",
+        }, time.time()))
+
+        self.assertEqual(
+            outcome_tracker._pending["MINT"]["take_profit_ladder"],
+            [{"multiplier": 2, "sell_pct": 30}],
+        )
 
 
 class MinHolderCountGateTests(unittest.TestCase):

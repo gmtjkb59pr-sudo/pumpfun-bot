@@ -141,6 +141,7 @@ class SniperStrategy:
                         stop_loss_pct=self.cfg.stop_loss_pct,
                         trailing_activation_pct=self.cfg.trailing_activation_pct,
                         trailing_stop_pct=self.cfg.trailing_stop_pct,
+                        take_profit_ladder=self.cfg.take_profit_ladder,
                     )
                 continue
 
@@ -169,6 +170,7 @@ class SniperStrategy:
                         stop_loss_pct=self.cfg.stop_loss_pct,
                         trailing_activation_pct=self.cfg.trailing_activation_pct,
                         trailing_stop_pct=self.cfg.trailing_stop_pct,
+                        take_profit_ladder=self.cfg.take_profit_ladder,
                     )
             except Exception as exc:  # noqa: BLE001
                 logger.exception("Snipe buy mislukt voor %s: %s", mint, exc)

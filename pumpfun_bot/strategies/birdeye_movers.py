@@ -192,6 +192,7 @@ class BirdeyeMoversStrategy:
                     trailing_stop_pct=self.cfg.trailing_stop_pct,
                     strategy="birdeye_movers",
                     price_source="usd",
+                    take_profit_ladder=self.cfg.take_profit_ladder,
                 )
             return
 
@@ -216,6 +217,7 @@ class BirdeyeMoversStrategy:
                     trailing_stop_pct=self.cfg.trailing_stop_pct,
                     strategy="birdeye_movers",
                     price_source="usd",
+                    take_profit_ladder=self.cfg.take_profit_ladder,
                 )
         except Exception as exc:  # noqa: BLE001
             logger.exception("Birdeye-movers buy mislukt voor %s: %s", mint, exc)

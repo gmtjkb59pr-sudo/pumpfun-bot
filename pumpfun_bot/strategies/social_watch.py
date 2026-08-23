@@ -352,6 +352,7 @@ class SocialWatchStrategy:
                     trailing_activation_pct=self.cfg.trailing_activation_pct,
                     trailing_stop_pct=self.cfg.trailing_stop_pct,
                     strategy="social_watch",
+                    take_profit_ladder=self.cfg.take_profit_ladder,
                 )
             if self.scaled_exit_simulator is not None and entry_ref is not None:
                 self.scaled_exit_simulator.track(mint, entry_ref, self.trade_size_sol)
@@ -383,6 +384,7 @@ class SocialWatchStrategy:
                     trailing_activation_pct=self.cfg.trailing_activation_pct,
                     trailing_stop_pct=self.cfg.trailing_stop_pct,
                     strategy="social_watch",
+                    take_profit_ladder=self.cfg.take_profit_ladder,
                 )
             if self.scaled_exit_simulator is not None and entry_ref is not None:
                 self.scaled_exit_simulator.track(mint, entry_ref, self.trade_size_sol)
