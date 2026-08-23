@@ -121,6 +121,39 @@ class TradeRequestBodyTests(unittest.TestCase):
         self.assertEqual(captured["amount"], 0.05)
         self.assertEqual(captured["denominatedInSol"], "true")
 
+    def test_buy_defaults_to_pool_auto_not_bonding_curve_only(self):
+        # confirmed live: a candidate that isn't a real pump.fun mint fails
+        # identically under every pool value, but a REAL pump.fun position
+        # can still migrate to PumpSwap while held - "pump" alone can only
+        # ever route to the bonding curve, "auto" routes to wherever the
+        # token actually trades right now
+        client = self._make_client()
+        captured = {}
+
+        async def fake_sign_and_send(body):
+            captured.update(body)
+            return "fake_signature"
+
+        client._sign_and_send = fake_sign_and_send
+        asyncio.run(client.build_and_send_trade(
+            action="buy", mint="MINT123", amount_sol=0.05, slippage_pct=10
+        ))
+
+        self.assertEqual(captured["pool"], "auto")
+
+    def test_full_sell_defaults_to_pool_auto_not_bonding_curve_only(self):
+        client = self._make_client()
+        captured = {}
+
+        async def fake_sign_and_send(body):
+            captured.update(body)
+            return "fake_signature"
+
+        client._sign_and_send = fake_sign_and_send
+        asyncio.run(client.build_and_send_full_sell(mint="MINT123", slippage_pct=10))
+
+        self.assertEqual(captured["pool"], "auto")
+
 
 class ConfirmTransactionTests(unittest.TestCase):
     """Regression coverage for a real bug: with skipPreflight on,

@@ -30,6 +30,19 @@ from ..state import bot_state
 
 logger = logging.getLogger("pumpfun_bot.birdeye_movers")
 
+# pump.fun mints every one it launches through a vanity-address grinder that
+# always ends in "pump" - confirmed live tonight: two Birdeye trending
+# candidates (Truth Coin, OpenAI PreStocks) both failed to buy with a 400
+# from PumpPortal regardless of pool routing (tested "pump"/"auto"/"pump-amm"
+# /"raydium" directly against PumpPortal - identical failure every time).
+# Neither mint ends in "pump" - Birdeye's trending list is Solana-wide, not
+# pump.fun-specific, and surfaced two tokens that were never launched on
+# pump.fun at all, just happened to have meme-coin-sounding names. PumpPortal
+# has no route for a mint it never indexed, so no pool parameter fixes this -
+# the fix is to never attempt these candidates in the first place.
+def is_pump_fun_mint(mint: str) -> bool:
+    return mint.endswith("pump")
+
 
 class BirdeyeMoversStrategy:
     def __init__(
@@ -80,6 +93,15 @@ class BirdeyeMoversStrategy:
     async def _consider(self, token: dict) -> None:
         mint = token.get("address")
         if not mint:
+            return
+        if not is_pump_fun_mint(mint):
+            # cheapest possible rejection - no RPC calls, no risk-manager
+            # check, just a string check - see the module-level comment on
+            # is_pump_fun_mint for why this matters
+            logger.info(
+                "Birdeye-movers: %s is geen pump.fun mint (geen \"pump\"-suffix), "
+                "PumpPortal heeft hier geen route voor, sla over.", mint,
+            )
             return
         if self.outcome_tracker is not None and self.outcome_tracker.is_tracking(mint):
             # already held (e.g. social_watch bought this same mint) -
