@@ -97,10 +97,18 @@ class RiskManager:
         to only ever compare against the shared value. Falls back to
         self.cfg.max_sol_per_trade when not given.
 
-        In dry_run, the open-positions check is skipped entirely -
-        user-requested: no real capital is at risk in dry-run, so cap
-        nothing and let every qualifying candidate open a position to
-        farm as much outcome data as possible."""
+        In dry_run, the open-positions check, total-exposure cap,
+        trades/hour cap, and daily-loss circuit breaker are all skipped
+        entirely - user-requested: no real capital is at risk in dry-run,
+        so cap nothing and let every qualifying candidate open a position
+        to farm as much outcome data as possible. Confirmed live this cap
+        was starving social_watch/coingecko_movers of almost every buy
+        opportunity once sniper was also enabled, since sniper alone fires
+        often enough to keep the shared exposure pool saturated. Per-trade
+        size (max_sol_per_trade) and candidate-quality filters
+        (min_liquidity_sol) still apply even in dry_run - those aren't
+        capital constraints, they shape what's actually worth farming data
+        on."""
         self._reset_day_if_needed()
 
         if sol_amount <= 0:
@@ -117,7 +125,10 @@ class RiskManager:
                 f"({effective_max_sol_per_trade})."
             )
 
-        if self.state.open_exposure_sol + sol_amount > self.cfg.max_sol_total_exposure:
+        if (
+            not self.cfg.dry_run
+            and self.state.open_exposure_sol + sol_amount > self.cfg.max_sol_total_exposure
+        ):
             return False, (
                 f"Zou totale exposure naar {self.state.open_exposure_sol + sol_amount:.4f} SOL "
                 f"brengen, max is {self.cfg.max_sol_total_exposure}."
@@ -134,10 +145,10 @@ class RiskManager:
                     f"Al {open_positions_count} open posities, max is {effective_max}."
                 )
 
-        if self._trades_in_last_hour() >= self.cfg.max_trades_per_hour:
+        if not self.cfg.dry_run and self._trades_in_last_hour() >= self.cfg.max_trades_per_hour:
             return False, f"Limiet van {self.cfg.max_trades_per_hour} trades/uur bereikt."
 
-        if self.state.realized_pnl_sol <= -abs(self.cfg.max_daily_loss_sol):
+        if not self.cfg.dry_run and self.state.realized_pnl_sol <= -abs(self.cfg.max_daily_loss_sol):
             return False, (
                 f"Dagelijkse verlieslimiet bereikt ({self.state.realized_pnl_sol:.4f} SOL). "
                 f"Bot handelt vandaag niet meer."
