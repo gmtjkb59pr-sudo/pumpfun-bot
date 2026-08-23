@@ -135,6 +135,13 @@ WALLET_RECONCILE_INTERVAL_SEC = 60
 # genuinely-stale drop (up to ~2x WALLET_RECONCILE_INTERVAL_SEC) for real
 # protection against silently abandoning a position that's still held.
 WALLET_MISS_CONFIRMATION_COUNT = 2
+# how long a mint stays excluded from the untracked-holdings sweep after the
+# bot's own code closes it - covers wallet-RPC indexer lag right after a
+# sell lands (confirmed live: a mint was still listed as held by
+# fetch_wallet_token_mints() 8s after its closing sell had already confirmed
+# on-chain). Comfortably longer than WALLET_RECONCILE_INTERVAL_SEC so a
+# mint closed just before a reconcile poll starts is still covered by it.
+RECENTLY_EXITED_GRACE_SEC = 120
 
 EXIT_EMOJI = {
     "take_profit": "🟢", "stop_loss": "🔴", "trailing_stop": "🟡", "timeout": "⏱️",
@@ -254,6 +261,19 @@ class OutcomeTracker:
         # these were never real tracked positions (no entry price, no risk/
         # exposure attribution), just something being cleaned up
         self._untracked_liquidation: dict[str, dict] = {}
+        # mint -> ts of the bot's own last successful real close (normal
+        # exit or untracked-sweep liquidation) - see _reconcile_with_wallet's
+        # use of RECENTLY_EXITED_GRACE_SEC for why this exists: confirmed
+        # live (Alpha, social_watch, 2026-08-23) that the wallet RPC's
+        # getTokenAccountsByOwner index can still list a mint for several
+        # seconds after the sell that emptied+closed its token account has
+        # already landed and confirmed on-chain. Without this, a reconcile
+        # poll landing in that lag window sees the mint as "untracked",
+        # queues a redundant liquidation attempt, and that attempt fails
+        # on-chain with SellZeroAmount (Custom 6022) - harmless (nothing was
+        # actually stuck), but it burns a real priority fee on a doomed tx
+        # every time the timing lines up.
+        self._recently_closed: dict[str, float] = {}
         # the currently in-flight liquidation sweep (if any) - guards
         # against starting an overlapping sweep every reconciliation cycle,
         # which would pile up concurrent RPC/confirm-polling load on top of
@@ -658,7 +678,12 @@ class OutcomeTracker:
             logger.debug("Kon wallet niet verifiëren voor reconciliatie, sla deze ronde over.")
             return
 
-        untracked = held - tracked
+        now = time.time()
+        self._recently_closed = {
+            m: ts for m, ts in self._recently_closed.items()
+            if now - ts < RECENTLY_EXITED_GRACE_SEC
+        }
+        untracked = held - tracked - self._recently_closed.keys()
         # surfaces the gap in the dashboard's "open exposure" figure - that
         # number only ever sums positions this bot tracked opening, so it
         # silently misses whatever's untracked here (confirmed live: the
@@ -802,6 +827,7 @@ class OutcomeTracker:
                             mint=mint, slippage_pct=self.sell_slippage_pct, amount_pct=99,
                         )
                         del self._untracked_liquidation[mint]
+                        self._recently_closed[mint] = time.time()
                         append_jsonl({
                             "type": "untracked_liquidation",
                             "ts": time.time(),
@@ -844,6 +870,7 @@ class OutcomeTracker:
                 continue
 
             del self._untracked_liquidation[mint]
+            self._recently_closed[mint] = time.time()
             append_jsonl({
                 "type": "untracked_liquidation",
                 "ts": time.time(),
@@ -1047,6 +1074,8 @@ class OutcomeTracker:
             async with self._lock:
                 self._pending.pop(mint, None)
                 self._persist_pending()
+            if not self.dry_run:
+                self._recently_closed[mint] = time.time()
 
     async def _exit(
         self, mint: str, info: dict, reason: str, pct_change: float,
