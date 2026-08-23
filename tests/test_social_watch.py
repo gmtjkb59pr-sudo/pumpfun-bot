@@ -898,15 +898,23 @@ class HolderCountIndexingDelayTests(unittest.TestCase):
     """A candidate can get bought on the very first poll cycle if socials
     were already present at launch - well under the indexing delay needed
     for holder count to be real (confirmed live: a mint read 0 holders at
-    buy time, then showed real holders minutes later). _buy() must top up
-    to that minimum, measured from the token's own launch (added_ts), not
-    skip it just because it already waited watch_window_sec.
+    buy time, then showed real holders minutes later). _buy() must not
+    evaluate holder_count/concentration at all until that delay has
+    elapsed, measured from the token's own launch (added_ts) - not skip it
+    just because it already waited watch_window_sec.
+
+    User-requested: _buy() no longer SLEEPS to top up this delay (that
+    blocked the whole poll cycle for every other watched candidate too) -
+    it returns False immediately ("not ready, retry me") without touching
+    the RPC lookup at all, and _poll_once() naturally retries on its next
+    real poll a few seconds later. See TooEarlyStaysOnWatchlistTests below
+    for the retry-after-delay-elapses behavior.
 
     Only applies when min_holder_count > 1 - see the "skip this wait
     entirely" test below for the user-requested speed exemption at the
     trivial (<=1) threshold."""
 
-    def test_tops_up_to_the_indexing_delay_when_bought_on_first_poll(self):
+    def test_returns_false_without_calling_fetch_holder_count_before_the_delay_elapses(self):
         client = FakeClient(trade_events=[{"marketCapSol": 30.0}])
         strategy, _ = _make_strategy(client, dry_run=True, min_holder_count=16)
 
@@ -917,20 +925,21 @@ class HolderCountIndexingDelayTests(unittest.TestCase):
             return 5
 
         with patch(
-            "pumpfun_bot.strategies.social_watch.HOLDER_COUNT_INDEXING_DELAY_SEC", 0.05,
+            "pumpfun_bot.strategies.social_watch.HOLDER_COUNT_INDEXING_DELAY_SEC", 20,
         ), patch(
             "pumpfun_bot.strategies.social_watch.fetch_holder_count", _fake_fetch_holder_count,
         ):
             start = time.time()
             # added_ts == now: bought on the very first poll cycle, zero
-            # elapsed time since launch, so the full (patched, tiny) delay
-            # must still be topped up before the holder-count check runs
-            asyncio.run(strategy._buy("MINT", {
+            # elapsed time since launch - nowhere near the 20s delay yet
+            done = asyncio.run(strategy._buy("MINT", {
                 "mint": "MINT", "name": "Test", "symbol": "TEST", "vSolInBondingCurve": 30.0,
             }, time.time()))
+            elapsed = time.time() - start
 
-        self.assertEqual(len(holder_count_calls), 1)
-        self.assertGreaterEqual(holder_count_calls[0] - start, 0.05)
+        self.assertFalse(done)  # stays on the watchlist, retried later
+        self.assertEqual(holder_count_calls, [])  # never even reached the RPC lookup
+        self.assertLess(elapsed, 1.0)  # and critically, didn't sleep to get there
 
     def test_does_not_sleep_when_already_past_the_indexing_delay(self):
         client = FakeClient(trade_events=[{"marketCapSol": 30.0}])
@@ -976,7 +985,7 @@ class HolderCountIndexingDelayTests(unittest.TestCase):
 
         self.assertLess(elapsed, 1.0)
 
-    def test_tops_up_to_the_settling_delay_when_concentration_filter_is_active(self):
+    def test_returns_false_without_calling_fetch_concentration_before_the_delay_elapses(self):
         # right after launch, virtually all supply sits with the deployer/
         # curve - not an indexing lag, just "no one has traded yet" - so the
         # concentration check needs its own short settling window too
@@ -990,20 +999,19 @@ class HolderCountIndexingDelayTests(unittest.TestCase):
             return 30.0
 
         with patch(
-            "pumpfun_bot.strategies.social_watch.CONCENTRATION_SETTLING_DELAY_SEC", 0.05,
+            "pumpfun_bot.strategies.social_watch.CONCENTRATION_SETTLING_DELAY_SEC", 20,
         ), patch(
             "pumpfun_bot.strategies.social_watch.fetch_top10_concentration_pct",
             _fake_fetch_top10_concentration_pct,
         ):
-            start = time.time()
-            asyncio.run(strategy._buy("MINT", {
+            done = asyncio.run(strategy._buy("MINT", {
                 "mint": "MINT", "name": "Test", "symbol": "TEST", "vSolInBondingCurve": 30.0,
             }, time.time()))
 
-        self.assertEqual(len(concentration_calls), 1)
-        self.assertGreaterEqual(concentration_calls[0] - start, 0.05)
+        self.assertFalse(done)
+        self.assertEqual(concentration_calls, [])
 
-    def test_waits_for_the_longer_of_the_two_delays_when_both_filters_are_active(self):
+    def test_returns_false_until_the_longer_of_the_two_delays_has_elapsed(self):
         client = FakeClient(trade_events=[{"marketCapSol": 30.0}])
         strategy, _ = _make_strategy(
             client, dry_run=True, min_holder_count=16, max_top10_concentration_pct=70,
@@ -1016,25 +1024,21 @@ class HolderCountIndexingDelayTests(unittest.TestCase):
             return 30.0
 
         with patch(
-            "pumpfun_bot.strategies.social_watch.HOLDER_COUNT_INDEXING_DELAY_SEC", 0.2,
+            "pumpfun_bot.strategies.social_watch.HOLDER_COUNT_INDEXING_DELAY_SEC", 20,
         ), patch(
-            "pumpfun_bot.strategies.social_watch.CONCENTRATION_SETTLING_DELAY_SEC", 0.05,
+            "pumpfun_bot.strategies.social_watch.CONCENTRATION_SETTLING_DELAY_SEC", 5,
         ), patch(
             "pumpfun_bot.strategies.social_watch.fetch_holder_count", _fake_fetch_holder_count,
         ), patch(
             "pumpfun_bot.strategies.social_watch.fetch_top10_concentration_pct",
             _fake_fetch_top10_concentration_pct,
         ):
-            start = time.time()
-            asyncio.run(strategy._buy("MINT", {
+            # only 10s old - past the shorter (concentration, 5s) delay but
+            # not the longer (holder count, 20s) one, so still not ready
+            done = asyncio.run(strategy._buy("MINT", {
                 "mint": "MINT", "name": "Test", "symbol": "TEST", "vSolInBondingCurve": 30.0,
-            }, time.time()))
-            elapsed = time.time() - start
-
-        # must wait for the longer (holder count, 0.2s) delay, not just the
-        # shorter (concentration, 0.05s) one, and not both added together
-        self.assertGreaterEqual(elapsed, 0.2)
-        self.assertLess(elapsed, 0.3)
+            }, time.time() - 10))
+        self.assertFalse(done)
 
 
 class FetchFreshRefTests(unittest.TestCase):
@@ -1117,6 +1121,88 @@ class PollOnceTests(unittest.TestCase):
         self.assertIn("MINT", strategy._watching)
         self.assertEqual(client.buy_calls, [])
         self.assertAlmostEqual(risk.state.open_exposure_sol, 0.0)
+
+    def test_stays_on_watchlist_when_holder_count_still_too_low(self):
+        # user-requested (option 3): a candidate with socials but not
+        # enough holders YET must stay on the watchlist for a later poll to
+        # retry, not get dropped after a single miss
+        client = FakeClient(trade_events=[{"marketCapSol": 30.0}])
+        strategy, risk = _make_strategy(client, dry_run=False, min_holder_count=50)
+        strategy._watching["MINT"] = {
+            "event": {
+                "mint": "MINT", "name": "Test", "symbol": "TEST",
+                "uri": "https://example.invalid/meta.json", "vSolInBondingCurve": 30.0,
+            },
+            "added_ts": time.time() - 25,  # past the indexing delay
+        }
+
+        async def _fake_has_socials(uri):
+            return True
+
+        async def _fake_fetch_holder_count(mint, rpc_http_url):
+            return 12  # below the 50 minimum
+
+        with patch(
+            "pumpfun_bot.strategies.social_watch.fetch_has_socials", _fake_has_socials,
+        ), patch(
+            "pumpfun_bot.strategies.social_watch.fetch_holder_count", _fake_fetch_holder_count,
+        ):
+            asyncio.run(strategy._poll_once())
+
+        self.assertIn("MINT", strategy._watching)  # NOT dropped
+        self.assertEqual(client.buy_calls, [])
+        self.assertAlmostEqual(risk.state.open_exposure_sol, 0.0)
+
+    def test_buys_on_a_later_poll_once_holder_count_clears_the_bar(self):
+        # the other half of the retry story: a candidate that missed on an
+        # earlier poll (still on the watchlist) buys as soon as a LATER
+        # poll finds it's cleared the threshold
+        client = FakeClient(trade_events=[{"marketCapSol": 30.0}])
+        strategy, risk = _make_strategy(client, dry_run=False, min_holder_count=50)
+        strategy._watching["MINT"] = {
+            "event": {
+                "mint": "MINT", "name": "Test", "symbol": "TEST",
+                "uri": "https://example.invalid/meta.json", "vSolInBondingCurve": 30.0,
+            },
+            "added_ts": time.time() - 25,
+        }
+
+        async def _fake_has_socials(uri):
+            return True
+
+        async def _fake_fetch_holder_count(mint, rpc_http_url):
+            return 60  # now above the 50 minimum
+
+        with patch(
+            "pumpfun_bot.strategies.social_watch.fetch_has_socials", _fake_has_socials,
+        ), patch(
+            "pumpfun_bot.strategies.social_watch.fetch_holder_count", _fake_fetch_holder_count,
+        ):
+            asyncio.run(strategy._poll_once())
+
+        self.assertNotIn("MINT", strategy._watching)  # bought, removed
+        self.assertEqual(len(client.buy_calls), 1)
+        self.assertAlmostEqual(risk.state.open_exposure_sol, 0.03)
+
+    def test_eventually_expires_a_candidate_that_never_clears_holder_count(self):
+        # the watch window itself is the ultimate backstop - retrying
+        # doesn't mean watching forever
+        client = FakeClient(trade_events=[{"marketCapSol": 30.0}])
+        strategy, risk = _make_strategy(client, dry_run=False, min_holder_count=50)
+        strategy._watching["MINT"] = {
+            "event": {
+                "mint": "MINT", "name": "Test", "symbol": "TEST",
+                "uri": "https://example.invalid/meta.json", "vSolInBondingCurve": 30.0,
+            },
+            "added_ts": time.time() - 61,  # past watch_window_sec (60)
+        }
+
+        with patch("pumpfun_bot.strategies.social_watch.fetch_has_socials") as mock_fetch:
+            asyncio.run(strategy._poll_once())
+            mock_fetch.assert_not_called()  # expired before even checking socials again
+
+        self.assertNotIn("MINT", strategy._watching)
+        self.assertEqual(client.buy_calls, [])
 
 
 if __name__ == "__main__":
