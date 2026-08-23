@@ -151,6 +151,41 @@ class BirdeyeMoversConfig:
 
 
 @dataclass
+class CoinGeckoMoversConfig:
+    """Same discovery niche as BirdeyeMoversConfig (already-existing tokens
+    spiking, not brand-new launches) via CoinGecko's free Demo API plan
+    instead - much higher budget (10,000 calls/month vs Birdeye's ~1,000),
+    so this can poll far more often and react to genuinely short-window
+    momentum (m5/m15/m30) instead of only a 24h lagging signal. See
+    coingecko.py's module docstring for the API/budget details, and
+    coingecko_movers.py for why the same is_pump_fun_mint() filter from
+    birdeye_movers.py applies here too - CoinGecko's trending pools are
+    Solana-wide, not pump.fun-specific, same as Birdeye's."""
+    enabled: bool = False
+    api_key: str = ""
+    # user-requested: CoinGecko's free Demo plan is 100 calls/min, 10,000
+    # calls/month - 300s (5 min) is 8,640 calls/month running 24/7,
+    # comfortably under that with margin. Do not lower without checking
+    # the actual monthly usage on the CoinGecko developer dashboard first.
+    poll_interval_sec: int = 300
+    trending_limit: int = 20
+    # which of CoinGecko's price_change_percentage windows (m5/m15/m30/h1/
+    # h6/h24) gates the buy decision - defaults to the shortest available,
+    # matching social_watch's own evidence-based use of a 5-minute window
+    momentum_window: str = "m5"
+    min_holder_count: int = 0
+    max_top10_concentration_pct: float = 0
+    # same bonding-curve-graduation-margin reasoning as BirdeyeMoversConfig
+    max_market_cap_usd: float = 100_000
+    take_profit_pct: float = 50
+    stop_loss_pct: float = 25
+    trailing_activation_pct: float = 20
+    trailing_stop_pct: float = 15
+    max_open_positions: int = 5
+    trade_size_sol: float = 0.0
+
+
+@dataclass
 class CopyTradeConfig:
     enabled: bool = False
     watched_wallets: list = field(default_factory=list)
@@ -183,6 +218,7 @@ class AppConfig:
     sniper: SniperConfig
     social_watch: SocialWatchConfig
     birdeye_movers: BirdeyeMoversConfig
+    coingecko_movers: CoinGeckoMoversConfig
     copytrade: CopyTradeConfig
     market_maker: MarketMakerConfig
     alerts_console: bool
@@ -273,13 +309,32 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         trending_limit=be_raw.get("trending_limit", 20),
         min_holder_count=be_raw.get("min_holder_count", 0),
         max_top10_concentration_pct=be_raw.get("max_top10_concentration_pct", 0),
-        max_market_cap_usd=be_raw.get("max_market_cap_usd", 20_000_000),
+        max_market_cap_usd=be_raw.get("max_market_cap_usd", 100_000),
         max_open_positions=be_raw.get("max_open_positions", 5),
         trade_size_sol=be_raw.get("trade_size_sol", 0.0),
         take_profit_pct=be_raw.get("take_profit_pct", 50),
         stop_loss_pct=be_raw.get("stop_loss_pct", 25),
         trailing_activation_pct=be_raw.get("trailing_activation_pct", 20),
         trailing_stop_pct=be_raw.get("trailing_stop_pct", 15),
+    )
+
+    cg_raw = strat_raw.get("coingecko_movers", {})
+    cg_key_var = cg_raw.get("api_key_env_var", "COINGECKO_API_KEY")
+    coingecko_movers = CoinGeckoMoversConfig(
+        enabled=cg_raw.get("enabled", False),
+        api_key=os.environ.get(cg_key_var, ""),
+        poll_interval_sec=cg_raw.get("poll_interval_sec", 300),
+        trending_limit=cg_raw.get("trending_limit", 20),
+        momentum_window=cg_raw.get("momentum_window", "m5"),
+        min_holder_count=cg_raw.get("min_holder_count", 0),
+        max_top10_concentration_pct=cg_raw.get("max_top10_concentration_pct", 0),
+        max_market_cap_usd=cg_raw.get("max_market_cap_usd", 100_000),
+        max_open_positions=cg_raw.get("max_open_positions", 5),
+        trade_size_sol=cg_raw.get("trade_size_sol", 0.0),
+        take_profit_pct=cg_raw.get("take_profit_pct", 50),
+        stop_loss_pct=cg_raw.get("stop_loss_pct", 25),
+        trailing_activation_pct=cg_raw.get("trailing_activation_pct", 20),
+        trailing_stop_pct=cg_raw.get("trailing_stop_pct", 15),
     )
 
     ct_raw = strat_raw.get("copytrade", {})
@@ -322,6 +377,7 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         sniper=sniper,
         social_watch=social_watch,
         birdeye_movers=birdeye_movers,
+        coingecko_movers=coingecko_movers,
         copytrade=copytrade,
         market_maker=market_maker,
         alerts_console=alerts_raw.get("console", True),

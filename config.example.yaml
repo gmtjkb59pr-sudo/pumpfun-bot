@@ -111,6 +111,35 @@ strategies:
     # eigen trade-grootte, los van de gedeelde risk.max_sol_per_trade - 0 = gebruik die gedeelde waarde
     trade_size_sol: 0
 
+  coingecko_movers:
+    # Zelfde niche als birdeye_movers hierboven (al bestaande tokens die
+    # plotseling bewegen), maar via CoinGecko's gratis Demo API plan -
+    # veel hoger call-budget (10.000/maand vs Birdeye's ~1.000) waardoor dit
+    # veel vaker kan pollen en op een echt kort momentum-venster kan
+    # reageren. Vereist een gratis CoinGecko account + Demo API key, zie
+    # .env.example (COINGECKO_API_KEY). Gebruikt dezelfde is_pump_fun_mint()
+    # filter als birdeye_movers - zie coingecko_movers.py.
+    enabled: false
+    api_key_env_var: "COINGECKO_API_KEY"
+    # CoinGecko's gratis Demo plan is 100 calls/min, 10.000 calls/maand -
+    # 300s (5 min) is 8.640 calls/maand 24/7, ruim binnen dat budget. NIET
+    # verlagen zonder eerst het echte verbruik op het CoinGecko dashboard
+    # te checken.
+    poll_interval_sec: 300
+    trending_limit: 20
+    # welk van CoinGecko's price_change_percentage vensters (m5/m15/m30/h1/
+    # h6/h24) de buy-beslissing bepaalt - standaard het kortste beschikbare
+    momentum_window: "m5"
+    min_holder_count: 1
+    max_top10_concentration_pct: 90
+    max_market_cap_usd: 100000
+    take_profit_pct: 50
+    stop_loss_pct: 25
+    trailing_activation_pct: 20
+    trailing_stop_pct: 15
+    max_open_positions: 5
+    trade_size_sol: 0
+
   copytrade:
     enabled: false
     watched_wallets:
