@@ -161,11 +161,12 @@ class PumpPortalClient:
         slippage_pct: float,
         priority_fee_sol: float = PRIORITY_FEE_SOL_PER_LEG,
         pool: str = "auto",
+        amount_pct: float = 100,
     ) -> dict:
         """
-        Verkoopt 100% van wat deze wallet aan `mint` in bezit heeft - voor een
-        volledige exit (take-profit/stop-loss/timeout), niet een gedeeltelijke
-        SOL-gedenomineerde sell. Gebruikt amount: "100%" met
+        Verkoopt amount_pct% van wat deze wallet aan `mint` in bezit heeft -
+        voor een volledige exit (take-profit/stop-loss/timeout), niet een
+        gedeeltelijke SOL-gedenomineerde sell. Gebruikt amount: "{pct}%" met
         denominatedInSol: "false", zoals PumpPortal's Local Trading API docs
         beschrijven (https://pumpportal.fun/local-trading-api/trading-api).
 
@@ -178,19 +179,29 @@ class PumpPortalClient:
         those hit are a separate, still-unexplained issue, NOT pool
         routing. Kept "auto" as the default anyway (strictly more capable,
         costs nothing), just not overselling what it fixes.
+
+        amount_pct: default 100 (unchanged behavior). Confirmed live via
+        getTransaction logs that these same 3 stuck positions ALL fail with
+        an AnchorError thrown in programs/pump/src/lib.rs:801 ("Overflow",
+        Custom 6024) right after a successful GetFees sub-call - consistent
+        with an edge case in fully-liquidating a position, not a slippage
+        or balance-index problem (see outcome_tracker.py's _exit(), which
+        retries at amount_pct=99 once a position hits
+        MAX_CONSECUTIVE_SELL_FAILURES at 100%, before giving up entirely).
         """
+        amount = f"{amount_pct:g}%"
         body = {
             "publicKey": str(self.keypair.pubkey()),
             "action": "sell",
             "mint": mint,
-            "amount": "100%",
+            "amount": amount,
             "denominatedInSol": "false",
             "slippage": slippage_pct,
             "priorityFee": priority_fee_sol,
             "pool": pool,
         }
         sig = await self._sign_and_send(body)
-        return {"signature": sig, "action": "sell", "mint": mint, "amount": "100%"}
+        return {"signature": sig, "action": "sell", "mint": mint, "amount": amount}
 
     async def _sign_and_send(self, body: dict) -> str:
         # timing + blockhash-validity diagnostics for BlockhashNotFound

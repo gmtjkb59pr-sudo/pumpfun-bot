@@ -65,18 +65,27 @@ class _FakeKeypair:
 class FakeClient:
     """Stands in for PumpPortalClient - no real network calls."""
 
-    def __init__(self, *, should_fail=False, signature="fake_sig"):
+    def __init__(self, *, should_fail=False, signature="fake_sig", fail_at_amount_pcts=None):
         self.should_fail = should_fail
+        # user-requested: simulates the real 99% fallback-sell path (see
+        # outcome_tracker.py's _exit()) - fail only at these specific
+        # amount_pct values (e.g. {100} to always fail the first attempt
+        # but succeed once _exit() retries at 99), rather than the blanket
+        # should_fail. None keeps the original all-or-nothing behavior.
+        self.fail_at_amount_pcts = fail_at_amount_pcts
         self.signature = signature
         self.sell_calls = []
         self.keypair = _FakeKeypair()
         self.rpc_http_url = "https://example.invalid/rpc"
 
-    async def build_and_send_full_sell(self, mint, slippage_pct):
-        self.sell_calls.append((mint, slippage_pct))
-        if self.should_fail:
+    async def build_and_send_full_sell(self, mint, slippage_pct, amount_pct=100):
+        self.sell_calls.append((mint, slippage_pct, amount_pct))
+        if self.fail_at_amount_pcts is not None:
+            if amount_pct in self.fail_at_amount_pcts:
+                raise RuntimeError(f"simulated RPC failure at {amount_pct}%")
+        elif self.should_fail:
             raise RuntimeError("simulated RPC failure")
-        return {"signature": self.signature, "action": "sell", "mint": mint, "amount": "100%"}
+        return {"signature": self.signature, "action": "sell", "mint": mint, "amount": f"{amount_pct}%"}
 
     async def build_and_send_trade(self, action, mint, amount_sol, slippage_pct):
         self.sell_calls.append((mint, slippage_pct, action, amount_sol))
@@ -343,7 +352,7 @@ class ClosesPositionAtFinalCheckpointTests(unittest.TestCase):
         }
         asyncio.run(tracker._emit_due_checkpoints())
 
-        self.assertEqual(client.sell_calls, [("MINT", tracker.sell_slippage_pct)])
+        self.assertEqual(client.sell_calls, [("MINT", tracker.sell_slippage_pct, 100)])
         self.assertNotIn("MINT", tracker._pending)
         self.assertAlmostEqual(risk.state.open_exposure_sol, 0.0)
         # unknown price -> 0 pnl from the trade itself, but the real priority
@@ -865,6 +874,94 @@ class WsMessageHandlingTests(unittest.TestCase):
         asyncio.run(tracker._handle_ws_message(raw))
 
         self.assertTrue(tracker._warned_no_access)
+
+
+class PriceRefFieldConsistencyTests(unittest.TestCase):
+    """Real bug found live (twice): a position exited at exactly -100.0%
+    within 1.7s and 4.9s of buying - not a real crash. entry_ref came from
+    one PumpPortal field (e.g. marketCapSol), but a later WS trade event
+    for the same mint was missing that field, and extract_price_ref() fell
+    through to a different, scale-incompatible one (e.g. price - ~1e9x
+    smaller for a fixed-supply token). track()'s price_ref_field records
+    which field the entry came from, and _handle_ws_message must re-extract
+    ONLY that same field for every later update on that position - never
+    substitute a different one, even if present."""
+
+    def test_a_later_event_missing_the_recorded_field_is_ignored(self):
+        tracker = OutcomeTracker(ws_url="wss://example.invalid")
+        asyncio.run(tracker.track(
+            "MINT", "Test", "TEST", entry_ref=30.0, trade_size_sol=0.03,
+            price_ref_field="marketCapSol",
+        ))
+
+        # this event has NO marketCapSol - only a wildly different-scale
+        # "price" field, exactly the scenario that produced the bogus -100%
+        raw = json.dumps({"mint": "MINT", "price": 0.00000003})
+        asyncio.run(tracker._handle_ws_message(raw))
+
+        # never applied - last_ref/has_real_update untouched
+        self.assertEqual(tracker._pending["MINT"]["last_ref"], 30.0)
+        self.assertFalse(tracker._pending["MINT"]["has_real_update"])
+        self.assertIn("MINT", tracker._pending)  # and critically, no bogus stop-loss exit
+
+    def test_a_later_event_with_the_recorded_field_is_applied_normally(self):
+        tracker = OutcomeTracker(ws_url="wss://example.invalid")
+        asyncio.run(tracker.track(
+            "MINT", "Test", "TEST", entry_ref=30.0, trade_size_sol=0.03,
+            price_ref_field="marketCapSol",
+        ))
+
+        raw = json.dumps({"mint": "MINT", "marketCapSol": 33.0})
+        asyncio.run(tracker._handle_ws_message(raw))
+
+        self.assertEqual(tracker._pending["MINT"]["last_ref"], 33.0)
+        self.assertTrue(tracker._pending["MINT"]["has_real_update"])
+
+    def test_an_event_with_the_recorded_field_ignores_a_second_field_present(self):
+        # even if the "wrong" field is ALSO present alongside the right
+        # one, only the recorded field is used - never a mix
+        tracker = OutcomeTracker(ws_url="wss://example.invalid")
+        asyncio.run(tracker.track(
+            "MINT", "Test", "TEST", entry_ref=30.0, trade_size_sol=0.03,
+            price_ref_field="vSolInBondingCurve",
+        ))
+
+        raw = json.dumps({"mint": "MINT", "marketCapSol": 999.0, "vSolInBondingCurve": 32.0})
+        asyncio.run(tracker._handle_ws_message(raw))
+
+        self.assertEqual(tracker._pending["MINT"]["last_ref"], 32.0)
+
+    def test_no_recorded_field_falls_back_to_any_field_extraction(self):
+        # backward compat: a position persisted before this fix (or tracked
+        # without price_ref_field, e.g. hand-built test fixtures) keeps the
+        # old any-field behavior rather than being permanently frozen
+        tracker = OutcomeTracker(ws_url="wss://example.invalid")
+        asyncio.run(tracker.track("MINT", "Test", "TEST", entry_ref=100.0, trade_size_sol=0.03))
+
+        raw = json.dumps({"mint": "MINT", "price": 110.0})
+        asyncio.run(tracker._handle_ws_message(raw))
+
+        self.assertEqual(tracker._pending["MINT"]["last_ref"], 110.0)
+
+    def test_the_exact_live_bug_scenario_no_longer_produces_a_bogus_stop_loss(self):
+        # reproduces the real observed case: entry via marketCapSol, then a
+        # trade event lacking it - must NOT trigger stop_loss at -100%
+        risk = RiskManager(RiskConfig())
+        risk.register_trade_opened(0.053)
+        tracker = OutcomeTracker(
+            ws_url="wss://example.invalid", risk=risk, stop_loss_pct=25.0,
+        )
+        asyncio.run(tracker.track(
+            "MINT", "XYZ coin", "XYZ", entry_ref=28.9, trade_size_sol=0.053,
+            price_ref_field="marketCapSol",
+        ))
+
+        raw = json.dumps({"mint": "MINT", "price": 0.0000000289})
+        asyncio.run(tracker._handle_ws_message(raw))
+
+        self.assertIn("MINT", tracker._pending)  # not exited
+        self.assertAlmostEqual(risk.state.open_exposure_sol, 0.053)  # exposure untouched
+        self.assertAlmostEqual(risk.state.realized_pnl_sol, 0.0)
 
 
 class ReconcileWithWalletTests(unittest.TestCase):
@@ -1404,6 +1501,80 @@ class SellFailurePauseTests(unittest.TestCase):
         self.assertNotIn("MINT", tracker._pending)
 
 
+class NinetyNinePercentFallbackSellTests(unittest.TestCase):
+    """User-requested fix, root-caused via real getTransaction logs on the
+    3 positions from SellFailurePauseTests' docstring: every 100% sell
+    attempt failed with the SAME deterministic AnchorError ("Overflow",
+    Custom 6024), thrown right after a successful GetFees sub-call -
+    consistent with an edge case in fully-liquidating a position, not a
+    slippage/balance-index problem. Once a position hits
+    MAX_CONSECUTIVE_SELL_FAILURES at 100%, _exit() now tries once more at
+    99% before giving up - if that clears the same edge case, the position
+    is treated as closed (a ~1% dust remainder is an accepted trade-off,
+    the same threshold the take-profit ladder already treats as
+    "close enough")."""
+
+    def _make_tracker(self, *, client):
+        risk = RiskManager(RiskConfig())
+        risk.register_trade_opened(0.05)
+        tracker = OutcomeTracker(ws_url="wss://example.invalid", risk=risk, client=client, dry_run=False)
+        info = {
+            "entry_ts": time.time() - MIN_SELL_DELAY_SEC - 1,
+            "entry_ref": 100.0, "last_ref": 151.0, "peak_ref": 151.0,
+            "name": "Test Token", "symbol": "TEST", "trade_size_sol": 0.05,
+            "hit": set(), "has_real_update": True,
+        }
+        tracker._pending["MINT"] = info
+        return tracker, risk, info
+
+    def test_falls_back_to_99_percent_and_closes_once_100_percent_has_failed_enough(self):
+        from pumpfun_bot.outcome_tracker import MAX_CONSECUTIVE_SELL_FAILURES
+
+        client = FakeClient(fail_at_amount_pcts={100})
+        tracker, risk, info = self._make_tracker(client=client)
+
+        closed = False
+        for _ in range(MAX_CONSECUTIVE_SELL_FAILURES):
+            closed = asyncio.run(tracker._exit("MINT", dict(tracker._pending["MINT"]), "stale_price", 51.0))
+
+        self.assertTrue(closed)  # the fallback attempt succeeded - caller (_attempt_exit) would now pop it
+        self.assertEqual(client.sell_calls[-1], ("MINT", tracker.sell_slippage_pct, 99))
+        self.assertAlmostEqual(risk.state.open_exposure_sol, 0.0)  # exposure released, position closed
+
+    def test_does_not_attempt_the_fallback_before_the_threshold_is_reached(self):
+        from pumpfun_bot.outcome_tracker import MAX_CONSECUTIVE_SELL_FAILURES
+
+        client = FakeClient(fail_at_amount_pcts={100})
+        tracker, risk, info = self._make_tracker(client=client)
+
+        for _ in range(MAX_CONSECUTIVE_SELL_FAILURES - 1):
+            asyncio.run(tracker._exit("MINT", dict(tracker._pending["MINT"]), "stale_price", 51.0))
+
+        # only 100% attempts so far - the 99% fallback only kicks in once
+        # the threshold is actually reached
+        self.assertTrue(all(call[2] == 100 for call in client.sell_calls))
+        self.assertIn("MINT", tracker._pending)
+        self.assertFalse(tracker._pending["MINT"].get("sell_paused", False))
+
+    def test_pauses_normally_when_the_99_percent_fallback_also_fails(self):
+        # confirms this doesn't change the end state when the edge case
+        # guess is wrong - still pauses exactly as before, just with one
+        # extra real attempt first
+        from pumpfun_bot.outcome_tracker import MAX_CONSECUTIVE_SELL_FAILURES
+
+        client = FakeClient(should_fail=True)  # fails at every amount_pct
+        tracker, risk, info = self._make_tracker(client=client)
+
+        for _ in range(MAX_CONSECUTIVE_SELL_FAILURES):
+            asyncio.run(tracker._exit("MINT", dict(tracker._pending["MINT"]), "stale_price", 51.0))
+
+        self.assertTrue(tracker._pending["MINT"]["sell_paused"])
+        self.assertIn("MINT", tracker._pending)
+        # the final iteration made TWO attempts (100% then 99% fallback)
+        self.assertEqual(client.sell_calls[-2][2], 100)
+        self.assertEqual(client.sell_calls[-1][2], 99)
+
+
 class TrailingStopTests(unittest.TestCase):
     def _make_tracker(
         self, *,
@@ -1543,7 +1714,7 @@ class StalePriceExitTests(unittest.TestCase):
         }
         asyncio.run(tracker._emit_due_checkpoints())
 
-        self.assertEqual(client.sell_calls, [("MINT", tracker.sell_slippage_pct)])
+        self.assertEqual(client.sell_calls, [("MINT", tracker.sell_slippage_pct, 100)])
         self.assertNotIn("MINT", tracker._pending)
         self.assertAlmostEqual(risk.state.realized_pnl_sol, -ROUND_TRIP_PRIORITY_FEE_SOL)
 

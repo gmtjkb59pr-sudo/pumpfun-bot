@@ -101,6 +101,27 @@ class TradeRequestBodyTests(unittest.TestCase):
         self.assertEqual(captured["mint"], "MINT123")
         self.assertEqual(result["signature"], "fake_signature")
 
+    def test_amount_pct_overrides_the_default_100_percent(self):
+        # user-requested: 99% fallback for a real deterministic on-chain
+        # Overflow (Custom 6024) confirmed on 3 stuck positions, all
+        # failing at exactly 100% liquidation - see outcome_tracker.py's
+        # _exit()
+        client = self._make_client()
+        captured = {}
+
+        async def fake_sign_and_send(body):
+            captured.update(body)
+            return "fake_signature"
+
+        client._sign_and_send = fake_sign_and_send
+        result = asyncio.run(
+            client.build_and_send_full_sell(mint="MINT123", slippage_pct=10, amount_pct=99)
+        )
+
+        self.assertEqual(captured["amount"], "99%")
+        self.assertEqual(captured["denominatedInSol"], "false")
+        self.assertEqual(result["amount"], "99%")
+
     def test_buy_is_still_sol_denominated(self):
         # regression guard: build_and_send_trade (used for buys, and for
         # copytrade's partial sells) must keep its existing SOL-denominated
