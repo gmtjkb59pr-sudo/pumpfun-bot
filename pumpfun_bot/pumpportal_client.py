@@ -110,7 +110,7 @@ class PumpPortalClient:
         amount_sol: float,
         slippage_pct: float,
         priority_fee_sol: float = PRIORITY_FEE_SOL_PER_LEG,
-        pool: str = "pump",
+        pool: str = "auto",
     ) -> dict:
         """
         Vraagt een ongesigneerde transactie op bij PumpPortal, signeert lokaal met
@@ -123,6 +123,24 @@ class PumpPortalClient:
         build_and_send_full_sell() - "amount: X SOL" bij een sell verkoopt NIET
         per se de hele positie, alleen tokens ter waarde van X SOL tegen de
         actuele prijs.
+
+        pool="auto" (was hardcoded "pump" - bonding curve only): PumpPortal
+        supports "pump" (bonding curve), "pump-amm" (PumpSwap, where
+        pump.fun tokens graduate to by default since March 2025), and
+        several external DEXes, with "auto" routing to wherever the token
+        actually trades right now - a real limitation of hardcoding "pump"
+        for any position that outlives its own migration. Tested directly
+        against PumpPortal tonight, though: this was NOT what caused the
+        "400 Bad Request" on birdeye_movers' Truth Coin/OpenAI PreStocks
+        candidates - every pool value failed identically for those two.
+        Root cause turned out to be simpler: neither mint ends in "pump"
+        (pump.fun's vanity-address convention for every mint it launches),
+        meaning Birdeye's Solana-wide trending list surfaced two tokens
+        that were never pump.fun tokens at all - PumpPortal correctly has
+        no route for them regardless of pool. See birdeye_movers.py's
+        is_pump_fun_mint() for the actual fix. "auto" is kept anyway since
+        it's a strict superset of "pump" per PumpPortal's own docs and
+        costs nothing, but it does not explain tonight's failures.
         """
         body = {
             "publicKey": str(self.keypair.pubkey()),
@@ -142,7 +160,7 @@ class PumpPortalClient:
         mint: str,
         slippage_pct: float,
         priority_fee_sol: float = PRIORITY_FEE_SOL_PER_LEG,
-        pool: str = "pump",
+        pool: str = "auto",
     ) -> dict:
         """
         Verkoopt 100% van wat deze wallet aan `mint` in bezit heeft - voor een
@@ -150,6 +168,16 @@ class PumpPortalClient:
         SOL-gedenomineerde sell. Gebruikt amount: "100%" met
         denominatedInSol: "false", zoals PumpPortal's Local Trading API docs
         beschrijven (https://pumpportal.fun/local-trading-api/trading-api).
+
+        pool="auto" (was hardcoded "pump") - see build_and_send_trade's
+        docstring for the full reasoning and what it does/doesn't explain.
+        Tested directly against the 3 real long-stuck positions tonight
+        (585UP, TOXCOM, $MAMA): PumpPortal builds a valid transaction for
+        all three regardless of "pump" vs "auto" - both succeed at the
+        build step identically, so the Custom 6022/6024 on-chain failures
+        those hit are a separate, still-unexplained issue, NOT pool
+        routing. Kept "auto" as the default anyway (strictly more capable,
+        costs nothing), just not overselling what it fixes.
         """
         body = {
             "publicKey": str(self.keypair.pubkey()),

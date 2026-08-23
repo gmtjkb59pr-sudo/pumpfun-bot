@@ -8,7 +8,7 @@ import pumpfun_bot.activity_log as activity_log
 from pumpfun_bot.config import BirdeyeMoversConfig, RiskConfig
 from pumpfun_bot.outcome_tracker import OutcomeTracker
 from pumpfun_bot.risk import RiskManager
-from pumpfun_bot.strategies.birdeye_movers import BirdeyeMoversStrategy
+from pumpfun_bot.strategies.birdeye_movers import BirdeyeMoversStrategy, is_pump_fun_mint
 
 _ORIGINAL_DATA_LOG_PATH = activity_log.DATA_LOG_PATH
 _TEST_LOG_FILE = None
@@ -72,7 +72,7 @@ def _make_strategy(
 
 def _token(**overrides):
     base = {
-        "address": "MINT", "name": "Test Token", "symbol": "TEST",
+        "address": "MINTpump", "name": "Test Token", "symbol": "TEST",
         "price": 1.5, "price24hChangePercent": 42.0, "volume24hUSD": 100000.0,
         "marketcap": 50000.0,  # realistic small-memecoin cap, well under the default ceiling
     }
@@ -94,7 +94,30 @@ async def _async_return(value):
     return value
 
 
+class IsPumpFunMintTests(unittest.TestCase):
+    def test_accepts_a_real_pump_fun_style_mint(self):
+        self.assertTrue(is_pump_fun_mint("BUXBsh4FxjSGbR2H5MJFg3c3Xf5hYRV4hG3u51iUpump"))
+
+    def test_rejects_a_mint_confirmed_live_to_have_no_pumpportal_route(self):
+        # Truth Coin and OpenAI PreStocks - both real Birdeye trending
+        # candidates tonight, both failed to buy with a 400 from
+        # PumpPortal under every pool value tested
+        self.assertFalse(is_pump_fun_mint("8wEZ5cavCg2zvGzo91FnjaEbYv4bWXyfTFQkSW6QwBHP"))
+        self.assertFalse(is_pump_fun_mint("HiKvhwS1eV4yP5h4p1ZxKGjkvukhxMii23C4W64BApZ"))
+
+    def test_rejects_a_mint_that_merely_contains_pump_not_ending_in_it(self):
+        self.assertFalse(is_pump_fun_mint("pumpXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"))
+
+
 class ConsiderTests(unittest.TestCase):
+    def test_skips_a_candidate_that_is_not_a_real_pump_fun_mint(self):
+        client = FakeClient()
+        strategy, risk = _make_strategy(client, dry_run=False)
+
+        asyncio.run(strategy._consider(_token(address="8wEZ5cavCg2zvGzo91FnjaEbYv4bWXyfTFQkSW6QwBHP")))
+
+        self.assertEqual(client.buy_calls, [])
+
     def test_skips_when_already_tracked(self):
         store_file = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
         store_file.close()
@@ -104,7 +127,7 @@ class ConsiderTests(unittest.TestCase):
         client = FakeClient()
         outcome_tracker = OutcomeTracker(ws_url="wss://example.invalid", position_store_path=store_path)
         asyncio.run(outcome_tracker.track(
-            "MINT", "Already Held", "HELD", entry_ref=100.0, trade_size_sol=0.03,
+            "MINTpump", "Already Held", "HELD", entry_ref=100.0, trade_size_sol=0.03,
         ))
         strategy, risk = _make_strategy(client, dry_run=False, outcome_tracker=outcome_tracker)
 
@@ -184,7 +207,7 @@ class ConsiderTests(unittest.TestCase):
             asyncio.run(strategy._consider(_token()))
 
         self.assertEqual(len(client.buy_calls), 1)
-        self.assertEqual(client.buy_calls[0], ("buy", "MINT", 0.03))
+        self.assertEqual(client.buy_calls[0], ("buy", "MINTpump", 0.03))
 
     def test_live_buy_failure_is_handled_gracefully(self):
         client = FakeClient(should_fail_buy=True)
@@ -323,7 +346,7 @@ class PollOnceTests(unittest.TestCase):
     def test_considers_every_returned_token(self):
         client = FakeClient()
         strategy, risk = _make_strategy(client, dry_run=False)
-        tokens = [_token(address="MINT1"), _token(address="MINT2")]
+        tokens = [_token(address="MINT1pump"), _token(address="MINT2pump")]
 
         async def _fake_fetch(api_key, limit=20):
             return tokens
