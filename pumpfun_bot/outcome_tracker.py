@@ -47,7 +47,7 @@ import time
 
 import websockets
 
-from . import position_store
+from . import activity_log, position_store
 from .activity_log import append_jsonl
 from .alerts import Alerter
 from .fees import ROUND_TRIP_PRIORITY_FEE_SOL, net_pct_change_after_fees
@@ -127,6 +127,45 @@ EXIT_EMOJI = {
     "take_profit": "🟢", "stop_loss": "🔴", "trailing_stop": "🟡", "timeout": "⏱️",
     "timeout_unmeasured": "❔", "stale_price": "💤", "stale_price_unmeasured": "💤",
 }
+
+
+def load_confirmed_unsellable_mints(log_path=None) -> set[str]:
+    """Returns every mint that has ever logged a "sell_paused" record (see
+    _record_sell_failure and _liquidate_untracked_holdings_inner, both of
+    which append one once a mint hits MAX_CONSECUTIVE_SELL_FAILURES) -
+    user-requested: without this, the untracked-holdings liquidation sweep
+    forgot this history on every restart (its pause state is in-memory
+    only) and re-burned a real priority fee re-proving the same
+    already-known-unsellable mint every single time, since the deterministic
+    on-chain errors behind this never resolve. Fails open (empty set) on a
+    missing/unreadable log - never treat "can't read the history" as
+    license to skip a real liquidation attempt that might actually work.
+
+    log_path defaults to None (not activity_log.DATA_LOG_PATH bound at
+    import time) and is resolved fresh here on every call - same reasoning
+    as OutcomeTracker.position_store_path: a module-level default captured
+    at import time would never see a test's later reassignment of
+    activity_log.DATA_LOG_PATH."""
+    if log_path is None:
+        log_path = activity_log.DATA_LOG_PATH
+    mints: set[str] = set()
+    try:
+        with open(log_path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if d.get("type") == "sell_paused":
+                    mint = d.get("mint")
+                    if mint:
+                        mints.add(mint)
+    except FileNotFoundError:
+        pass
+    return mints
 
 
 def is_funded_key_rejection(message: str) -> bool:
@@ -211,7 +250,16 @@ class OutcomeTracker:
     def load_pending(self) -> None:
         """Reconstructs _pending from disk - call once at startup, before
         run(), so a restart resumes tracking real open positions instead of
-        silently abandoning them (see position_store.py module docstring)."""
+        silently abandoning them (see position_store.py module docstring).
+
+        Also pre-seeds _untracked_liquidation with mints already confirmed
+        unsellable in a PAST session (see load_confirmed_unsellable_mints) -
+        without this, every restart forgot that history and re-attempted
+        (and re-failed, and re-paid the fee for) a liquidation already
+        proven doomed. A mint that's back in _pending this run isn't
+        untracked anymore, so it's excluded here - that's the real, still-
+        tracked position's own sell_paused flag (persisted separately in
+        position_store) to manage, not this one."""
         loaded = position_store.load(self.position_store_path)
         if loaded:
             logger.warning(
@@ -219,6 +267,21 @@ class OutcomeTracker:
                 len(loaded), ", ".join(loaded.keys()),
             )
         self._pending.update(loaded)
+
+        if not self.dry_run:
+            previously_unsellable = load_confirmed_unsellable_mints() - set(self._pending.keys())
+            if previously_unsellable:
+                logger.info(
+                    "%d niet-getrackte holding(s) al eerder bevestigd onverkoopbaar - "
+                    "wordt deze run niet opnieuw geprobeerd: %s",
+                    len(previously_unsellable), ", ".join(sorted(previously_unsellable)),
+                )
+            for mint in previously_unsellable:
+                self._untracked_liquidation[mint] = {
+                    "consecutive_failures": MAX_CONSECUTIVE_SELL_FAILURES,
+                    "last_attempt_ts": 0.0,
+                    "paused": True,
+                }
 
     def _persist_pending(self) -> None:
         position_store.save(self._pending, self.position_store_path)
