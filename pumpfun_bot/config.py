@@ -33,6 +33,18 @@ class RiskConfig:
     # session loss reaches this many dollars - user-requested "stop after
     # losing $X", not "stop once the wallet is down to $Y". 0 = disabled.
     max_real_loss_usd: float = 0
+    # user-requested, real incident 2026-08-23: max_sol_total_exposure is a
+    # FIXED number - re-enabling sniper with a fixed cap larger than the
+    # actual (much smaller, after a day of losses) wallet balance let it
+    # spend the wallet down from 0.114 to 0.0012 SOL in about 90 seconds,
+    # since nothing scaled the cap to what was actually left. This caps
+    # total exposure at a PERCENTAGE of the wallet's real, live SOL balance
+    # instead (see risk.py's update_live_balance()/can_trade()) - shrinks
+    # automatically as the wallet shrinks, grows automatically after a
+    # top-up, without needing a manual config edit either way. 0 = disabled
+    # (falls back to max_sol_total_exposure alone, the old fixed-cap-only
+    # behavior) so existing configs without this field are unaffected.
+    max_exposure_pct_of_balance: float = 0
 
 
 @dataclass
@@ -413,6 +425,7 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         max_open_positions=risk_raw.get("max_open_positions", 1000),
         min_wallet_balance_usd=risk_raw.get("min_wallet_balance_usd", 0),
         max_real_loss_usd=risk_raw.get("max_real_loss_usd", 0),
+        max_exposure_pct_of_balance=risk_raw.get("max_exposure_pct_of_balance", 0),
     )
 
     strat_raw = raw.get("strategies", {})

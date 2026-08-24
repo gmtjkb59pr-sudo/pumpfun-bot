@@ -104,6 +104,22 @@ async def watch_balance_floor(
             raise BalanceFloorReached(message)
 
 
+async def watch_and_update_live_balance(
+    risk_manager, wallet_pubkey: str, rpc_http_url: str, poll_interval_sec: float = 30.0,
+) -> None:
+    """Runs forever, keeping RiskManager.state.live_balance_sol fresh via
+    update_live_balance() - see can_trade()'s max_exposure_pct_of_balance
+    check for why this exists. Unlike watch_balance_floor/watch_max_real_loss,
+    this never raises - it's not a kill-switch, just a cache refresh, so a
+    failed lookup is simply skipped for that cycle (the cap check already
+    fails open on a stale/missing reading)."""
+    while True:
+        balance_sol = await fetch_sol_balance(wallet_pubkey, rpc_http_url)
+        if balance_sol is not None:
+            risk_manager.update_live_balance(balance_sol)
+        await asyncio.sleep(poll_interval_sec)
+
+
 async def watch_max_real_loss(
     max_loss_usd: float, alerter=None, poll_interval_sec: float = 30.0,
 ) -> None:

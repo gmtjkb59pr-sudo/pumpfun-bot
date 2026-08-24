@@ -7,6 +7,7 @@ from pumpfun_bot.balance_watch import (
     MaxRealLossReached,
     fetch_sol_balance,
     fetch_sol_usd_price,
+    watch_and_update_live_balance,
     watch_balance_floor,
     watch_max_real_loss,
 )
@@ -185,6 +186,86 @@ class WatchBalanceFloorTests(unittest.TestCase):
                     pass
 
         asyncio.run(_drive())  # must not raise BalanceFloorReached
+
+
+class _FakeRiskManager:
+    def __init__(self):
+        self.updates = []
+
+    def update_live_balance(self, balance_sol):
+        self.updates.append(balance_sol)
+
+
+class WatchAndUpdateLiveBalanceTests(unittest.TestCase):
+    """Keeps RiskManager.state.live_balance_sol fresh for can_trade()'s
+    max_exposure_pct_of_balance check - never raises, just a cache refresh,
+    so a failed lookup is skipped rather than propagated."""
+
+    def test_updates_the_risk_manager_on_a_successful_lookup(self):
+        risk_manager = _FakeRiskManager()
+
+        async def _fake_balance(wallet_pubkey, rpc_http_url):
+            return 0.25
+
+        async def _drive():
+            with patch("pumpfun_bot.balance_watch.fetch_sol_balance", _fake_balance):
+                try:
+                    await asyncio.wait_for(
+                        watch_and_update_live_balance(
+                            risk_manager, "WALLET", "https://example.invalid/rpc", poll_interval_sec=0,
+                        ),
+                        timeout=0.05,
+                    )
+                except asyncio.TimeoutError:
+                    pass  # expected - loops forever
+
+        asyncio.run(_drive())
+        self.assertTrue(risk_manager.updates)
+        self.assertAlmostEqual(risk_manager.updates[0], 0.25)
+
+    def test_a_failed_lookup_is_skipped_not_treated_as_zero(self):
+        risk_manager = _FakeRiskManager()
+
+        async def _fake_balance(wallet_pubkey, rpc_http_url):
+            return None
+
+        async def _drive():
+            with patch("pumpfun_bot.balance_watch.fetch_sol_balance", _fake_balance):
+                try:
+                    await asyncio.wait_for(
+                        watch_and_update_live_balance(
+                            risk_manager, "WALLET", "https://example.invalid/rpc", poll_interval_sec=0,
+                        ),
+                        timeout=0.05,
+                    )
+                except asyncio.TimeoutError:
+                    pass
+
+        asyncio.run(_drive())
+        self.assertEqual(risk_manager.updates, [])
+
+    def test_fetches_immediately_without_waiting_out_the_first_interval(self):
+        risk_manager = _FakeRiskManager()
+
+        async def _fake_balance(wallet_pubkey, rpc_http_url):
+            return 0.5
+
+        async def _drive():
+            with patch("pumpfun_bot.balance_watch.fetch_sol_balance", _fake_balance):
+                try:
+                    # a long interval - if the first fetch waited it out,
+                    # this would time out with zero updates recorded
+                    await asyncio.wait_for(
+                        watch_and_update_live_balance(
+                            risk_manager, "WALLET", "https://example.invalid/rpc", poll_interval_sec=100,
+                        ),
+                        timeout=0.05,
+                    )
+                except asyncio.TimeoutError:
+                    pass
+
+        asyncio.run(_drive())
+        self.assertTrue(risk_manager.updates)
 
 
 class WatchMaxRealLossTests(unittest.TestCase):
