@@ -53,6 +53,70 @@ class RealPnlTrackingTests(unittest.TestCase):
         self.assertIsNone(snap["real_pnl_usd"])  # can't compute without a price
 
 
+class ExternalTransferAccountingTests(unittest.TestCase):
+    """User-requested 2026-08-24 ("the actual profit is not right because
+    i topped up the bot with 10 dollar it is actually down 3") -
+    real_pnl_sol was just current_balance - session_start_balance, with no
+    way to know a manual deposit/withdrawal had landed mid-session. A
+    $10 top-up 23 seconds after session start showed up entirely as
+    "trading profit" until this."""
+
+    def test_net_external_transfers_defaults_to_zero(self):
+        state = BotState()
+        self.assertEqual(state.snapshot()["net_external_transfers_sol"], 0.0)
+
+    def test_a_deposit_is_excluded_from_real_pnl(self):
+        state = BotState()
+        state.set_session_start_balance(0.10, 10.0)
+        state.update_real_balance(0.20, 20.0)  # naive delta would read +0.10
+        state.add_external_transfer(0.10634)  # the deposit that explains most of it
+
+        snap = state.snapshot()
+        # real trading result: (0.20 - 0.10) - 0.10634 = a real loss
+        self.assertAlmostEqual(snap["real_pnl_sol"], 0.20 - 0.10 - 0.10634, places=6)
+        self.assertLess(snap["real_pnl_sol"], 0)
+        self.assertAlmostEqual(snap["net_external_transfers_sol"], 0.10634)
+
+    def test_a_withdrawal_is_added_back_to_real_pnl(self):
+        state = BotState()
+        state.set_session_start_balance(1.0, 150.0)
+        state.update_real_balance(0.5, 75.0)  # naive delta would read -0.5
+        state.add_external_transfer(-0.4)  # the user withdrew 0.4 SOL
+
+        snap = state.snapshot()
+        # real trading result: (0.5 - 1.0) - (-0.4) = -0.1, not -0.5
+        self.assertAlmostEqual(snap["real_pnl_sol"], -0.1, places=6)
+
+    def test_add_external_transfer_recomputes_immediately_not_just_on_next_poll(self):
+        state = BotState()
+        state.set_session_start_balance(0.10, 10.0)
+        state.update_real_balance(0.20, 20.0)
+        before = state.snapshot()["real_pnl_sol"]
+
+        state.add_external_transfer(0.10634)
+
+        after = state.snapshot()["real_pnl_sol"]
+        self.assertNotAlmostEqual(before, after, places=4)
+
+    def test_multiple_transfers_accumulate(self):
+        state = BotState()
+        state.set_session_start_balance(1.0, 150.0)
+        state.add_external_transfer(0.1)
+        state.add_external_transfer(-0.03)
+        state.add_external_transfer(0.05)
+
+        self.assertAlmostEqual(state.snapshot()["net_external_transfers_sol"], 0.12, places=6)
+
+    def test_a_transfer_before_session_start_balance_is_captured_does_not_raise(self):
+        # add_external_transfer only recomputes real_pnl_sol if both
+        # session_start and current balance are already known - must not
+        # crash if it fires before either lookup has completed
+        state = BotState()
+        state.add_external_transfer(0.1)  # must not raise
+        self.assertIsNone(state.snapshot()["real_pnl_sol"])
+        self.assertAlmostEqual(state.snapshot()["net_external_transfers_sol"], 0.1)
+
+
 class UntrackedHoldingsCountTests(unittest.TestCase):
     """open_exposure_sol only ever sums positions the bot tracked opening
     itself - confirmed live: the wallet held real balances of several
