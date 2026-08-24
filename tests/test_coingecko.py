@@ -11,6 +11,7 @@ USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 def _pool(
     base_id=f"solana_TARGETpump", quote_id=f"solana_{SOL_MINT}",
     price_change=None, market_cap_usd="500000.0", volume_h24="123456.0", name="TARGET / SOL",
+    pool_created_at=None,
 ):
     return {
         "attributes": {
@@ -20,6 +21,7 @@ def _pool(
                 "m5": "1.2", "m15": "2.3", "m30": "3.4", "h1": "4.5", "h6": "5.6", "h24": "6.7",
             },
             "volume_usd": {"h24": volume_h24},
+            "pool_created_at": pool_created_at,
         },
         "relationships": {
             "base_token": {"data": {"id": base_id}},
@@ -87,6 +89,25 @@ class ParsePoolCandidateTests(unittest.TestCase):
     def test_pair_name_is_carried_through(self):
         result = parse_pool_candidate(_pool(name="COOL / SOL"))
         self.assertEqual(result["pair_name"], "COOL / SOL")
+
+    def test_pool_created_at_is_parsed_to_a_unix_timestamp(self):
+        # user-requested 2026-08-24 ("how can i test more to be sure this
+        # strategy will work") - confirmed live: real pool_created_at
+        # values range from minutes to 841 DAYS old, previously fetched
+        # but never parsed - this is what lets a real candidate be tagged
+        # "revival" vs "fresh"
+        result = parse_pool_candidate(_pool(pool_created_at="2026-08-23T11:44:49Z"))
+        self.assertIsNotNone(result["pool_created_ts"])
+        # sanity: a real, plausible unix timestamp, not zero/garbage
+        self.assertGreater(result["pool_created_ts"], 1_700_000_000)
+
+    def test_missing_pool_created_at_is_none_not_an_error(self):
+        result = parse_pool_candidate(_pool(pool_created_at=None))
+        self.assertIsNone(result["pool_created_ts"])
+
+    def test_malformed_pool_created_at_is_none_not_an_error(self):
+        result = parse_pool_candidate(_pool(pool_created_at="not-a-real-timestamp"))
+        self.assertIsNone(result["pool_created_ts"])
 
 
 class FetchTrendingPoolsTests(unittest.TestCase):

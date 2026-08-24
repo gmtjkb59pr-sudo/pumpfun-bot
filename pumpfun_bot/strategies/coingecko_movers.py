@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 
 from ..alerts import Alerter
 from ..coingecko import fetch_trending_pools, parse_pool_candidate
@@ -148,11 +149,21 @@ class CoinGeckoMoversStrategy:
 
         pair_name = candidate["pair_name"]
         volume_24h_usd = candidate["volume_24h_usd"]
+        # user-requested 2026-08-24 ("how can i test more to be sure this
+        # strategy will work") - was fetched but never used. Tags every
+        # real candidate as a "revival" (old pool, just started moving
+        # again) or "fresh" (already-hot recent launch) mover - lets real
+        # outcome data eventually answer whether catching revivals
+        # specifically matters, with the strategy already running, before
+        # ever paying for custom on-chain infrastructure to do the same.
+        pool_created_ts = candidate.get("pool_created_ts")
+        pool_age_hours = (time.time() - pool_created_ts) / 3600 if pool_created_ts else None
+        age_str = f", {pool_age_hours:.0f}u oud" if pool_age_hours is not None else ""
         await self.alerter.send(
             f"⚡ CoinGecko-mover kandidaat: {pair_name} - {mint} "
-            f"({price_change_pct:+.1f}% {self.cfg.momentum_window}, ${volume_24h_usd:,.0f} volume 24h)"
+            f"({price_change_pct:+.1f}% {self.cfg.momentum_window}, ${volume_24h_usd:,.0f} volume 24h{age_str})"
             if volume_24h_usd is not None else
-            f"⚡ CoinGecko-mover kandidaat: {pair_name} - {mint} ({price_change_pct:+.1f}% {self.cfg.momentum_window})"
+            f"⚡ CoinGecko-mover kandidaat: {pair_name} - {mint} ({price_change_pct:+.1f}% {self.cfg.momentum_window}{age_str})"
         )
 
         entry_ref = candidate["price_usd"]
@@ -162,6 +173,7 @@ class CoinGeckoMoversStrategy:
             "volume_24h_usd": volume_24h_usd,
             "holder_count": holder_count,
             "top10_concentration_pct": top10_concentration_pct,
+            "pool_age_hours": pool_age_hours,
         }
 
         if self.dry_run:
