@@ -180,6 +180,8 @@ class CoinGeckoMoversStrategy:
                     strategy="coingecko_movers",
                     price_source="usd",
                     take_profit_ladder=self.cfg.take_profit_ladder,
+                    stale_price_timeout_sec=self.cfg.stale_price_timeout_sec,
+                    max_hold_sec=self.cfg.max_hold_sec,
                 )
             return
 
@@ -205,6 +207,8 @@ class CoinGeckoMoversStrategy:
                     strategy="coingecko_movers",
                     price_source="usd",
                     take_profit_ladder=self.cfg.take_profit_ladder,
+                    stale_price_timeout_sec=self.cfg.stale_price_timeout_sec,
+                    max_hold_sec=self.cfg.max_hold_sec,
                 )
         except Exception as exc:  # noqa: BLE001
             logger.exception("CoinGecko-movers buy mislukt voor %s: %s", mint, exc)

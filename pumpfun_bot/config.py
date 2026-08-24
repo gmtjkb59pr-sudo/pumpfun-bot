@@ -304,6 +304,21 @@ class CoinGeckoMoversConfig:
     take_profit_ladder: list = field(default_factory=list)
     max_open_positions: int = 5
     trade_size_sol: float = 0.0
+    # user-requested 2026-08-24 ("what is the best exit strategy for this
+    # kind of strategy") - both previously fell back to
+    # OutcomeTracker's shared sniper-scale defaults (15-min max hold, 10s
+    # stale-price timeout), which assume a brand-new bonding curve that
+    # trades multiple times per second early on. An already-liquid,
+    # already-established "mover" (real $1M+ 24h volume) can go a full
+    # minute between trades while perfectly healthy, and this strategy's
+    # whole premise is a slower, sustained move (5-min momentum window,
+    # ladder rungs up to +20%) - a 10s silence forcing an exit is
+    # premature panic-selling, not real risk management. Widened
+    # proportionally to the ~5-15x slower time horizon this strategy
+    # actually operates on, not derived from real trade data (none exists
+    # yet for this strategy) - revisit once it does.
+    stale_price_timeout_sec: float = 60
+    max_hold_sec: float = 3600
 
 
 @dataclass
@@ -547,6 +562,8 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         trailing_activation_pct=cg_raw.get("trailing_activation_pct", 20),
         trailing_stop_pct=cg_raw.get("trailing_stop_pct", 15),
         take_profit_ladder=_parse_take_profit_ladder(cg_raw.get("take_profit_ladder")),
+        stale_price_timeout_sec=cg_raw.get("stale_price_timeout_sec", 60),
+        max_hold_sec=cg_raw.get("max_hold_sec", 3600),
     )
 
     mh_raw = strat_raw.get("moonshot_hunter", {})
