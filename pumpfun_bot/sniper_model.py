@@ -37,6 +37,22 @@ do):
   our own trade history (see wallet_reputation.py for the adjacent
   blocked-wallet tracking) - falls back to a neutral 0.5 prior for a
   creator with no history
+- activity_window_buy_count: real number of buys observed on the token's
+  live trade stream during sniper's own pre-buy activity-check window
+  (see sniper.py's _pre_buy_activity_check) - added 2026-08-24, user-
+  requested, after the first trained model (on the 3 features above)
+  came in BELOW the majority-class baseline (53.85% vs 57.55%). Root
+  cause: liquidity_sol is nearly constant across launches and
+  creator_win_rate defaults to the same neutral 0.5 for ~93% of rows
+  (most creators launch only once), so the model had almost no real
+  per-row variance to learn from. activity_window_buy_count is the one
+  cheap, already-computed-but-previously-unlogged signal that varies
+  meaningfully per candidate - a genuine "how much organic interest did
+  this get" signal, not a near-constant. Falls back to
+  DEFAULT_ACTIVITY_WINDOW_BUY_COUNT (a sentinel, NOT 0) for any row from
+  before this field was logged, or any candidate where the activity
+  check itself was disabled/skipped that run - distinguishing "not
+  measured" from a genuinely-observed 0 buys.
 """
 from __future__ import annotations
 
@@ -50,7 +66,7 @@ logger = logging.getLogger("pumpfun_bot.sniper_model")
 
 MODEL_PATH = Path("data/sniper_model.json")
 
-FEATURES = ("initial_buy_pct", "liquidity_sol", "creator_win_rate")
+FEATURES = ("initial_buy_pct", "liquidity_sol", "creator_win_rate", "activity_window_buy_count")
 
 # a real trade must clear this real (post-fee) pct_change to count as a
 # "win" label - covers the ~3.5%+ round-trip fee cost (see fees.py), not
@@ -58,6 +74,11 @@ FEATURES = ("initial_buy_pct", "liquidity_sol", "creator_win_rate")
 WIN_MARGIN_PCT = 5.0
 
 DEFAULT_CREATOR_WIN_RATE = 0.5
+
+# sentinel, NOT 0 - a genuinely-observed 0 buys is real signal, "the check
+# wasn't run/logged for this row" is a different thing entirely and must
+# stay distinguishable (see module docstring)
+DEFAULT_ACTIVITY_WINDOW_BUY_COUNT = -1.0
 
 
 def _load_creator_outcomes(activity_log_path: Path) -> list[tuple[float, str, str, bool]]:
@@ -154,7 +175,13 @@ def extract_features(meta: dict, creator_win_rates: dict[str, float]) -> list[fl
         return None
     creator = meta.get("creator")
     creator_win_rate = creator_win_rates.get(creator, DEFAULT_CREATOR_WIN_RATE) if creator else DEFAULT_CREATOR_WIN_RATE
-    return [float(initial_buy_pct), float(liquidity_sol), float(creator_win_rate)]
+    activity_window_buy_count = meta.get("activity_window_buy_count")
+    if activity_window_buy_count is None:
+        activity_window_buy_count = DEFAULT_ACTIVITY_WINDOW_BUY_COUNT
+    return [
+        float(initial_buy_pct), float(liquidity_sol), float(creator_win_rate),
+        float(activity_window_buy_count),
+    ]
 
 
 def _sigmoid(z: float) -> float:
