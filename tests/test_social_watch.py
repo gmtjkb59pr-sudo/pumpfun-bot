@@ -19,6 +19,7 @@ _TEST_LOG_FILE = None
 _market_cap_patcher = None
 _concentration_patcher = None
 _momentum_patcher = None
+_bundle_patcher = None
 
 
 def setUpModule():
@@ -26,7 +27,7 @@ def setUpModule():
     # activity_log.DATA_LOG_PATH - the live buy path (dry_run=False) here
     # isn't mocked, so without this every run of this module wrote fake
     # "MINT" trade records into the real, live activity_log.jsonl
-    global _TEST_LOG_FILE, _market_cap_patcher, _concentration_patcher, _momentum_patcher
+    global _TEST_LOG_FILE, _market_cap_patcher, _concentration_patcher, _momentum_patcher, _bundle_patcher
     _TEST_LOG_FILE = tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False)
     _TEST_LOG_FILE.close()
     activity_log.DATA_LOG_PATH = Path(_TEST_LOG_FILE.name)
@@ -69,6 +70,18 @@ def setUpModule():
     )
     _momentum_patcher.start()
 
+    # same reasoning as above, for fetch_launch_slot_clustering - default to
+    # a single-tx/single-slot result (nothing suspicious) so tests that
+    # don't care about bundle detection never make a real RPC call.
+    async def _fake_fetch_launch_slot_clustering(mint, rpc_http_url):
+        return {"total_txs": 1, "distinct_slots": 1, "max_txs_in_one_slot": 1}
+
+    _bundle_patcher = patch(
+        "pumpfun_bot.strategies.social_watch.fetch_launch_slot_clustering",
+        _fake_fetch_launch_slot_clustering,
+    )
+    _bundle_patcher.start()
+
 
 def tearDownModule():
     activity_log.DATA_LOG_PATH = _ORIGINAL_DATA_LOG_PATH
@@ -80,6 +93,8 @@ def tearDownModule():
         _concentration_patcher.stop()
     if _momentum_patcher is not None:
         _momentum_patcher.stop()
+    if _bundle_patcher is not None:
+        _bundle_patcher.stop()
 
 
 class FakeClient:
@@ -894,6 +909,52 @@ class PriceTrackerLifecycleTests(unittest.TestCase):
         meta = trades[-1]["meta"]
         self.assertNotIn("price_change_1m_pct", meta)
         self.assertNotIn("price_change_2m_pct", meta)
+
+
+class BundleDetectionMetaTests(unittest.TestCase):
+    def test_logs_the_slot_clustering_stats_from_bundle_detection(self):
+        client = FakeClient(trade_events=[{"marketCapSol": 30.0}])
+        strategy, _ = _make_strategy(client, dry_run=True)
+
+        async def _fake_fetch_launch_slot_clustering(mint, rpc_http_url):
+            return {"total_txs": 6, "distinct_slots": 2, "max_txs_in_one_slot": 5}
+
+        with patch(
+            "pumpfun_bot.strategies.social_watch.fetch_launch_slot_clustering",
+            _fake_fetch_launch_slot_clustering,
+        ):
+            asyncio.run(strategy._buy("MINT", {
+                "mint": "MINT", "name": "Test", "symbol": "TEST", "vSolInBondingCurve": 30.0,
+            }, time.time()))
+
+        with open(activity_log.DATA_LOG_PATH, encoding="utf-8") as f:
+            trades = [json.loads(line) for line in f if json.loads(line).get("type") == "trade"]
+        meta = trades[-1]["meta"]
+        self.assertEqual(meta["launch_total_txs"], 6)
+        self.assertEqual(meta["launch_distinct_slots"], 2)
+        self.assertEqual(meta["launch_max_txs_in_one_slot"], 5)
+
+    def test_a_failed_lookup_logs_none_not_a_crash(self):
+        client = FakeClient(trade_events=[{"marketCapSol": 30.0}])
+        strategy, _ = _make_strategy(client, dry_run=True)
+
+        async def _fake_fetch_launch_slot_clustering(mint, rpc_http_url):
+            return None
+
+        with patch(
+            "pumpfun_bot.strategies.social_watch.fetch_launch_slot_clustering",
+            _fake_fetch_launch_slot_clustering,
+        ):
+            asyncio.run(strategy._buy("MINT", {
+                "mint": "MINT", "name": "Test", "symbol": "TEST", "vSolInBondingCurve": 30.0,
+            }, time.time()))
+
+        with open(activity_log.DATA_LOG_PATH, encoding="utf-8") as f:
+            trades = [json.loads(line) for line in f if json.loads(line).get("type") == "trade"]
+        meta = trades[-1]["meta"]
+        self.assertIsNone(meta["launch_total_txs"])
+        self.assertIsNone(meta["launch_distinct_slots"])
+        self.assertIsNone(meta["launch_max_txs_in_one_slot"])
 
 
 class ScaledExitSimulatorWiringTests(unittest.TestCase):
