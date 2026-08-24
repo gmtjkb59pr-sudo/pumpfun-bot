@@ -167,6 +167,35 @@ class CoinGeckoMoversStrategy:
         )
 
         entry_ref = candidate["price_usd"]
+        # user-requested 2026-08-24 ("let those ride probably they wont
+        # rug") - a pool old enough to still be trading has already
+        # cleared the classic instant "dev pulls liquidity" rug risk that
+        # justifies the tight ladder/hold-time above (sized for a fresh,
+        # unproven mover) - use the looser, more patient revival_* exit
+        # settings instead once a candidate clears revival_age_hours. See
+        # CoinGeckoMoversConfig.revival_age_hours' docstring for the
+        # honest caveat (reduces classic rug risk, doesn't eliminate
+        # crash risk) and why this is reasoned-but-unproven.
+        is_revival = pool_age_hours is not None and pool_age_hours >= self.cfg.revival_age_hours
+        exit_kwargs = (
+            {
+                "take_profit_pct": self.cfg.take_profit_pct,
+                "stop_loss_pct": self.cfg.revival_stop_loss_pct,
+                "trailing_activation_pct": self.cfg.revival_trailing_activation_pct,
+                "trailing_stop_pct": self.cfg.revival_trailing_stop_pct,
+                "take_profit_ladder": self.cfg.revival_take_profit_ladder,
+                "stale_price_timeout_sec": self.cfg.revival_stale_price_timeout_sec,
+                "max_hold_sec": self.cfg.revival_max_hold_sec,
+            } if is_revival else {
+                "take_profit_pct": self.cfg.take_profit_pct,
+                "stop_loss_pct": self.cfg.stop_loss_pct,
+                "trailing_activation_pct": self.cfg.trailing_activation_pct,
+                "trailing_stop_pct": self.cfg.trailing_stop_pct,
+                "take_profit_ladder": self.cfg.take_profit_ladder,
+                "stale_price_timeout_sec": self.cfg.stale_price_timeout_sec,
+                "max_hold_sec": self.cfg.max_hold_sec,
+            }
+        )
         meta = {
             "price_change_pct": price_change_pct,
             "momentum_window": self.cfg.momentum_window,
@@ -174,6 +203,7 @@ class CoinGeckoMoversStrategy:
             "holder_count": holder_count,
             "top10_concentration_pct": top10_concentration_pct,
             "pool_age_hours": pool_age_hours,
+            "is_revival": is_revival,
         }
 
         if self.dry_run:
@@ -185,15 +215,9 @@ class CoinGeckoMoversStrategy:
             if self.outcome_tracker is not None:
                 await self.outcome_tracker.track(
                     mint, pair_name, pair_name, entry_ref, trade_size_sol=self.trade_size_sol,
-                    take_profit_pct=self.cfg.take_profit_pct,
-                    stop_loss_pct=self.cfg.stop_loss_pct,
-                    trailing_activation_pct=self.cfg.trailing_activation_pct,
-                    trailing_stop_pct=self.cfg.trailing_stop_pct,
                     strategy="coingecko_movers",
                     price_source="usd",
-                    take_profit_ladder=self.cfg.take_profit_ladder,
-                    stale_price_timeout_sec=self.cfg.stale_price_timeout_sec,
-                    max_hold_sec=self.cfg.max_hold_sec,
+                    **exit_kwargs,
                 )
             return
 
@@ -212,15 +236,9 @@ class CoinGeckoMoversStrategy:
             if self.outcome_tracker is not None:
                 await self.outcome_tracker.track(
                     mint, pair_name, pair_name, entry_ref, trade_size_sol=self.trade_size_sol,
-                    take_profit_pct=self.cfg.take_profit_pct,
-                    stop_loss_pct=self.cfg.stop_loss_pct,
-                    trailing_activation_pct=self.cfg.trailing_activation_pct,
-                    trailing_stop_pct=self.cfg.trailing_stop_pct,
                     strategy="coingecko_movers",
                     price_source="usd",
-                    take_profit_ladder=self.cfg.take_profit_ladder,
-                    stale_price_timeout_sec=self.cfg.stale_price_timeout_sec,
-                    max_hold_sec=self.cfg.max_hold_sec,
+                    **exit_kwargs,
                 )
         except Exception as exc:  # noqa: BLE001
             logger.exception("CoinGecko-movers buy mislukt voor %s: %s", mint, exc)
