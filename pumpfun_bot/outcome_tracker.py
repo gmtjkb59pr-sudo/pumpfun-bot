@@ -1295,12 +1295,12 @@ class OutcomeTracker:
                     # pnl is genuinely unknown (a blind forced sell that
                     # never got price data) - record 0 rather than guessing
                     pnl_sol = 0.0
-                if not self.dry_run:
-                    # a real buy and a real sell transaction were each
-                    # submitted with a real priority fee attached - subtract
-                    # that actual on-chain cost so the dashboard's P&L
-                    # matches the wallet
-                    pnl_sol = round(pnl_sol - ROUND_TRIP_PRIORITY_FEE_SOL, 6)
+                # a real buy and sell would each carry a real priority fee -
+                # subtract that known, fixed cost here too (not just in
+                # live mode) so dry-run pnl reflects what would actually
+                # happen, not an overly-optimistic estimate that pretends
+                # this fee away
+                pnl_sol = round(pnl_sol - ROUND_TRIP_PRIORITY_FEE_SOL, 6)
             self.risk.register_trade_closed(effective_trade_size_sol, pnl_sol)
         append_jsonl({
             "type": "exit",
@@ -1408,6 +1408,11 @@ class OutcomeTracker:
             else:
                 net_pct = net_pct_change_after_fees(pct_change) if pct_change is not None else 0.0
                 pnl_sol = round(slice_cost_sol_at_entry * (net_pct / 100), 6)
+                # a real buy and sell would each carry a real priority fee -
+                # this was previously never subtracted here (live OR dry-
+                # run) even though every OTHER exit path accounts for it,
+                # making a ladder rung's pnl look better than reality
+                pnl_sol = round(pnl_sol - ROUND_TRIP_PRIORITY_FEE_SOL, 6)
             self.risk.register_trade_closed(slice_cost_sol_at_entry, pnl_sol)
 
         append_jsonl({
