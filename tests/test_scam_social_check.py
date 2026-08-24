@@ -8,6 +8,7 @@ from pumpfun_bot.scam_social_check import (
     evaluate_social_links,
     load_known_scam_links,
     record_scam_links,
+    twitter_link_is_live,
     twitter_link_looks_real,
     website_looks_real,
 )
@@ -67,6 +68,44 @@ class TwitterLinkLooksRealTests(unittest.TestCase):
 
     def test_empty_string_fails(self):
         self.assertFalse(twitter_link_looks_real(""))
+
+
+class TwitterLinkIsLiveTests(unittest.TestCase):
+    def test_a_real_profile_with_real_content_passes(self):
+        response = _FakeTextResponse('<title>Real Project (@realproject) / X</title>')
+        with _patched(response):
+            self.assertTrue(asyncio.run(twitter_link_is_live("https://x.com/realproject")))
+
+    def test_a_404_status_fails(self):
+        response = _FakeTextResponse("User Profile Not Found - X | 404 Error", status=404)
+        with _patched(response):
+            self.assertFalse(asyncio.run(twitter_link_is_live("https://x.com/neverregistered")))
+
+    def test_a_200_status_with_a_not_found_marker_fails(self):
+        # confirmed live 2026-08-24: X can serve the "doesn't exist" page
+        # itself at 200 in some cases - don't trust status code alone
+        response = _FakeTextResponse("This account doesn't exist", status=200)
+        with _patched(response):
+            self.assertFalse(asyncio.run(twitter_link_is_live("https://x.com/gone")))
+
+    def test_a_suspended_account_fails(self):
+        response = _FakeTextResponse("Account suspended", status=200)
+        with _patched(response):
+            self.assertFalse(asyncio.run(twitter_link_is_live("https://x.com/suspended")))
+
+    def test_a_connection_failure_fails(self):
+        class _RaisingSession:
+            def get(self, url, timeout=None, allow_redirects=True):
+                raise TimeoutError("simulated timeout")
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+        with patch("pumpfun_bot.scam_social_check.aiohttp.ClientSession", return_value=_RaisingSession()):
+            self.assertFalse(asyncio.run(twitter_link_is_live("https://x.com/unreachable")))
 
 
 class WebsiteLooksRealTests(unittest.TestCase):
@@ -159,10 +198,19 @@ class EvaluateSocialLinksTests(unittest.TestCase):
         self.assertTrue(is_sus)
         self.assertIn("twitter", reason)
 
-    def test_a_real_looking_twitter_with_no_website_is_not_sus(self):
-        is_sus, reason = asyncio.run(evaluate_social_links({"twitter": "https://x.com/realproject"}))
+    def test_a_real_looking_and_live_twitter_with_no_website_is_not_sus(self):
+        response = _FakeTextResponse('<title>Real Project (@realproject) / X</title>')
+        with _patched(response):
+            is_sus, reason = asyncio.run(evaluate_social_links({"twitter": "https://x.com/realproject"}))
         self.assertFalse(is_sus)
         self.assertIsNone(reason)
+
+    def test_a_real_looking_but_dead_twitter_handle_is_sus(self):
+        response = _FakeTextResponse("User Profile Not Found - X | 404 Error", status=404)
+        with _patched(response):
+            is_sus, reason = asyncio.run(evaluate_social_links({"twitter": "https://x.com/neverregistered"}))
+        self.assertTrue(is_sus)
+        self.assertIn("twitter", reason)
 
     def test_a_dead_website_is_sus(self):
         response = _FakeTextResponse("", status=404)
