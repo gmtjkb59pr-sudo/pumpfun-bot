@@ -1164,6 +1164,10 @@ class OutcomeTracker:
 
         pct_change = round(pct_change, 2) if pct_change is not None else None
         tx_signature = ""
+        # see _fetch_real_sol_delta's docstring - the actual on-chain SOL
+        # received for this sell, when available, used below in place of
+        # the flat fee-model pnl estimate
+        real_sol_delta = None
 
         if is_partial:
             return await self._partial_exit(
@@ -1198,6 +1202,7 @@ class OutcomeTracker:
                     mint=mint, slippage_pct=self.sell_slippage_pct,
                 )
                 tx_signature = result["signature"]
+                real_sol_delta = result.get("real_sol_delta")
             except Exception as exc:  # noqa: BLE001
                 logger.exception(
                     "ECHTE sell mislukt voor %s (%s, reden=%s): %s - positie blijft open, "
@@ -1229,6 +1234,7 @@ class OutcomeTracker:
                             mint=mint, slippage_pct=self.sell_slippage_pct, amount_pct=99,
                         )
                         tx_signature = fallback_result["signature"]
+                        real_sol_delta = fallback_result.get("real_sol_delta")
                         logger.warning(
                             "99%% fallback-verkoop GESLAAGD voor %s na %d mislukte 100%% "
                             "pogingen (laatste fout: %s) - positie wordt als gesloten "
@@ -1271,16 +1277,30 @@ class OutcomeTracker:
             # never got price data) - pnl is genuinely unknown, so record 0
             # rather than guessing, but still release the exposure slot since
             # the position really is closing
-            if pct_change is not None:
-                net_pct = net_pct_change_after_fees(pct_change)
-                pnl_sol = round(effective_trade_size_sol * (net_pct / 100), 6)
+            if not self.dry_run and real_sol_delta is not None and real_sol_delta > 0:
+                # real, ground-truth pnl: what this slice actually cost to
+                # buy vs. what the sell actually returned, from the real
+                # on-chain SOL delta (already fee/slippage-inclusive) -
+                # see _fetch_real_sol_delta's docstring for why the flat
+                # fee-model estimate below is systematically too optimistic
+                # on a fast-dying/illiquid token's forced exit
+                pnl_sol = round(real_sol_delta - effective_trade_size_sol, 6)
             else:
-                pnl_sol = 0.0
-            if not self.dry_run:
-                # a real buy and a real sell transaction were each submitted
-                # with a real priority fee attached - subtract that actual
-                # on-chain cost so the dashboard's P&L matches the wallet
-                pnl_sol = round(pnl_sol - ROUND_TRIP_PRIORITY_FEE_SOL, 6)
+                # estimate-only path - real_sol_delta wasn't available (dry
+                # run, or the lookup itself failed)
+                if pct_change is not None:
+                    net_pct = net_pct_change_after_fees(pct_change)
+                    pnl_sol = round(effective_trade_size_sol * (net_pct / 100), 6)
+                else:
+                    # pnl is genuinely unknown (a blind forced sell that
+                    # never got price data) - record 0 rather than guessing
+                    pnl_sol = 0.0
+                if not self.dry_run:
+                    # a real buy and a real sell transaction were each
+                    # submitted with a real priority fee attached - subtract
+                    # that actual on-chain cost so the dashboard's P&L
+                    # matches the wallet
+                    pnl_sol = round(pnl_sol - ROUND_TRIP_PRIORITY_FEE_SOL, 6)
             self.risk.register_trade_closed(effective_trade_size_sol, pnl_sol)
         append_jsonl({
             "type": "exit",
@@ -1342,6 +1362,7 @@ class OutcomeTracker:
         multiplier = 1 + ((pct_change or 0.0) / 100)
         current_slice_value_sol = round(slice_cost_sol_at_entry * multiplier, 9)
         tx_signature = ""
+        real_sol_delta = None
 
         if not self.dry_run:
             if self.client is None:
@@ -1364,6 +1385,7 @@ class OutcomeTracker:
                     slippage_pct=self.sell_slippage_pct,
                 )
                 tx_signature = result["signature"]
+                real_sol_delta = result.get("real_sol_delta")
             except Exception as exc:  # noqa: BLE001
                 logger.exception(
                     "ECHTE ladder-sell mislukt voor %s (%s, multiplier=%s): %s - "
@@ -1379,8 +1401,13 @@ class OutcomeTracker:
                 return False
 
         if self.risk is not None and slice_cost_sol_at_entry:
-            net_pct = net_pct_change_after_fees(pct_change) if pct_change is not None else 0.0
-            pnl_sol = round(slice_cost_sol_at_entry * (net_pct / 100), 6)
+            if not self.dry_run and real_sol_delta is not None and real_sol_delta > 0:
+                # see _fetch_real_sol_delta's docstring - real, ground-truth
+                # proceeds for this rung instead of the flat fee-model estimate
+                pnl_sol = round(real_sol_delta - slice_cost_sol_at_entry, 6)
+            else:
+                net_pct = net_pct_change_after_fees(pct_change) if pct_change is not None else 0.0
+                pnl_sol = round(slice_cost_sol_at_entry * (net_pct / 100), 6)
             self.risk.register_trade_closed(slice_cost_sol_at_entry, pnl_sol)
 
         append_jsonl({

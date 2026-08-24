@@ -66,7 +66,10 @@ class _FakeKeypair:
 class FakeClient:
     """Stands in for PumpPortalClient - no real network calls."""
 
-    def __init__(self, *, should_fail=False, signature="fake_sig", fail_at_amount_pcts=None):
+    def __init__(
+        self, *, should_fail=False, signature="fake_sig", fail_at_amount_pcts=None,
+        real_sol_delta=None,
+    ):
         self.should_fail = should_fail
         # user-requested: simulates the real 99% fallback-sell path (see
         # outcome_tracker.py's _exit()) - fail only at these specific
@@ -78,6 +81,11 @@ class FakeClient:
         self.sell_calls = []
         self.keypair = _FakeKeypair()
         self.rpc_http_url = "https://example.invalid/rpc"
+        # user-requested: simulates PumpPortalClient._fetch_real_sol_delta's
+        # result on a sell - None (default) matches every pre-existing test
+        # (no real_sol_delta key from the real client until this was added),
+        # falling back to the fee-model estimate unchanged
+        self.real_sol_delta = real_sol_delta
 
     async def build_and_send_full_sell(self, mint, slippage_pct, amount_pct=100):
         self.sell_calls.append((mint, slippage_pct, amount_pct))
@@ -86,13 +94,19 @@ class FakeClient:
                 raise RuntimeError(f"simulated RPC failure at {amount_pct}%")
         elif self.should_fail:
             raise RuntimeError("simulated RPC failure")
-        return {"signature": self.signature, "action": "sell", "mint": mint, "amount": f"{amount_pct}%"}
+        return {
+            "signature": self.signature, "action": "sell", "mint": mint, "amount": f"{amount_pct}%",
+            "real_sol_delta": self.real_sol_delta,
+        }
 
     async def build_and_send_trade(self, action, mint, amount_sol, slippage_pct):
         self.sell_calls.append((mint, slippage_pct, action, amount_sol))
         if self.should_fail:
             raise RuntimeError("simulated RPC failure")
-        return {"signature": self.signature, "action": action, "mint": mint, "amount_sol": amount_sol}
+        return {
+            "signature": self.signature, "action": action, "mint": mint, "amount_sol": amount_sol,
+            "real_sol_delta": self.real_sol_delta if action == "sell" else None,
+        }
 
 
 class PerPositionThresholdTests(unittest.TestCase):
@@ -1696,6 +1710,83 @@ class LiveExitTests(unittest.TestCase):
         self.assertAlmostEqual(risk.state.realized_pnl_sol, _net_pnl_sol(0.05, 51.0), places=4)
 
 
+class RealSolDeltaPnlTests(unittest.TestCase):
+    """Real finding 2026-08-23: over one 23-minute live session, real
+    wallet balance dropped 0.155 SOL while the bot's own flat fee-model
+    pnl tracker showed +0.057 SOL - real slippage on fast-dying/thin-
+    liquidity tokens the flat model can't see. When the real on-chain SOL
+    delta of a sell is available, pnl must be computed from THAT (ground
+    truth) instead of the pct_change-based estimate."""
+
+    def _make_tracker(self, *, client, entry_ref=100.0):
+        risk = RiskManager(RiskConfig())
+        risk.register_trade_opened(0.05)
+        tracker = OutcomeTracker(
+            ws_url="wss://example.invalid", risk=risk, client=client, dry_run=False,
+            take_profit_pct=50.0,
+        )
+        tracker._pending["MINT"] = {
+            "entry_ts": time.time() - 100, "entry_ref": entry_ref, "last_ref": entry_ref,
+            "peak_ref": entry_ref, "name": "Test", "symbol": "TEST", "trade_size_sol": 0.05,
+            "hit": set(), "has_real_update": False,
+        }
+        return tracker, risk
+
+    def test_uses_the_real_delta_over_the_fee_model_estimate(self):
+        # a much worse real outcome than the fee-model would have guessed -
+        # bought 0.05 SOL worth, only got 0.02 SOL back on the forced sell
+        client = FakeClient(should_fail=False, real_sol_delta=0.02)
+        tracker, risk = self._make_tracker(client=client)
+
+        asyncio.run(tracker._handle_price_update("MINT", 151.0))  # +51%, crosses TP
+
+        self.assertAlmostEqual(risk.state.realized_pnl_sol, 0.02 - 0.05, places=6)
+        # NOT anywhere near what the fee-model estimate for +51% would be
+        self.assertNotAlmostEqual(risk.state.realized_pnl_sol, _net_pnl_sol(0.05, 51.0), places=2)
+
+    def test_falls_back_to_the_estimate_when_no_real_delta_is_available(self):
+        client = FakeClient(should_fail=False, real_sol_delta=None)
+        tracker, risk = self._make_tracker(client=client)
+
+        asyncio.run(tracker._handle_price_update("MINT", 151.0))
+
+        self.assertAlmostEqual(
+            risk.state.realized_pnl_sol, _net_pnl_sol(0.05, 51.0) - ROUND_TRIP_PRIORITY_FEE_SOL, places=4
+        )
+
+    def test_falls_back_to_the_estimate_when_real_delta_is_zero_or_negative(self):
+        # a real_sol_delta <= 0 on a "sell" is nonsensical (nothing
+        # received, or a net outflow) - not trustworthy as sell proceeds,
+        # treat like unavailable rather than record a bogus pnl from it
+        client = FakeClient(should_fail=False, real_sol_delta=0.0)
+        tracker, risk = self._make_tracker(client=client)
+
+        asyncio.run(tracker._handle_price_update("MINT", 151.0))
+
+        self.assertAlmostEqual(
+            risk.state.realized_pnl_sol, _net_pnl_sol(0.05, 51.0) - ROUND_TRIP_PRIORITY_FEE_SOL, places=4
+        )
+
+    def test_dry_run_never_uses_the_real_delta_even_if_present(self):
+        client = FakeClient(should_fail=False, real_sol_delta=0.02)
+        risk = RiskManager(RiskConfig())
+        risk.register_trade_opened(0.05)
+        tracker = OutcomeTracker(
+            ws_url="wss://example.invalid", risk=risk, client=client, dry_run=True,
+            take_profit_pct=50.0,
+        )
+        tracker._pending["MINT"] = {
+            "entry_ts": time.time() - 100, "entry_ref": 100.0, "last_ref": 100.0,
+            "peak_ref": 100.0, "name": "Test", "symbol": "TEST", "trade_size_sol": 0.05,
+            "hit": set(), "has_real_update": False,
+        }
+
+        asyncio.run(tracker._handle_price_update("MINT", 151.0))
+
+        self.assertEqual(client.sell_calls, [])  # dry-run never touches the client
+        self.assertAlmostEqual(risk.state.realized_pnl_sol, _net_pnl_sol(0.05, 51.0), places=4)
+
+
 class SellFailurePauseTests(unittest.TestCase):
     """Real bug found live: a position hit pump.fun's own program throwing
     'AnchorError ... Error Code: Overflow' (Custom 6024) on every sell
@@ -2613,6 +2704,17 @@ class TakeProfitLadderTests(unittest.TestCase):
         self.assertAlmostEqual(amount_sol, 0.015 * 2, places=6)
         self.assertIn("MINT", tracker._pending)
         self.assertAlmostEqual(tracker._pending["MINT"]["remaining_fraction"], 0.7, places=6)
+
+    def test_live_rung_sell_uses_the_real_delta_over_the_fee_model_estimate(self):
+        # slice cost basis is 0.015 SOL (30% of 0.05) - a real proceeds of
+        # 0.05 SOL here is nowhere near what the +100% fee-model estimate
+        # for that slice would give
+        client = FakeClient(should_fail=False, real_sol_delta=0.05)
+        tracker, risk = self._make_tracker(client=client, dry_run=False, entry_ref=100.0, trade_size_sol=0.05)
+
+        asyncio.run(tracker._handle_price_update("MINT", 200.0))  # 2x -> first rung (30%)
+
+        self.assertAlmostEqual(risk.state.realized_pnl_sol, 0.05 - 0.015, places=6)
 
     def test_failed_live_rung_sell_leaves_remaining_fraction_untouched(self):
         client = FakeClient(should_fail=True)

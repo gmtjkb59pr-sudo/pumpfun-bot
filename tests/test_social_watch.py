@@ -851,14 +851,14 @@ class PriceTrackerLifecycleTests(unittest.TestCase):
             "added_ts": time.time() - 25,
         }
 
-        async def _fake_has_socials(uri):
-            return True
+        async def _fake_fetch_links(uri):
+            return {"twitter": "https://x.com/realproject"}
 
         async def _fake_fetch_holder_count(mint, rpc_http_url):
             return 42
 
         with patch(
-            "pumpfun_bot.strategies.social_watch.fetch_has_socials", _fake_has_socials,
+            "pumpfun_bot.strategies.social_watch.fetch_social_links", _fake_fetch_links,
         ), patch(
             "pumpfun_bot.strategies.social_watch.fetch_holder_count", _fake_fetch_holder_count,
         ):
@@ -1109,7 +1109,7 @@ class PollOnceTests(unittest.TestCase):
             "event": {"mint": "MINT", "uri": "https://example.invalid/meta.json"},
             "added_ts": time.time() - 61,  # past the 60s window
         }
-        with patch("pumpfun_bot.strategies.social_watch.fetch_has_socials") as mock_fetch:
+        with patch("pumpfun_bot.strategies.social_watch.fetch_social_links") as mock_fetch:
             asyncio.run(strategy._poll_once())
             mock_fetch.assert_not_called()
 
@@ -1129,14 +1129,14 @@ class PollOnceTests(unittest.TestCase):
             "added_ts": time.time() - 25,
         }
 
-        async def _fake_has_socials(uri):
-            return True
+        async def _fake_fetch_links(uri):
+            return {"twitter": "https://x.com/realproject"}
 
         async def _fake_fetch_holder_count(mint, rpc_http_url):
             return 42
 
         with patch(
-            "pumpfun_bot.strategies.social_watch.fetch_has_socials", _fake_has_socials,
+            "pumpfun_bot.strategies.social_watch.fetch_social_links", _fake_fetch_links,
         ), patch(
             "pumpfun_bot.strategies.social_watch.fetch_holder_count", _fake_fetch_holder_count,
         ):
@@ -1155,11 +1155,11 @@ class PollOnceTests(unittest.TestCase):
             "added_ts": time.time() - 5,
         }
 
-        async def _fake_no_socials(uri):
-            return False
+        async def _fake_no_links(uri):
+            return {}
 
         with patch(
-            "pumpfun_bot.strategies.social_watch.fetch_has_socials", _fake_no_socials,
+            "pumpfun_bot.strategies.social_watch.fetch_social_links", _fake_no_links,
         ):
             asyncio.run(strategy._poll_once())
 
@@ -1167,6 +1167,52 @@ class PollOnceTests(unittest.TestCase):
         self.assertIn("MINT", strategy._watching)
         self.assertEqual(client.buy_calls, [])
         self.assertAlmostEqual(risk.state.open_exposure_sol, 0.0)
+
+    def test_does_not_buy_when_socials_look_fake(self):
+        # user-requested: check BEFORE spending real money, not after - a
+        # sus link must never reach _buy() at all
+        client = FakeClient()
+        strategy, risk = _make_strategy(client, dry_run=False)
+        strategy._watching["MINT"] = {
+            "event": {"mint": "MINT", "uri": "https://example.invalid/meta.json"},
+            "added_ts": time.time() - 5,
+        }
+
+        async def _fake_fake_links(uri):
+            return {"twitter": "https://example.invalid/definitely-not-x"}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scam_links_path = Path(tmpdir) / "known_scam_social_links.json"
+            with patch(
+                "pumpfun_bot.strategies.social_watch.fetch_social_links", _fake_fake_links,
+            ), patch("pumpfun_bot.scam_social_check.KNOWN_SCAM_LINKS_PATH", scam_links_path):
+                asyncio.run(strategy._poll_once())
+
+        # dropped immediately, not left to expire naturally - already known bad
+        self.assertNotIn("MINT", strategy._watching)
+        self.assertEqual(client.buy_calls, [])
+        self.assertAlmostEqual(risk.state.open_exposure_sol, 0.0)
+
+    def test_records_a_fake_link_for_future_reuse_detection(self):
+        client = FakeClient()
+        strategy, _ = _make_strategy(client, dry_run=False)
+        strategy._watching["MINT"] = {
+            "event": {"mint": "MINT", "uri": "https://example.invalid/meta.json"},
+            "added_ts": time.time() - 5,
+        }
+
+        async def _fake_fake_links(uri):
+            return {"twitter": "https://example.invalid/definitely-not-x"}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scam_links_path = Path(tmpdir) / "known_scam_social_links.json"
+            with patch(
+                "pumpfun_bot.strategies.social_watch.fetch_social_links", _fake_fake_links,
+            ), patch("pumpfun_bot.scam_social_check.KNOWN_SCAM_LINKS_PATH", scam_links_path):
+                asyncio.run(strategy._poll_once())
+                recorded = json.loads(scam_links_path.read_text())
+
+        self.assertIn("https://example.invalid/definitely-not-x", recorded)
 
     def test_stays_on_watchlist_when_holder_count_still_too_low(self):
         # user-requested (option 3): a candidate with socials but not
@@ -1182,14 +1228,14 @@ class PollOnceTests(unittest.TestCase):
             "added_ts": time.time() - 25,  # past the indexing delay
         }
 
-        async def _fake_has_socials(uri):
-            return True
+        async def _fake_fetch_links(uri):
+            return {"twitter": "https://x.com/realproject"}
 
         async def _fake_fetch_holder_count(mint, rpc_http_url):
             return 12  # below the 50 minimum
 
         with patch(
-            "pumpfun_bot.strategies.social_watch.fetch_has_socials", _fake_has_socials,
+            "pumpfun_bot.strategies.social_watch.fetch_social_links", _fake_fetch_links,
         ), patch(
             "pumpfun_bot.strategies.social_watch.fetch_holder_count", _fake_fetch_holder_count,
         ):
@@ -1213,14 +1259,14 @@ class PollOnceTests(unittest.TestCase):
             "added_ts": time.time() - 25,
         }
 
-        async def _fake_has_socials(uri):
-            return True
+        async def _fake_fetch_links(uri):
+            return {"twitter": "https://x.com/realproject"}
 
         async def _fake_fetch_holder_count(mint, rpc_http_url):
             return 60  # now above the 50 minimum
 
         with patch(
-            "pumpfun_bot.strategies.social_watch.fetch_has_socials", _fake_has_socials,
+            "pumpfun_bot.strategies.social_watch.fetch_social_links", _fake_fetch_links,
         ), patch(
             "pumpfun_bot.strategies.social_watch.fetch_holder_count", _fake_fetch_holder_count,
         ):
@@ -1243,7 +1289,7 @@ class PollOnceTests(unittest.TestCase):
             "added_ts": time.time() - 61,  # past watch_window_sec (60)
         }
 
-        with patch("pumpfun_bot.strategies.social_watch.fetch_has_socials") as mock_fetch:
+        with patch("pumpfun_bot.strategies.social_watch.fetch_social_links") as mock_fetch:
             asyncio.run(strategy._poll_once())
             mock_fetch.assert_not_called()  # expired before even checking socials again
 

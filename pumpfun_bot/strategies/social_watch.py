@@ -27,7 +27,8 @@ from ..price_ref import extract_price_ref_with_field
 from ..pumpportal_client import PumpPortalClient
 from ..risk import RiskManager
 from ..scaled_exit_simulator import ScaledExitSimulator
-from ..social_metadata import fetch_has_socials
+from ..scam_social_check import evaluate_social_links, record_scam_links
+from ..social_metadata import fetch_social_links
 from ..state import bot_state
 
 logger = logging.getLogger("pumpfun_bot.social_watch")
@@ -123,11 +124,27 @@ class SocialWatchStrategy:
             return
 
         results = await asyncio.gather(*(
-            fetch_has_socials(info["event"].get("uri")) for info in still_watching.values()
+            fetch_social_links(info["event"].get("uri")) for info in still_watching.values()
         ))
 
-        for (mint, info), has_socials in zip(still_watching.items(), results):
-            if not has_socials:
+        for (mint, info), links in zip(still_watching.items(), results):
+            if not links:
+                continue
+            # user-requested: check BEFORE spending real money, not after -
+            # reuses this same metadata fetch (no extra network round trip)
+            # rather than the separate post-buy check in outcome_tracker.py
+            # (still runs too, as a safety net for anything that changes
+            # between here and the buy actually landing)
+            is_sus, reason = await evaluate_social_links(links)
+            if is_sus:
+                logger.warning(
+                    "Social-watch: %s verdachte socials, koop niet: %s", mint, reason,
+                )
+                record_scam_links([v for v in links.values() if v])
+                async with self._lock:
+                    self._watching.pop(mint, None)
+                if self.price_tracker is not None:
+                    await self.price_tracker.unwatch(mint)
                 continue
             async with self._lock:
                 # may already be gone (expired between the snapshot above
