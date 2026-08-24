@@ -252,6 +252,28 @@ class ConsiderTests(unittest.TestCase):
             [{"multiplier": 2, "sell_pct": 30}],
         )
 
+    def test_dry_run_buy_passes_the_movers_specific_hold_time_settings(self):
+        # user-requested 2026-08-24 ("what is the best exit strategy for
+        # this kind of strategy") - was silently falling back to
+        # OutcomeTracker's shared sniper-scale defaults (15-min max hold,
+        # 10s stale-price timeout), which assume a brand-new bonding curve
+        # trading multiple times per second - premature panic-selling on
+        # an already-liquid, slower-moving "mover"
+        store_file = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
+        store_file.close()
+        store_path = Path(store_file.name)
+        self.addCleanup(lambda: store_path.unlink(missing_ok=True))
+
+        client = FakeClient()
+        outcome_tracker = OutcomeTracker(ws_url="wss://example.invalid", position_store_path=store_path)
+        strategy, risk = _make_strategy(client, dry_run=True, outcome_tracker=outcome_tracker)
+
+        with _DEFAULT_HOLDER_PATCH, _DEFAULT_CONCENTRATION_PATCH:
+            asyncio.run(strategy._consider(_candidate()))
+
+        self.assertEqual(outcome_tracker._pending["MINTpump"]["stale_price_timeout_sec"], 60)
+        self.assertEqual(outcome_tracker._pending["MINTpump"]["max_hold_sec"], 3600)
+
     def test_live_buy_sends_a_real_trade(self):
         client = FakeClient()
         strategy, risk = _make_strategy(client, dry_run=False)
