@@ -300,5 +300,52 @@ class MinBuysInWindowFilterTests(unittest.TestCase):
         self.assertEqual(len(client.requested_mints), 1)  # one shared window
 
 
+class DuplicateNameFilterTests(unittest.TestCase):
+    """Real finding 2026-08-23: bought "Rogue Rocket (ROGROC)", and ~35s
+    later a DIFFERENT mint launched under the exact same name and symbol -
+    a real, free (no RPC call) scam signal: a legitimate project doesn't
+    relaunch under its own name minutes later, but a copycat/rug-kit
+    reusing a recognizable name to catch bots/humans does."""
+
+    def test_first_sighting_of_a_name_is_not_a_duplicate(self):
+        strategy = _make_strategy()
+        self.assertFalse(strategy._is_duplicate_name("Rogue Rocket", "ROGROC"))
+
+    def test_the_same_name_and_symbol_seen_again_is_a_duplicate(self):
+        strategy = _make_strategy()
+        strategy._is_duplicate_name("Rogue Rocket", "ROGROC")
+        self.assertTrue(strategy._is_duplicate_name("Rogue Rocket", "ROGROC"))
+
+    def test_matching_is_case_insensitive_and_ignores_surrounding_whitespace(self):
+        strategy = _make_strategy()
+        strategy._is_duplicate_name("Rogue Rocket", "ROGROC")
+        self.assertTrue(strategy._is_duplicate_name("  rogue rocket ", " rogroc "))
+
+    def test_a_different_symbol_with_the_same_name_is_not_a_duplicate(self):
+        strategy = _make_strategy()
+        strategy._is_duplicate_name("Rogue Rocket", "ROGROC")
+        self.assertFalse(strategy._is_duplicate_name("Rogue Rocket", "ROGROC2"))
+
+    def test_placeholder_names_never_count_as_duplicates_of_each_other(self):
+        # event.get("name", "?")/event.get("symbol", "?") in run() means
+        # every launch missing this field would otherwise collide on the
+        # same ("?", "?") key and falsely flag every one after the first
+        strategy = _make_strategy()
+        strategy._is_duplicate_name("?", "?")
+        self.assertFalse(strategy._is_duplicate_name("?", "?"))
+
+    def test_expires_after_the_window(self):
+        from pumpfun_bot.strategies import sniper as sniper_module
+
+        strategy = _make_strategy()
+        with patch.object(sniper_module.time, "time", return_value=1000.0):
+            strategy._is_duplicate_name("Rogue Rocket", "ROGROC")
+        with patch.object(
+            sniper_module.time, "time",
+            return_value=1000.0 + sniper_module.DUPLICATE_NAME_WINDOW_SEC + 1,
+        ):
+            self.assertFalse(strategy._is_duplicate_name("Rogue Rocket", "ROGROC"))
+
+
 if __name__ == "__main__":
     unittest.main()
