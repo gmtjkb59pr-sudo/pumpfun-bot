@@ -347,9 +347,10 @@ class DuplicateNameFilterTests(unittest.TestCase):
         strategy._is_duplicate_name("?", "?")
         self.assertFalse(strategy._is_duplicate_name("?", "?"))
 
-    def test_never_expires_even_after_a_long_time(self):
+    def test_still_a_duplicate_well_past_the_old_short_window(self):
         # real finding: "Rogue Wizard" resurfaced ~55 hours after its first
-        # two sightings - a short in-memory window would have missed it
+        # two sightings - a short in-memory window would have missed it,
+        # but the current 72h window comfortably covers it
         from pumpfun_bot.strategies import sniper as sniper_module
 
         strategy = _make_strategy()
@@ -357,6 +358,21 @@ class DuplicateNameFilterTests(unittest.TestCase):
             strategy._is_duplicate_name("Rogue Wizard", "ROGWIZ")
         with patch.object(sniper_module.time, "time", return_value=1000.0 + 55 * 3600):
             self.assertTrue(strategy._is_duplicate_name("Rogue Wizard", "ROGWIZ"))
+
+    def test_expires_after_the_window(self):
+        # user-requested: loosened from no-expiry - a permanently-growing
+        # store meant a common/generic name reused by unrelated people
+        # days later would also get blocked, not just deliberate copycats
+        from pumpfun_bot.strategies import sniper as sniper_module
+
+        strategy = _make_strategy()
+        with patch.object(sniper_module.time, "time", return_value=1000.0):
+            strategy._is_duplicate_name("Rogue Wizard", "ROGWIZ")
+        with patch.object(
+            sniper_module.time, "time",
+            return_value=1000.0 + sniper_module.SEEN_LAUNCH_NAME_WINDOW_SEC + 1,
+        ):
+            self.assertFalse(strategy._is_duplicate_name("Rogue Wizard", "ROGWIZ"))
 
     def test_persists_to_disk_across_separate_strategy_instances(self):
         # simulates surviving a bot restart - a fresh SniperStrategy

@@ -37,14 +37,22 @@ WALLET_BLOCKLIST_REFRESH_SEC = 60
 # its own name from scratch, but a copycat/rug-kit reusing a recognizable
 # or trending name to catch bots/humans does.
 #
-# PERSISTED, no expiry - confirmed live the SAME day: "Rogue Wizard"
-# (ROGWIZ) was bought, and a THIRD relaunch of that exact name appeared
-# ~55 HOURS after the first two (which themselves were only ~90s apart) -
-# a scam kit clearly resurfaces a name over days, not just minutes, so an
-# in-memory/short-window check isn't enough. Also noticed "Rogue Rocket"
-# and "Rogue Wizard" share a "Rogue ___" template, consistent with the
-# same actor/kit behind both.
+# PERSISTED - confirmed live the SAME day: "Rogue Wizard" (ROGWIZ) was
+# bought, and a THIRD relaunch of that exact name appeared ~55 HOURS after
+# the first two (which themselves were only ~90s apart) - a scam kit
+# clearly resurfaces a name over days, not just minutes, so an in-memory/
+# short-window check isn't enough. Also noticed "Rogue Rocket" and "Rogue
+# Wizard" share a "Rogue ___" template, consistent with the same actor/kit
+# behind both.
 SEEN_LAUNCH_NAMES_PATH = Path("data/sniper_seen_launch_names.json")
+# user-requested 2026-08-23: loosened from no-expiry - confirmed live this
+# was already the single biggest rejection category (38% of everything
+# sniper saw in one short window), and a permanently-growing store means
+# any common/generic meme name that gets coincidentally reused by
+# unrelated people days or weeks later starts getting blocked too, not
+# just deliberate copycats. 72h comfortably covers the confirmed 55h
+# ROGWIZ gap with margin, while still letting old entries age out.
+SEEN_LAUNCH_NAME_WINDOW_SEC = 72 * 3600
 
 # Standard total supply of a pump.fun token - used to turn initialBuy (how
 # many tokens the creator already bought in the creation tx itself) into a
@@ -53,21 +61,26 @@ SEEN_LAUNCH_NAMES_PATH = Path("data/sniper_seen_launch_names.json")
 DEFAULT_TOTAL_SUPPLY = 1_000_000_000
 
 
-def _load_seen_launch_names() -> set[str]:
+def _load_seen_launch_names() -> dict[str, float]:
     if not SEEN_LAUNCH_NAMES_PATH.exists():
-        return set()
+        return {}
     try:
         data = json.loads(SEEN_LAUNCH_NAMES_PATH.read_text())
-        return set(data) if isinstance(data, list) else set()
+        return dict(data) if isinstance(data, dict) else {}
     except Exception:  # noqa: BLE001
         logger.debug("Kon sniper_seen_launch_names.json niet lezen, start leeg.")
-        return set()
+        return {}
 
 
-def _record_seen_launch_name(key: str, existing: set[str]) -> None:
-    existing.add(key)
+def _record_seen_launch_name(key: str, existing: dict[str, float], now: float) -> None:
+    existing[key] = now
+    # prune anything past SEEN_LAUNCH_NAME_WINDOW_SEC on every write - bounded
+    # file size without a separate cleanup pass
+    expired = [k for k, ts in existing.items() if now - ts >= SEEN_LAUNCH_NAME_WINDOW_SEC]
+    for k in expired:
+        del existing[k]
     SEEN_LAUNCH_NAMES_PATH.parent.mkdir(parents=True, exist_ok=True)
-    SEEN_LAUNCH_NAMES_PATH.write_text(json.dumps(sorted(existing), indent=2))
+    SEEN_LAUNCH_NAMES_PATH.write_text(json.dumps(existing, indent=2))
 
 
 class SniperStrategy:
@@ -94,9 +107,10 @@ class SniperStrategy:
         # tokens - see wallet_reputation.py. Only ever grows (tighten-only,
         # same philosophy as auto_tuner.py), refreshed periodically below.
         self.blocked_wallets: set[str] = set()
-        # every (name, symbol) combo sniper has ever seen, persisted to
-        # disk with no expiry - see SEEN_LAUNCH_NAMES_PATH's docstring
-        self._seen_names: set[str] = _load_seen_launch_names()
+        # (name, symbol) -> last-seen timestamp, persisted to disk with a
+        # SEEN_LAUNCH_NAME_WINDOW_SEC expiry - see SEEN_LAUNCH_NAMES_PATH's
+        # docstring
+        self._seen_names: dict[str, float] = _load_seen_launch_names()
 
     def _passes_filters(self, event: dict) -> bool:
         # PumpPortal new-token events bevatten o.a. mint, name, symbol, initial
@@ -169,20 +183,22 @@ class SniperStrategy:
 
     def _is_duplicate_name(self, name: str, symbol: str) -> bool:
         """See SEEN_LAUNCH_NAMES_PATH's docstring - a free, no-RPC-call
-        check against every (name, symbol) sniper has EVER seen, persisted
-        to disk with no expiry (a scam kit reuses a name across days, not
-        just minutes - a short in-memory window isn't enough, confirmed
-        live). Records the CURRENT candidate regardless of outcome (even a
-        rejected one) so a run of copycats reusing the same name all get
-        caught, not just the first repeat."""
+        check against every (name, symbol) sniper has seen in the last
+        SEEN_LAUNCH_NAME_WINDOW_SEC, persisted to disk (a scam kit reuses a
+        name across days, not just minutes - a short in-memory window
+        isn't enough, confirmed live). Records the CURRENT candidate
+        regardless of outcome (even a rejected one) so a run of copycats
+        reusing the same name all get caught, not just the first repeat."""
         key = f"{name.strip().lower()}|{symbol.strip().lower()}"
         # a missing name/symbol (event.get(..., "?") in run()) must never
         # match itself across different real launches - that would flag
         # every subsequent placeholder-named candidate as a false duplicate
         if name.strip() == "?" or symbol.strip() == "?" or not name.strip() or not symbol.strip():
             return False
-        is_duplicate = key in self._seen_names
-        _record_seen_launch_name(key, self._seen_names)
+        now = time.time()
+        last_seen = self._seen_names.get(key)
+        is_duplicate = last_seen is not None and now - last_seen < SEEN_LAUNCH_NAME_WINDOW_SEC
+        _record_seen_launch_name(key, self._seen_names, now)
         return is_duplicate
 
     async def _pre_buy_activity_check(self, mint: str) -> str | None:
