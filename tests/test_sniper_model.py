@@ -2,11 +2,13 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from pumpfun_bot.sniper_model import (
     DEFAULT_CREATOR_WIN_RATE,
     WIN_MARGIN_PCT,
     build_creator_win_rates,
+    build_point_in_time_creator_win_rates,
     extract_features,
     load_model,
     save_model,
@@ -100,10 +102,10 @@ class BuildCreatorWinRatesTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             records = [
                 {"type": "trade", "action": "buy", "strategy": "sniper", "dry_run": False,
-                 "mint": "MINT_A", "meta": {"creator": "WALLET_A"}},
+                 "mint": "MINT_A", "ts": 1000.0, "meta": {"creator": "WALLET_A"}},
                 {"type": "exit", "dry_run": False, "mint": "MINT_A", "pct_change": 20.0},
                 {"type": "trade", "action": "buy", "strategy": "sniper", "dry_run": False,
-                 "mint": "MINT_B", "meta": {"creator": "WALLET_A"}},
+                 "mint": "MINT_B", "ts": 2000.0, "meta": {"creator": "WALLET_A"}},
                 {"type": "exit", "dry_run": False, "mint": "MINT_B", "pct_change": -30.0},
             ]
             path = self._write_log(tmpdir, records)
@@ -114,7 +116,7 @@ class BuildCreatorWinRatesTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             records = [
                 {"type": "trade", "action": "buy", "strategy": "sniper", "dry_run": False,
-                 "mint": "MINT_A", "meta": {"creator": "WALLET_A"}},
+                 "mint": "MINT_A", "ts": 1000.0, "meta": {"creator": "WALLET_A"}},
                 # a small positive move that doesn't clear WIN_MARGIN_PCT after fees
                 {"type": "exit", "dry_run": False, "mint": "MINT_A", "pct_change": WIN_MARGIN_PCT - 1},
             ]
@@ -161,7 +163,7 @@ class BuildCreatorWinRatesTests(unittest.TestCase):
                 f.write("not valid json\n")
                 f.write(json.dumps({
                     "type": "trade", "action": "buy", "strategy": "sniper", "dry_run": False,
-                    "mint": "MINT_A", "meta": {"creator": "WALLET_A"},
+                    "mint": "MINT_A", "ts": 1000.0, "meta": {"creator": "WALLET_A"},
                 }) + "\n")
                 f.write(json.dumps(
                     {"type": "exit", "dry_run": False, "mint": "MINT_A", "pct_change": 50.0}
@@ -172,9 +174,14 @@ class BuildCreatorWinRatesTests(unittest.TestCase):
 
 class ScoreTests(unittest.TestCase):
     def test_returns_none_when_no_model_is_available(self):
+        # score(model=None) falls back to load_model() with NO args (the
+        # real default MODEL_PATH) - must patch that path itself, not just
+        # pass model=None, or this would silently pick up the real trained
+        # data/sniper_model.json if one happens to exist on disk
         with tempfile.TemporaryDirectory() as tmpdir:
             missing_model_path = Path(tmpdir) / "no_model.json"
-            result = score({"initial_buy_pct": 5.0, "liquidity_sol": 30.0}, {}, model=load_model(missing_model_path))
+            with patch("pumpfun_bot.sniper_model.MODEL_PATH", missing_model_path):
+                result = score({"initial_buy_pct": 5.0, "liquidity_sol": 30.0}, {})
         self.assertIsNone(result)
 
     def test_returns_none_when_features_are_incomplete(self):
@@ -187,6 +194,82 @@ class ScoreTests(unittest.TestCase):
         result = score({"initial_buy_pct": 5.0, "liquidity_sol": 30.0, "creator": "W"}, {"W": 0.6}, model=model)
         self.assertIsNotNone(result)
         self.assertTrue(0.0 <= result <= 1.0)
+
+
+class BuildPointInTimeCreatorWinRatesTests(unittest.TestCase):
+    """Real bug found live 2026-08-23: build_creator_win_rates() (one
+    global, full-log snapshot) leaks each row's own label back into its
+    own creator_win_rate feature - confirmed live, 421 of 452 creators
+    (93%) launched exactly ONE token, so their win rate was EXACTLY 0.0 or
+    1.0, a verbatim copy of that single trade's own outcome. This
+    point-in-time version must give each mint a rate computed ONLY from
+    that creator's STRICTLY EARLIER trades."""
+
+    def _write_log(self, tmpdir, records):
+        path = Path(tmpdir) / "activity_log.jsonl"
+        with path.open("w") as f:
+            for r in records:
+                f.write(json.dumps(r) + "\n")
+        return path
+
+    def test_a_creators_first_ever_trade_gets_the_default_prior_not_its_own_outcome(self):
+        # THE core leak this fixes: a single-launch creator's win rate
+        # must NOT just echo that one trade's own label back
+        with tempfile.TemporaryDirectory() as tmpdir:
+            records = [
+                {"type": "trade", "action": "buy", "strategy": "sniper", "dry_run": False,
+                 "mint": "MINT_A", "ts": 1000.0, "meta": {"creator": "WALLET_A"}},
+                {"type": "exit", "dry_run": False, "mint": "MINT_A", "pct_change": 100.0},
+            ]
+            path = self._write_log(tmpdir, records)
+            rates = build_point_in_time_creator_win_rates(path)
+        self.assertAlmostEqual(rates["MINT_A"], DEFAULT_CREATOR_WIN_RATE)
+
+    def test_a_later_trade_sees_only_the_earlier_outcome(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            records = [
+                {"type": "trade", "action": "buy", "strategy": "sniper", "dry_run": False,
+                 "mint": "MINT_A", "ts": 1000.0, "meta": {"creator": "WALLET_A"}},
+                {"type": "exit", "dry_run": False, "mint": "MINT_A", "pct_change": 100.0},  # a win
+                {"type": "trade", "action": "buy", "strategy": "sniper", "dry_run": False,
+                 "mint": "MINT_B", "ts": 2000.0, "meta": {"creator": "WALLET_A"}},
+                {"type": "exit", "dry_run": False, "mint": "MINT_B", "pct_change": -50.0},  # a loss
+            ]
+            path = self._write_log(tmpdir, records)
+            rates = build_point_in_time_creator_win_rates(path)
+        self.assertAlmostEqual(rates["MINT_A"], DEFAULT_CREATOR_WIN_RATE)  # no prior history yet
+        self.assertAlmostEqual(rates["MINT_B"], 1.0)  # saw MINT_A's win, not MINT_B's own loss
+
+    def test_order_in_the_file_does_not_matter_only_ts_does(self):
+        # records out of chronological order in the log itself must still
+        # be replayed in real time order
+        with tempfile.TemporaryDirectory() as tmpdir:
+            records = [
+                {"type": "trade", "action": "buy", "strategy": "sniper", "dry_run": False,
+                 "mint": "MINT_LATER", "ts": 2000.0, "meta": {"creator": "WALLET_A"}},
+                {"type": "exit", "dry_run": False, "mint": "MINT_LATER", "pct_change": -50.0},
+                {"type": "trade", "action": "buy", "strategy": "sniper", "dry_run": False,
+                 "mint": "MINT_EARLIER", "ts": 1000.0, "meta": {"creator": "WALLET_A"}},
+                {"type": "exit", "dry_run": False, "mint": "MINT_EARLIER", "pct_change": 100.0},
+            ]
+            path = self._write_log(tmpdir, records)
+            rates = build_point_in_time_creator_win_rates(path)
+        self.assertAlmostEqual(rates["MINT_EARLIER"], DEFAULT_CREATOR_WIN_RATE)
+        self.assertAlmostEqual(rates["MINT_LATER"], 1.0)  # sees the earlier win, by ts not file order
+
+    def test_a_different_creators_history_never_leaks_across(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            records = [
+                {"type": "trade", "action": "buy", "strategy": "sniper", "dry_run": False,
+                 "mint": "MINT_A", "ts": 1000.0, "meta": {"creator": "WALLET_A"}},
+                {"type": "exit", "dry_run": False, "mint": "MINT_A", "pct_change": 100.0},
+                {"type": "trade", "action": "buy", "strategy": "sniper", "dry_run": False,
+                 "mint": "MINT_B", "ts": 2000.0, "meta": {"creator": "WALLET_B"}},
+                {"type": "exit", "dry_run": False, "mint": "MINT_B", "pct_change": -50.0},
+            ]
+            path = self._write_log(tmpdir, records)
+            rates = build_point_in_time_creator_win_rates(path)
+        self.assertAlmostEqual(rates["MINT_B"], DEFAULT_CREATOR_WIN_RATE)  # WALLET_B has no history of its own
 
 
 if __name__ == "__main__":
