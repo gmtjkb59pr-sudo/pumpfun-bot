@@ -14,6 +14,7 @@ import logging
 import time
 
 from ..alerts import Alerter
+from ..bundle_detection import fetch_launch_slot_clustering
 from ..candidate_price_tracker import CandidatePriceTracker
 from ..config import SocialWatchConfig
 from ..dexscreener import fetch_price_changes_pct
@@ -269,13 +270,24 @@ class SocialWatchStrategy:
         # the decision point, instead of a delayed best-effort background log
         (
             (entry_ref, price_ref_field), holder_count, market_cap_usd, top10_concentration_pct,
-            price_changes_pct,
+            price_changes_pct, slot_clustering,
         ) = await asyncio.gather(
             self._fetch_fresh_ref(mint),
             fetch_holder_count(mint, self.client.rpc_http_url),
             fetch_market_cap_usd(mint),
             fetch_top10_concentration_pct(mint, self.client.rpc_http_url),
             fetch_price_changes_pct(mint),
+            # user-requested 2026-08-24 ("what does axiom have that this bot
+            # doesn't") - Axiom's Pulse flags "bundled" launches (many
+            # wallets prepared to buy the instant a mint appeared) as a UI
+            # column; true Jito-bundle membership isn't exposed by standard
+            # RPC (see bundle_detection.py), same-slot clustering is the
+            # free on-chain proxy. Log-only for now, same as holder_count's
+            # own precedent - no evidence yet for what threshold (if any)
+            # should gate a buy, and this mint is still young enough here
+            # (watch_window_sec caps it) for one RPC call to capture its
+            # whole early history reliably.
+            fetch_launch_slot_clustering(mint, self.client.rpc_http_url),
         )
         # only m5 gates the buy decision (user-requested, see dexscreener.py) -
         # h1/h6/h24 are logged below with the trade but not enforced yet
@@ -384,6 +396,12 @@ class SocialWatchStrategy:
             momentum_meta["price_change_1m_pct"] = self.price_tracker.price_change_pct(mint, 60)
             momentum_meta["price_change_2m_pct"] = self.price_tracker.price_change_pct(mint, 120)
 
+        bundle_meta = {
+            "launch_total_txs": (slot_clustering or {}).get("total_txs"),
+            "launch_distinct_slots": (slot_clustering or {}).get("distinct_slots"),
+            "launch_max_txs_in_one_slot": (slot_clustering or {}).get("max_txs_in_one_slot"),
+        }
+
         if self.dry_run:
             logger.info("[DRY RUN] Zou kopen: %s SOL van %s", self.trade_size_sol, mint)
             self.risk.register_trade_opened(self.trade_size_sol)
@@ -391,7 +409,7 @@ class SocialWatchStrategy:
                 "social_watch", "buy", mint, self.trade_size_sol, dry_run=True,
                 meta={
                     "liquidity_sol": liquidity_sol, "has_socials": True, "holder_count": holder_count,
-                    **momentum_meta,
+                    **momentum_meta, **bundle_meta,
                 },
             )
             if self.outcome_tracker is not None:
@@ -423,7 +441,7 @@ class SocialWatchStrategy:
                 meta={
                     "liquidity_sol": liquidity_sol, "has_socials": True,
                     "creator": creator, "holder_count": holder_count,
-                    **momentum_meta,
+                    **momentum_meta, **bundle_meta,
                 },
             )
             await self.alerter.send(f"✅ Gekocht (social-watch): {symbol} | tx: {result['signature']}")
