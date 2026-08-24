@@ -126,17 +126,30 @@ class SniperStrategy:
             return False
         return top10_concentration_pct > self.cfg.max_top10_concentration_pct
 
-    async def _bundle_check_flags_bundle(self, mint: str) -> bool:
-        """user-requested, ported from an earlier version of this bot's
-        sniper: watches the token's live trade stream for
-        bundle_check_window_ms right after launch - if more buys land in
-        that window than bundle_check_max_buys, that's a sign of
-        coordinated insider wallets all buying at once. Deliberately costs
-        the whole window in real time - a conscious trade of sniper's speed
-        advantage for this one extra safety signal, which is why it's off
-        by default."""
-        if not self.cfg.enable_bundle_check:
-            return False
+    async def _pre_buy_activity_check(self, mint: str) -> str | None:
+        """Watches the token's live trade stream for bundle_check_window_ms
+        right after launch, in ONE pass, for two opposite failure modes:
+
+        - too MANY buys (bundle_check_max_buys) - user-requested, ported
+          from an earlier version of this bot's sniper: a sign of
+          coordinated insider wallets all buying at once.
+        - too FEW buys (min_buys_in_window) - user-requested, real finding
+          2026-08-23: 57.1% of everything sniper bought went stale_price
+          (zero real trade activity) within seconds, and min_liquidity_sol
+          can't catch this since every pump.fun launch starts at
+          essentially the same bonding-curve liquidity (confirmed live: 391
+          of ~401 real buys all fell in the same 30-40 SOL band - a
+          constant, not a signal). Checked in the SAME window-watch instead
+          of a second one, so this doesn't cost sniper a second window's
+          worth of real time on top of the bundle check.
+
+        Returns None if the candidate passes, or a short reason string if
+        it should be rejected. Deliberately costs the whole window in real
+        time when either check is enabled - a conscious trade of sniper's
+        speed advantage for these signals, which is why both are off by
+        default."""
+        if not self.cfg.enable_bundle_check and self.cfg.min_buys_in_window <= 0:
+            return None
 
         count = 0
         deadline = time.monotonic() + (self.cfg.bundle_check_window_ms / 1000)
@@ -152,11 +165,11 @@ class SniperStrategy:
                     break
                 if event.get("txType") == "buy":
                     count += 1
-                if count > self.cfg.bundle_check_max_buys:
-                    return True
+                if self.cfg.enable_bundle_check and count > self.cfg.bundle_check_max_buys:
+                    return "gebundeld (te veel snelle buys)"
         except Exception:  # noqa: BLE001
-            logger.exception("Bundle-check mislukt voor %s - filter wordt overgeslagen.", mint)
-            return False
+            logger.exception("Activiteit-check mislukt voor %s - filter wordt overgeslagen.", mint)
+            return None
         finally:
             aclose = getattr(stream, "aclose", None)
             if aclose:
@@ -165,7 +178,11 @@ class SniperStrategy:
                 except Exception:  # noqa: BLE001
                     pass
 
-        return count > self.cfg.bundle_check_max_buys
+        if self.cfg.enable_bundle_check and count > self.cfg.bundle_check_max_buys:
+            return "gebundeld (te veel snelle buys)"
+        if self.cfg.min_buys_in_window > 0 and count < self.cfg.min_buys_in_window:
+            return f"geen echte koopactiviteit ({count}/{self.cfg.min_buys_in_window} buys in het venster)"
+        return None
 
     async def run(self) -> None:
         if not self.cfg.enabled:
@@ -184,8 +201,9 @@ class SniperStrategy:
                 logger.debug("Token %s (%s) afgewezen door filters.", symbol, mint)
                 continue
 
-            if await self._bundle_check_flags_bundle(mint):
-                logger.info("Sniper: %s (%s) geweerd - lijkt gebundeld (te veel snelle buys).", name, symbol)
+            reject_reason = await self._pre_buy_activity_check(mint)
+            if reject_reason is not None:
+                logger.info("Sniper: %s (%s) geweerd - %s.", name, symbol, reject_reason)
                 continue
 
             if await self._holder_concentration_flags_risk(mint):

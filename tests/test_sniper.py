@@ -188,8 +188,8 @@ class BundleCheckFilterTests(unittest.TestCase):
         strategy = _make_strategy(
             client=client, cfg=SniperConfig(enabled=True, enable_bundle_check=False),
         )
-        result = asyncio.run(strategy._bundle_check_flags_bundle("MINT"))
-        self.assertFalse(result)
+        result = asyncio.run(strategy._pre_buy_activity_check("MINT"))
+        self.assertIsNone(result)
         self.assertEqual(client.requested_mints, [])
 
     def test_flags_a_mint_with_more_buys_than_the_max_within_the_window(self):
@@ -202,8 +202,9 @@ class BundleCheckFilterTests(unittest.TestCase):
                 bundle_check_window_ms=50, bundle_check_max_buys=5,
             ),
         )
-        result = asyncio.run(strategy._bundle_check_flags_bundle("MINT"))
-        self.assertTrue(result)
+        result = asyncio.run(strategy._pre_buy_activity_check("MINT"))
+        self.assertIsNotNone(result)
+        self.assertIn("gebundeld", result)
         self.assertEqual(client.requested_mints, [["MINT"]])
 
     def test_does_not_flag_a_mint_at_or_below_the_max(self):
@@ -216,8 +217,8 @@ class BundleCheckFilterTests(unittest.TestCase):
                 bundle_check_window_ms=50, bundle_check_max_buys=5,
             ),
         )
-        result = asyncio.run(strategy._bundle_check_flags_bundle("MINT"))
-        self.assertFalse(result)
+        result = asyncio.run(strategy._pre_buy_activity_check("MINT"))
+        self.assertIsNone(result)
 
     def test_ignores_non_buy_events(self):
         events = [{"txType": "sell"} for _ in range(10)]
@@ -229,8 +230,74 @@ class BundleCheckFilterTests(unittest.TestCase):
                 bundle_check_window_ms=50, bundle_check_max_buys=5,
             ),
         )
-        result = asyncio.run(strategy._bundle_check_flags_bundle("MINT"))
-        self.assertFalse(result)
+        result = asyncio.run(strategy._pre_buy_activity_check("MINT"))
+        self.assertIsNone(result)
+
+
+class MinBuysInWindowFilterTests(unittest.TestCase):
+    """User-requested, real finding 2026-08-23: 57.1% of everything sniper
+    bought went stale_price (zero real trade activity) within seconds, and
+    min_liquidity_sol can't catch it (every pump.fun launch starts at
+    essentially the same bonding-curve liquidity - not a real signal).
+    Rejects a candidate with too FEW real buys in the same window
+    bundle_check already watches, instead of a second one."""
+
+    def test_disabled_by_default_never_opens_a_stream(self):
+        client = FakeTokenTradeStreamClient(events=[])
+        strategy = _make_strategy(
+            client=client, cfg=SniperConfig(enabled=True, min_buys_in_window=0),
+        )
+        result = asyncio.run(strategy._pre_buy_activity_check("MINT"))
+        self.assertIsNone(result)
+        self.assertEqual(client.requested_mints, [])
+
+    def test_flags_a_mint_with_fewer_buys_than_the_minimum(self):
+        events = [{"txType": "buy"}]  # only 1 buy, below minimum of 2
+        client = FakeTokenTradeStreamClient(events=events)
+        strategy = _make_strategy(
+            client=client,
+            cfg=SniperConfig(enabled=True, bundle_check_window_ms=50, min_buys_in_window=2),
+        )
+        result = asyncio.run(strategy._pre_buy_activity_check("MINT"))
+        self.assertIsNotNone(result)
+        self.assertIn("geen echte koopactiviteit", result)
+
+    def test_flags_a_mint_with_zero_buys(self):
+        client = FakeTokenTradeStreamClient(events=[])
+        strategy = _make_strategy(
+            client=client,
+            cfg=SniperConfig(enabled=True, bundle_check_window_ms=50, min_buys_in_window=1),
+        )
+        result = asyncio.run(strategy._pre_buy_activity_check("MINT"))
+        self.assertIsNotNone(result)
+
+    def test_does_not_flag_a_mint_at_or_above_the_minimum(self):
+        events = [{"txType": "buy"} for _ in range(2)]
+        client = FakeTokenTradeStreamClient(events=events)
+        strategy = _make_strategy(
+            client=client,
+            cfg=SniperConfig(enabled=True, bundle_check_window_ms=50, min_buys_in_window=2),
+        )
+        result = asyncio.run(strategy._pre_buy_activity_check("MINT"))
+        self.assertIsNone(result)
+
+    def test_both_checks_share_a_single_window_not_two(self):
+        # 3 buys: passes min_buys_in_window=2, fails bundle_check_max_buys=2 -
+        # both evaluated from the SAME stream watch, only one stream request
+        events = [{"txType": "buy"} for _ in range(3)]
+        client = FakeTokenTradeStreamClient(events=events)
+        strategy = _make_strategy(
+            client=client,
+            cfg=SniperConfig(
+                enabled=True, bundle_check_window_ms=50,
+                enable_bundle_check=True, bundle_check_max_buys=2,
+                min_buys_in_window=2,
+            ),
+        )
+        result = asyncio.run(strategy._pre_buy_activity_check("MINT"))
+        self.assertIsNotNone(result)
+        self.assertIn("gebundeld", result)  # too many, not too few
+        self.assertEqual(len(client.requested_mints), 1)  # one shared window
 
 
 if __name__ == "__main__":
