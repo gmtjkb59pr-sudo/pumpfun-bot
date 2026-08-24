@@ -1110,6 +1110,134 @@ class ReconcileWithWalletTests(unittest.TestCase):
         self.assertGreater(tracker._last_wallet_reconcile_ts, time.time() - 1)
 
 
+class ScamSocialCheckSchedulingTests(unittest.TestCase):
+    """track() should only kick off the post-buy scam-social background
+    check (see scam_social_check.py) for real, live positions that were
+    actually handed a metadata_uri - dry-run positions have nothing real to
+    protect, and a caller with no uri handy has nothing to check."""
+
+    def test_a_metadata_uri_schedules_a_background_task_for_a_live_position(self):
+        risk = RiskManager(RiskConfig())
+        client = FakeClient()
+        tracker = OutcomeTracker(ws_url="wss://example.invalid", risk=risk, client=client, dry_run=False)
+
+        with patch("pumpfun_bot.outcome_tracker.asyncio.create_task") as mock_create_task:
+            asyncio.run(tracker.track(
+                "MINT", "Name", "SYM", 100.0, trade_size_sol=0.03,
+                metadata_uri="https://example.invalid/meta.json",
+            ))
+
+        mock_create_task.assert_called_once()
+
+    def test_no_metadata_uri_schedules_nothing(self):
+        risk = RiskManager(RiskConfig())
+        client = FakeClient()
+        tracker = OutcomeTracker(ws_url="wss://example.invalid", risk=risk, client=client, dry_run=False)
+
+        with patch("pumpfun_bot.outcome_tracker.asyncio.create_task") as mock_create_task:
+            asyncio.run(tracker.track("MINT", "Name", "SYM", 100.0, trade_size_sol=0.03))
+
+        mock_create_task.assert_not_called()
+
+    def test_dry_run_never_schedules_even_with_a_metadata_uri(self):
+        risk = RiskManager(RiskConfig())
+        client = FakeClient()
+        tracker = OutcomeTracker(ws_url="wss://example.invalid", risk=risk, client=client, dry_run=True)
+
+        with patch("pumpfun_bot.outcome_tracker.asyncio.create_task") as mock_create_task:
+            asyncio.run(tracker.track(
+                "MINT", "Name", "SYM", 100.0, trade_size_sol=0.03,
+                metadata_uri="https://example.invalid/meta.json",
+            ))
+
+        mock_create_task.assert_not_called()
+
+
+class ScamSocialCheckExitTests(unittest.TestCase):
+    """Real feature, user-requested: after a real buy, fetch the token's
+    declared socials and force-sell immediately if they look fake (see
+    scam_social_check.py) - catches a scam a fast-moving price-based exit
+    wouldn't notice for a while, if ever."""
+
+    def _make_tracker(self):
+        risk = RiskManager(RiskConfig())
+        risk.register_trade_opened(0.03)
+        client = FakeClient()
+        tracker = OutcomeTracker(ws_url="wss://example.invalid", risk=risk, client=client, dry_run=False)
+        return tracker, risk, client
+
+    def test_sus_links_force_sells_and_untracks_the_position(self):
+        from pumpfun_bot.outcome_tracker import MIN_SELL_DELAY_SEC
+
+        tracker, risk, client = self._make_tracker()
+        asyncio.run(tracker.track("MINT", "Scammy", "SCAM", 100.0, trade_size_sol=0.03))
+        # past MIN_SELL_DELAY_SEC already - the real check would await the
+        # remainder of that floor, which would just slow this test down
+        tracker._pending["MINT"]["entry_ts"] -= MIN_SELL_DELAY_SEC + 1
+
+        async def _fake_fetch(uri):
+            return {"twitter": "https://example.invalid/fake"}
+
+        async def _fake_evaluate(links):
+            return True, "twitter-link ziet er nep uit"
+
+        with patch("pumpfun_bot.outcome_tracker.fetch_social_links", _fake_fetch), \
+             patch("pumpfun_bot.outcome_tracker.evaluate_social_links", _fake_evaluate), \
+             patch("pumpfun_bot.outcome_tracker.record_scam_links") as mock_record:
+            asyncio.run(tracker._check_socials_and_maybe_exit("MINT", "https://example.invalid/meta.json"))
+
+        self.assertNotIn("MINT", tracker._pending)
+        self.assertEqual(client.sell_calls[0][0], "MINT")
+        mock_record.assert_called_once_with(["https://example.invalid/fake"])
+        self.assertAlmostEqual(risk.state.open_exposure_sol, 0.0)  # exposure released
+
+    def test_clean_links_leave_the_position_tracked_and_unsold(self):
+        tracker, risk, client = self._make_tracker()
+        asyncio.run(tracker.track("MINT", "Legit", "LEGIT", 100.0, trade_size_sol=0.03))
+
+        async def _fake_fetch(uri):
+            return {"twitter": "https://x.com/realproject"}
+
+        async def _fake_evaluate(links):
+            return False, None
+
+        with patch("pumpfun_bot.outcome_tracker.fetch_social_links", _fake_fetch), \
+             patch("pumpfun_bot.outcome_tracker.evaluate_social_links", _fake_evaluate):
+            asyncio.run(tracker._check_socials_and_maybe_exit("MINT", "https://example.invalid/meta.json"))
+
+        self.assertIn("MINT", tracker._pending)
+        self.assertEqual(client.sell_calls, [])
+
+    def test_no_links_found_is_a_no_op(self):
+        tracker, risk, client = self._make_tracker()
+        asyncio.run(tracker.track("MINT", "Unknown", "UNK", 100.0, trade_size_sol=0.03))
+
+        async def _fake_fetch(uri):
+            return {}
+
+        with patch("pumpfun_bot.outcome_tracker.fetch_social_links", _fake_fetch):
+            asyncio.run(tracker._check_socials_and_maybe_exit("MINT", "https://example.invalid/meta.json"))
+
+        self.assertIn("MINT", tracker._pending)
+        self.assertEqual(client.sell_calls, [])
+
+    def test_a_position_that_already_exited_before_the_check_finished_is_a_no_op(self):
+        tracker, risk, client = self._make_tracker()
+        # never tracked - simulates a normal fast exit completing before
+        # this background check got around to running
+        async def _fake_fetch(uri):
+            return {"twitter": "https://example.invalid/fake"}
+
+        async def _fake_evaluate(links):
+            return True, "sus"
+
+        with patch("pumpfun_bot.outcome_tracker.fetch_social_links", _fake_fetch), \
+             patch("pumpfun_bot.outcome_tracker.evaluate_social_links", _fake_evaluate):
+            asyncio.run(tracker._check_socials_and_maybe_exit("GONE_MINT", "https://example.invalid/meta.json"))
+
+        self.assertEqual(client.sell_calls, [])  # nothing to sell, no crash
+
+
 class RecentlyExitedGraceWindowTests(unittest.TestCase):
     """Real bug found live (Alpha, social_watch, 2026-08-23): a position
     exited normally via trailing_stop, its sell fully confirmed on-chain

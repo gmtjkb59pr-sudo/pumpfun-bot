@@ -420,6 +420,7 @@ class SocialWatchStrategy:
                     strategy="social_watch",
                     take_profit_ladder=self.cfg.take_profit_ladder,
                     price_ref_field=price_ref_field,
+                    metadata_uri=event.get("uri"),
                 )
             if self.scaled_exit_simulator is not None and entry_ref is not None:
                 self.scaled_exit_simulator.track(mint, entry_ref, self.trade_size_sol)

@@ -42,3 +42,28 @@ async def fetch_has_socials(uri: str, timeout_sec: float = 5.0) -> bool:
     if not isinstance(data, dict):
         return False
     return any(data.get(field) for field in SOCIAL_FIELDS)
+
+
+async def fetch_social_links(uri: str, timeout_sec: float = 5.0) -> dict[str, str]:
+    """Same fetch as fetch_has_socials, but returns the actual link values
+    instead of a bool - used by scam_social_check.py to inspect the links
+    themselves, not just whether they exist. Any failure returns {} for the
+    same reasons fetch_has_socials treats failure as "no socials"."""
+    if not uri:
+        return {}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(uri, timeout=timeout_sec) as resp:
+                if resp.status != 200:
+                    return {}
+                data = await resp.json(content_type=None)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Kon metadata niet ophalen van %s: %s", uri, exc)
+        return {}
+
+    if not isinstance(data, dict):
+        return {}
+    return {
+        field: data[field] for field in SOCIAL_FIELDS
+        if isinstance(data.get(field), str) and data[field].strip()
+    }

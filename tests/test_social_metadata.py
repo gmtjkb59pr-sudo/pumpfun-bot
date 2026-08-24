@@ -2,7 +2,7 @@ import asyncio
 import unittest
 from unittest.mock import patch
 
-from pumpfun_bot.social_metadata import fetch_has_socials
+from pumpfun_bot.social_metadata import fetch_has_socials, fetch_social_links
 
 
 class _FakeResponse:
@@ -85,6 +85,40 @@ class FetchHasSocialsTests(unittest.TestCase):
 
         with patch("pumpfun_bot.social_metadata.aiohttp.ClientSession", return_value=_RaisingSession()):
             self.assertFalse(asyncio.run(fetch_has_socials("https://example.invalid/meta.json")))
+
+
+class FetchSocialLinksTests(unittest.TestCase):
+    def test_returns_the_actual_link_values(self):
+        response = _FakeResponse({
+            "name": "Test", "twitter": "https://x.com/test", "website": "https://test.invalid",
+        })
+        with _patched(response):
+            links = asyncio.run(fetch_social_links("https://example.invalid/meta.json"))
+        self.assertEqual(links, {"twitter": "https://x.com/test", "website": "https://test.invalid"})
+
+    def test_omits_fields_that_are_missing_or_blank(self):
+        response = _FakeResponse({"name": "Test", "twitter": "https://x.com/test", "telegram": ""})
+        with _patched(response):
+            links = asyncio.run(fetch_social_links("https://example.invalid/meta.json"))
+        self.assertEqual(links, {"twitter": "https://x.com/test"})
+
+    def test_empty_dict_on_non_200_status(self):
+        response = _FakeResponse({"twitter": "https://x.com/test"}, status=404)
+        with _patched(response):
+            self.assertEqual(asyncio.run(fetch_social_links("https://example.invalid/meta.json")), {})
+
+    def test_empty_dict_when_uri_is_empty(self):
+        self.assertEqual(asyncio.run(fetch_social_links("")), {})
+
+    def test_empty_dict_when_metadata_is_not_a_dict(self):
+        response = _FakeResponse(["not", "a", "dict"])
+        with _patched(response):
+            self.assertEqual(asyncio.run(fetch_social_links("https://example.invalid/meta.json")), {})
+
+    def test_ignores_a_non_string_social_field(self):
+        response = _FakeResponse({"twitter": {"unexpected": "shape"}})
+        with _patched(response):
+            self.assertEqual(asyncio.run(fetch_social_links("https://example.invalid/meta.json")), {})
 
 
 if __name__ == "__main__":
