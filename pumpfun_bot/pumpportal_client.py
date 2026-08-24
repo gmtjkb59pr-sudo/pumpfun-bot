@@ -29,6 +29,29 @@ from .fees import PRIORITY_FEE_SOL_PER_LEG
 logger = logging.getLogger("pumpfun_bot.pumpportal")
 
 
+class OnChainTransactionError(RuntimeError):
+    """Raised by _confirm_transaction when a transaction reverted on-chain
+    - a plain RuntimeError subclass (existing `except Exception`/
+    `assertRaises(RuntimeError)` callers are unaffected), but carries the
+    parsed Anchor custom error code (e.g. 6005) when the failure has one,
+    so a caller that cares about a SPECIFIC on-chain reason (see
+    build_and_send_full_sell's pool="pump-amm" retry) doesn't have to
+    string-match the stringified error dict."""
+
+    def __init__(self, message: str, custom_error_code: int | None = None):
+        super().__init__(message)
+        self.custom_error_code = custom_error_code
+
+
+def _extract_custom_error_code(err) -> int | None:
+    if not isinstance(err, dict):
+        return None
+    instr_err = err.get("InstructionError")
+    if not (isinstance(instr_err, list) and len(instr_err) == 2 and isinstance(instr_err[1], dict)):
+        return None
+    return instr_err[1].get("Custom")
+
+
 def authenticated_ws_url(ws_url: str, api_key: str) -> str:
     # subscribeTokenTrade/subscribeAccountTrade need the key on the connection
     # URL itself (?api-key=...), not in a message - see
@@ -152,7 +175,7 @@ class PumpPortalClient:
             "priorityFee": priority_fee_sol,
             "pool": pool,
         }
-        sig = await self._sign_and_send(body)
+        sig = await self._sign_and_send_with_migration_retry(body)
         # only fetched for sells - a buy is speed-critical (sniper's whole
         # edge depends on it) and doesn't need this, see _fetch_real_sol_
         # delta's docstring for what it's actually used for (real, ground-
@@ -208,12 +231,43 @@ class PumpPortalClient:
             "priorityFee": priority_fee_sol,
             "pool": pool,
         }
-        sig = await self._sign_and_send(body)
+        sig = await self._sign_and_send_with_migration_retry(body)
         real_sol_delta = await self._fetch_real_sol_delta(sig)
         return {
             "signature": sig, "action": "sell", "mint": mint, "amount": amount,
             "real_sol_delta": real_sol_delta,
         }
+
+    async def _sign_and_send_with_migration_retry(self, body: dict) -> str:
+        """User-requested, real finding 2026-08-23: a sell failed with
+        AnchorError BondingCurveComplete (Custom 6005) - "The bonding curve
+        has completed and liquidity migrated to raydium." - even with
+        pool="auto", which is supposed to route wherever the token
+        currently trades. A token can graduate WHILE this bot holds it
+        (confirmed live: a real position pumped hard enough to migrate
+        mid-hold), and "auto" doesn't always catch a migration that just
+        happened. Only retries a SELL (a buy into an already-migrated
+        token is a different, pre-buy problem "auto" already claims to
+        handle) that isn't already explicitly on pool="pump-amm" - one
+        retry, forcing the PumpSwap pool explicitly since we now KNOW
+        definitively (from the error itself) that the bonding curve is
+        done and the token only trades there now."""
+        try:
+            return await self._sign_and_send(body)
+        except OnChainTransactionError as exc:
+            if (
+                exc.custom_error_code != 6005
+                or body.get("action") != "sell"
+                or body.get("pool") == "pump-amm"
+            ):
+                raise
+            logger.warning(
+                "Verkoop van %s mislukte met BondingCurveComplete (Custom 6005) - bonding curve "
+                "is gemigreerd naar Raydium/PumpSwap, probeer opnieuw met pool=pump-amm.",
+                body.get("mint"),
+            )
+            retry_body = {**body, "pool": "pump-amm"}
+            return await self._sign_and_send(retry_body)
 
     async def _sign_and_send(self, body: dict) -> str:
         # timing + blockhash-validity diagnostics for BlockhashNotFound
@@ -323,8 +377,9 @@ class PumpPortalClient:
 
             if status is not None:
                 if status.get("err") is not None:
-                    raise RuntimeError(
-                        f"Transactie {signature} is gefaald on-chain: {status['err']}"
+                    raise OnChainTransactionError(
+                        f"Transactie {signature} is gefaald on-chain: {status['err']}",
+                        custom_error_code=_extract_custom_error_code(status["err"]),
                     )
                 if status.get("confirmationStatus") in ("confirmed", "finalized"):
                     return

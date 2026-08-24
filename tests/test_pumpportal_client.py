@@ -4,7 +4,11 @@ from unittest.mock import patch
 
 from solders.keypair import Keypair
 
-from pumpfun_bot.pumpportal_client import PumpPortalClient, authenticated_ws_url
+from pumpfun_bot.pumpportal_client import (
+    OnChainTransactionError,
+    PumpPortalClient,
+    authenticated_ws_url,
+)
 
 
 class _FakeResponse:
@@ -355,6 +359,26 @@ class ConfirmTransactionTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 asyncio.run(client._confirm_transaction("SIG", timeout_sec=1, poll_interval_sec=0.01))
 
+    def test_the_raised_error_carries_the_parsed_custom_error_code(self):
+        client = self._make_client()
+        session = _FakeSession([
+            _status_response(err={"InstructionError": [3, {"Custom": 6005}]}, confirmation_status="processed")
+        ])
+        with patch("pumpfun_bot.pumpportal_client.aiohttp.ClientSession", return_value=session):
+            with self.assertRaises(OnChainTransactionError) as ctx:
+                asyncio.run(client._confirm_transaction("SIG", timeout_sec=1, poll_interval_sec=0.01))
+        self.assertEqual(ctx.exception.custom_error_code, 6005)
+
+    def test_a_non_instruction_error_has_no_custom_error_code(self):
+        client = self._make_client()
+        session = _FakeSession([
+            _status_response(err="SomeOtherKindOfError", confirmation_status="processed")
+        ])
+        with patch("pumpfun_bot.pumpportal_client.aiohttp.ClientSession", return_value=session):
+            with self.assertRaises(OnChainTransactionError) as ctx:
+                asyncio.run(client._confirm_transaction("SIG", timeout_sec=1, poll_interval_sec=0.01))
+        self.assertIsNone(ctx.exception.custom_error_code)
+
     def test_raises_if_never_confirmed_within_timeout(self):
         client = self._make_client()
         session = _FakeSession([_not_found_response()])
@@ -372,6 +396,123 @@ class ConfirmTransactionTests(unittest.TestCase):
         with patch("pumpfun_bot.pumpportal_client.aiohttp.ClientSession", return_value=session):
             asyncio.run(client._confirm_transaction("SIG", timeout_sec=1, poll_interval_sec=0.01))
         self.assertEqual(session.call_count, 3)
+
+
+class MigrationRetryTests(unittest.TestCase):
+    """Real finding 2026-08-23: a sell failed with AnchorError
+    BondingCurveComplete (Custom 6005) even with pool="auto" - a real
+    position pumped hard enough to migrate to Raydium/PumpSwap WHILE this
+    bot held it, and "auto" didn't catch the fresh migration. One retry,
+    forcing pool="pump-amm" explicitly since the error itself confirms the
+    bonding curve is done."""
+
+    def _make_client(self):
+        return PumpPortalClient(
+            ws_url="wss://example.invalid",
+            trade_api_url="https://example.invalid/trade-local",
+            rpc_http_url="https://example.invalid/rpc",
+            keypair=Keypair(),
+        )
+
+    def test_full_sell_retries_with_pump_amm_on_bonding_curve_complete(self):
+        client = self._make_client()
+        calls = []
+
+        async def fake_sign_and_send(body):
+            calls.append(dict(body))
+            if len(calls) == 1:
+                raise OnChainTransactionError("boom", custom_error_code=6005)
+            return "retry_signature"
+
+        client._sign_and_send = fake_sign_and_send
+        client._fetch_real_sol_delta = lambda sig: _async_none()
+        result = asyncio.run(client.build_and_send_full_sell(mint="MINT123", slippage_pct=10))
+
+        self.assertEqual(result["signature"], "retry_signature")
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0]["pool"], "auto")
+        self.assertEqual(calls[1]["pool"], "pump-amm")
+
+    def test_sell_via_build_and_send_trade_also_retries(self):
+        client = self._make_client()
+        calls = []
+
+        async def fake_sign_and_send(body):
+            calls.append(dict(body))
+            if len(calls) == 1:
+                raise OnChainTransactionError("boom", custom_error_code=6005)
+            return "retry_signature"
+
+        client._sign_and_send = fake_sign_and_send
+        client._fetch_real_sol_delta = lambda sig: _async_none()
+        result = asyncio.run(client.build_and_send_trade(
+            action="sell", mint="MINT123", amount_sol=0.02, slippage_pct=10,
+        ))
+
+        self.assertEqual(result["signature"], "retry_signature")
+        self.assertEqual(calls[1]["pool"], "pump-amm")
+
+    def test_a_buy_never_retries_on_bonding_curve_complete(self):
+        # a buy hitting an already-migrated token is a different, pre-buy
+        # problem - "auto" already claims to handle routing a fresh buy
+        client = self._make_client()
+        calls = []
+
+        async def fake_sign_and_send(body):
+            calls.append(dict(body))
+            raise OnChainTransactionError("boom", custom_error_code=6005)
+
+        client._sign_and_send = fake_sign_and_send
+        with self.assertRaises(OnChainTransactionError):
+            asyncio.run(client.build_and_send_trade(
+                action="buy", mint="MINT123", amount_sol=0.05, slippage_pct=10,
+            ))
+        self.assertEqual(len(calls), 1)  # no retry attempted
+
+    def test_does_not_retry_a_different_error_code(self):
+        client = self._make_client()
+        calls = []
+
+        async def fake_sign_and_send(body):
+            calls.append(dict(body))
+            raise OnChainTransactionError("boom", custom_error_code=6022)
+
+        client._sign_and_send = fake_sign_and_send
+        with self.assertRaises(OnChainTransactionError):
+            asyncio.run(client.build_and_send_full_sell(mint="MINT123", slippage_pct=10))
+        self.assertEqual(len(calls), 1)
+
+    def test_does_not_retry_again_if_already_on_pump_amm(self):
+        # avoids a pointless second failure/fee if pump-amm itself is
+        # somehow still wrong - one retry, not an infinite loop
+        client = self._make_client()
+        calls = []
+
+        async def fake_sign_and_send(body):
+            calls.append(dict(body))
+            raise OnChainTransactionError("boom", custom_error_code=6005)
+
+        client._sign_and_send = fake_sign_and_send
+        with self.assertRaises(OnChainTransactionError):
+            asyncio.run(client.build_and_send_full_sell(mint="MINT123", slippage_pct=10, pool="pump-amm"))
+        self.assertEqual(len(calls), 1)
+
+    def test_a_successful_first_attempt_never_retries(self):
+        client = self._make_client()
+        calls = []
+
+        async def fake_sign_and_send(body):
+            calls.append(dict(body))
+            return "sig"
+
+        client._sign_and_send = fake_sign_and_send
+        client._fetch_real_sol_delta = lambda sig: _async_none()
+        asyncio.run(client.build_and_send_full_sell(mint="MINT123", slippage_pct=10))
+        self.assertEqual(len(calls), 1)
+
+
+async def _async_none():
+    return None
 
 
 if __name__ == "__main__":

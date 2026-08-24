@@ -301,11 +301,24 @@ class MinBuysInWindowFilterTests(unittest.TestCase):
 
 
 class DuplicateNameFilterTests(unittest.TestCase):
-    """Real finding 2026-08-23: bought "Rogue Rocket (ROGROC)", and ~35s
-    later a DIFFERENT mint launched under the exact same name and symbol -
-    a real, free (no RPC call) scam signal: a legitimate project doesn't
-    relaunch under its own name minutes later, but a copycat/rug-kit
-    reusing a recognizable name to catch bots/humans does."""
+    """Real finding 2026-08-23: bought "Rogue Rocket (ROGROC)", and later a
+    DIFFERENT mint launched under the exact same name and symbol - a real,
+    free (no RPC call) scam signal. PERSISTED with no expiry (not just an
+    in-memory window) - confirmed live the SAME day: "Rogue Wizard"
+    (ROGWIZ) resurfaced a THIRD time ~55 HOURS after the first two, so a
+    scam kit clearly reuses a name across days, not just minutes."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._path = Path(self._tmpdir.name) / "sniper_seen_launch_names.json"
+        self._patcher = patch(
+            "pumpfun_bot.strategies.sniper.SEEN_LAUNCH_NAMES_PATH", self._path,
+        )
+        self._patcher.start()
+
+    def tearDown(self):
+        self._patcher.stop()
+        self._tmpdir.cleanup()
 
     def test_first_sighting_of_a_name_is_not_a_duplicate(self):
         strategy = _make_strategy()
@@ -334,17 +347,25 @@ class DuplicateNameFilterTests(unittest.TestCase):
         strategy._is_duplicate_name("?", "?")
         self.assertFalse(strategy._is_duplicate_name("?", "?"))
 
-    def test_expires_after_the_window(self):
+    def test_never_expires_even_after_a_long_time(self):
+        # real finding: "Rogue Wizard" resurfaced ~55 hours after its first
+        # two sightings - a short in-memory window would have missed it
         from pumpfun_bot.strategies import sniper as sniper_module
 
         strategy = _make_strategy()
         with patch.object(sniper_module.time, "time", return_value=1000.0):
-            strategy._is_duplicate_name("Rogue Rocket", "ROGROC")
-        with patch.object(
-            sniper_module.time, "time",
-            return_value=1000.0 + sniper_module.DUPLICATE_NAME_WINDOW_SEC + 1,
-        ):
-            self.assertFalse(strategy._is_duplicate_name("Rogue Rocket", "ROGROC"))
+            strategy._is_duplicate_name("Rogue Wizard", "ROGWIZ")
+        with patch.object(sniper_module.time, "time", return_value=1000.0 + 55 * 3600):
+            self.assertTrue(strategy._is_duplicate_name("Rogue Wizard", "ROGWIZ"))
+
+    def test_persists_to_disk_across_separate_strategy_instances(self):
+        # simulates surviving a bot restart - a fresh SniperStrategy
+        # instance must still recognize a name seen by an earlier one
+        strategy_a = _make_strategy()
+        strategy_a._is_duplicate_name("Rogue Wizard", "ROGWIZ")
+
+        strategy_b = _make_strategy()
+        self.assertTrue(strategy_b._is_duplicate_name("Rogue Wizard", "ROGWIZ"))
 
 
 if __name__ == "__main__":
