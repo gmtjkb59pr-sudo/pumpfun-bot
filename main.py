@@ -23,6 +23,7 @@ from pumpfun_bot.balance_watch import (
     MaxRealLossReached,
     fetch_sol_balance,
     fetch_sol_usd_price,
+    watch_and_update_live_balance,
     watch_balance_floor,
     watch_max_real_loss,
 )
@@ -333,6 +334,17 @@ async def main() -> None:
         )
         tasks.append(asyncio.create_task(
             watch_max_real_loss(max_loss_usd=cfg.risk.max_real_loss_usd, alerter=alerter)
+        ))
+
+    if not cfg.risk.dry_run and cfg.risk.max_exposure_pct_of_balance > 0:
+        logger.info(
+            "Balance-relatieve exposure-cap actief: max %.0f%% van live wallet-balance.",
+            cfg.risk.max_exposure_pct_of_balance,
+        )
+        tasks.append(asyncio.create_task(
+            watch_and_update_live_balance(
+                risk_manager=risk, wallet_pubkey=str(keypair.pubkey()), rpc_http_url=cfg.rpc_http_url,
+            )
         ))
 
     try:

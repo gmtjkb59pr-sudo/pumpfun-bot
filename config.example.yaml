@@ -33,6 +33,12 @@ risk:
   # zodra het ECHTE verlies deze sessie (echte wallet-balans, niet het
   # fee-model) dit bedrag bereikt. 0 = uitgeschakeld (standaard).
   max_real_loss_usd: 0
+  # caps total open exposure at a PERCENTAGE of the wallet's real, live SOL
+  # balance instead of (in addition to) the fixed max_sol_total_exposure
+  # above - shrinks automatically as the wallet shrinks, grows
+  # automatically after a top-up. 0 = disabled (default), relies on
+  # max_sol_total_exposure alone.
+  max_exposure_pct_of_balance: 0
 
 strategies:
   sniper:

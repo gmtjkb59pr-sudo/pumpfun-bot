@@ -41,6 +41,11 @@ class RiskState:
     buy_failure_timestamps: list = field(default_factory=list)
     circuit_breaker_state: str = "closed"  # closed | open | half_open
     circuit_breaker_opened_at: float = 0.0
+    # real, live wallet SOL balance - see RiskManager.update_live_balance()
+    # and can_trade()'s max_exposure_pct_of_balance check. None until the
+    # first successful balance lookup lands (fails open, same stance as
+    # every other RPC-dependent check in this codebase).
+    live_balance_sol: float | None = None
 
 
 class RiskManager:
@@ -62,6 +67,13 @@ class RiskManager:
         cutoff = time.time() - 3600
         self.state.trade_timestamps = [t for t in self.state.trade_timestamps if t > cutoff]
         return len(self.state.trade_timestamps)
+
+    def update_live_balance(self, balance_sol: float) -> None:
+        """Called periodically by a background task (see balance_watch.py's
+        watch_and_update_live_balance) with the wallet's real, on-chain SOL
+        balance - see can_trade()'s max_exposure_pct_of_balance check for
+        why this exists."""
+        self.state.live_balance_sol = balance_sol
 
     def can_trade(
         self, sol_amount: float, liquidity_sol: float | None = None,
@@ -133,6 +145,26 @@ class RiskManager:
                 f"Zou totale exposure naar {self.state.open_exposure_sol + sol_amount:.4f} SOL "
                 f"brengen, max is {self.cfg.max_sol_total_exposure}."
             )
+
+        # see max_exposure_pct_of_balance's docstring in config.py for the
+        # real incident this fixes - a FIXED exposure cap can be larger
+        # than the wallet's actual current balance, letting a burst of
+        # buys spend the wallet down to near-zero. 0 (default) or no live
+        # balance reading yet (fails open, same stance as every other RPC-
+        # dependent check here) skips this and relies on the fixed cap
+        # above alone, unchanged from before.
+        if (
+            not self.cfg.dry_run
+            and self.cfg.max_exposure_pct_of_balance > 0
+            and self.state.live_balance_sol is not None
+        ):
+            allowed = self.state.live_balance_sol * (self.cfg.max_exposure_pct_of_balance / 100)
+            if self.state.open_exposure_sol + sol_amount > allowed:
+                return False, (
+                    f"Zou totale exposure naar {self.state.open_exposure_sol + sol_amount:.4f} SOL "
+                    f"brengen, max is {self.cfg.max_exposure_pct_of_balance}% van live wallet-"
+                    f"balance ({self.state.live_balance_sol:.4f} SOL) = {allowed:.4f} SOL."
+                )
 
         if not self.cfg.dry_run and open_positions_count is not None:
             effective_max = (

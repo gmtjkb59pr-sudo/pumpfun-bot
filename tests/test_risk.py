@@ -199,6 +199,64 @@ class DryRunSkipsCapitalLimitsTests(unittest.TestCase):
         self.assertIn("Liquiditeit", reason)
 
 
+class BalanceRelativeExposureCapTests(unittest.TestCase):
+    """Real incident 2026-08-23: a FIXED max_sol_total_exposure larger than
+    the wallet's actual (much smaller, after a day of losses) balance let
+    sniper spend the wallet down to near-zero in about 90 seconds once
+    re-enabled. max_exposure_pct_of_balance caps total exposure at a
+    percentage of the wallet's real, live SOL balance instead - see
+    risk.py's update_live_balance()/can_trade()."""
+
+    def test_disabled_by_default_relies_on_fixed_cap_alone(self):
+        # max_exposure_pct_of_balance=0 (the default) - a live balance
+        # reading that would otherwise block this trade is simply ignored
+        risk = make_manager(max_sol_total_exposure=0.3, dry_run=False)
+        risk.update_live_balance(0.01)  # tiny wallet
+        ok, reason = risk.can_trade(0.05, liquidity_sol=10)
+        self.assertTrue(ok)
+
+    def test_no_live_balance_reading_yet_fails_open(self):
+        # max_exposure_pct_of_balance set, but update_live_balance() never
+        # called - same fail-open stance as every other RPC-dependent check
+        risk = make_manager(max_sol_per_trade=0.3, max_sol_total_exposure=0.3, max_exposure_pct_of_balance=50, dry_run=False)
+        ok, reason = risk.can_trade(0.05, liquidity_sol=10)
+        self.assertTrue(ok)
+
+    def test_blocks_a_trade_that_would_exceed_the_percentage_of_live_balance(self):
+        risk = make_manager(max_sol_per_trade=0.3, max_sol_total_exposure=0.3, max_exposure_pct_of_balance=50, dry_run=False)
+        risk.update_live_balance(0.1)  # allowed = 0.05 SOL
+        ok, reason = risk.can_trade(0.06, liquidity_sol=10)
+        self.assertFalse(ok)
+        self.assertIn("50", reason)
+        self.assertIn("0.1000", reason)
+
+    def test_allows_a_trade_within_the_percentage_of_live_balance(self):
+        risk = make_manager(max_sol_per_trade=0.3, max_sol_total_exposure=0.3, max_exposure_pct_of_balance=50, dry_run=False)
+        risk.update_live_balance(0.1)  # allowed = 0.05 SOL
+        ok, reason = risk.can_trade(0.04, liquidity_sol=10)
+        self.assertTrue(ok)
+
+    def test_cap_shrinks_automatically_as_the_wallet_shrinks(self):
+        risk = make_manager(max_sol_per_trade=0.3, max_sol_total_exposure=0.3, max_exposure_pct_of_balance=50, dry_run=False)
+        risk.update_live_balance(0.1)
+        self.assertTrue(risk.can_trade(0.04, liquidity_sol=10)[0])
+        risk.update_live_balance(0.02)  # a big loss/drain since the last reading
+        self.assertFalse(risk.can_trade(0.04, liquidity_sol=10)[0])
+
+    def test_accounts_for_already_open_exposure_not_just_the_new_trade(self):
+        risk = make_manager(max_sol_per_trade=0.3, max_sol_total_exposure=0.3, max_exposure_pct_of_balance=50, dry_run=False)
+        risk.update_live_balance(0.1)  # allowed = 0.05 SOL
+        risk.register_trade_opened(0.03)
+        ok, reason = risk.can_trade(0.03, liquidity_sol=10)  # 0.03 + 0.03 > 0.05
+        self.assertFalse(ok)
+
+    def test_skipped_entirely_in_dry_run(self):
+        risk = make_manager(max_sol_total_exposure=0.3, max_exposure_pct_of_balance=50, dry_run=True)
+        risk.update_live_balance(0.001)  # would block if this check applied
+        ok, reason = risk.can_trade(0.05, liquidity_sol=10)
+        self.assertTrue(ok)
+
+
 class RiskManagerStateTests(unittest.TestCase):
     def test_register_trade_opened_increases_exposure(self):
         risk = make_manager()
