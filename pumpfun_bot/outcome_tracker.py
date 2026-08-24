@@ -791,16 +791,39 @@ class OutcomeTracker:
         # AND this on-chain re-check is trustworthy enough to hold against
         # the launcher wallet's reputation (see wallet_reputation.py).
         # reputation_logged avoids re-logging the same mint every cycle.
+        # user-requested, real finding 2026-08-23: a permanently-stuck
+        # position's exposure was never released, since it can never close
+        # through the normal sell path - confirmed live, 4 such positions'
+        # combined exposure (0.14 SOL) grew bigger than 50% of the actual
+        # (much smaller, after losses) wallet balance, so
+        # max_exposure_pct_of_balance blocked EVERY new trade indefinitely,
+        # regardless of quality, until the wallet happened to grow enough
+        # on its own. This capital is realistically gone/illiquid already,
+        # not meaningfully "at risk" in the sense the cap exists to guard -
+        # released here, the SAME moment a position is confirmed
+        # permanently unsellable (not a moment sooner - a transient/
+        # recoverable pause must keep counting as real exposure).
         newly_confirmed_unsellable = []
         async with self._lock:
             for mint, info in self._pending.items():
                 if info.get("sell_paused") and mint in held and not info.get("reputation_logged"):
                     info["reputation_logged"] = True
                     newly_confirmed_unsellable.append(mint)
+                    if self.risk is not None:
+                        effective_size = info.get("trade_size_sol", 0) * info.get("remaining_fraction", 1.0)
+                        if effective_size:
+                            self.risk.register_trade_closed(effective_size, 0.0)
             if newly_confirmed_unsellable:
                 self._persist_pending()
         for mint in newly_confirmed_unsellable:
             append_jsonl({"type": "sell_paused", "ts": time.time(), "mint": mint})
+            message = (
+                f"🔓 Exposure vrijgegeven voor permanent onverkoopbare positie {mint} - "
+                f"telt niet langer mee tegen max_sol_total_exposure/max_exposure_pct_of_balance."
+            )
+            logger.warning(message)
+            if self.alerter is not None:
+                await self.alerter.send(message)
 
         if untracked:
             # user-requested: don't keep re-alerting about the SAME mints
