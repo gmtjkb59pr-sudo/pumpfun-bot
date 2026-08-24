@@ -319,6 +319,32 @@ class CoinGeckoMoversConfig:
     # yet for this strategy) - revisit once it does.
     stale_price_timeout_sec: float = 60
     max_hold_sec: float = 3600
+    # user-requested 2026-08-24 ("thats most important you want to let
+    # those ride probably they wont rug") - a pool old enough to still be
+    # trading has already cleared the classic instant "dev pulls
+    # liquidity" rug risk that justifies sniper's ultra-tight exits, so
+    # the SAME tight ladder/hold-time above (sized for a fresh, unproven
+    # mover) is probably needlessly capping upside on a genuine revival.
+    # Caveat: age reduces classic rug risk, it doesn't eliminate crash
+    # risk entirely (a coordinated pump on a mostly-dead token can still
+    # be engineered to dump on latecomers) - stop_loss stays active, just
+    # looser. A candidate at/above this age uses the revival_* settings
+    # below instead of the fields above. Provisional, reasoned but
+    # UNPROVEN with real data (this strategy has zero real trades so
+    # far) - now that pool_age_hours is tracked on every real
+    # candidate/trade, real outcome data can eventually confirm or
+    # refute treating revivals differently at all.
+    revival_age_hours: float = 24.0
+    revival_stop_loss_pct: float = 30
+    revival_trailing_activation_pct: float = 40
+    revival_trailing_stop_pct: float = 20
+    revival_take_profit_ladder: list = field(default_factory=lambda: [
+        TakeProfitLevel(multiplier=1.5, sell_pct=20),
+        TakeProfitLevel(multiplier=2.0, sell_pct=30),
+        TakeProfitLevel(multiplier=5.0, sell_pct=30),
+    ])
+    revival_stale_price_timeout_sec: float = 60
+    revival_max_hold_sec: float = 86400  # 24h - let a genuine revival actually play out
 
 
 @dataclass
@@ -545,6 +571,7 @@ def load_config(path: str = "config.yaml") -> AppConfig:
 
     cg_raw = strat_raw.get("coingecko_movers", {})
     cg_key_var = cg_raw.get("api_key_env_var", "COINGECKO_API_KEY")
+    cg_defaults = CoinGeckoMoversConfig()
     coingecko_movers = CoinGeckoMoversConfig(
         enabled=cg_raw.get("enabled", False),
         api_key=os.environ.get(cg_key_var, ""),
@@ -564,6 +591,23 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         take_profit_ladder=_parse_take_profit_ladder(cg_raw.get("take_profit_ladder")),
         stale_price_timeout_sec=cg_raw.get("stale_price_timeout_sec", 60),
         max_hold_sec=cg_raw.get("max_hold_sec", 3600),
+        revival_age_hours=cg_raw.get("revival_age_hours", cg_defaults.revival_age_hours),
+        revival_stop_loss_pct=cg_raw.get("revival_stop_loss_pct", cg_defaults.revival_stop_loss_pct),
+        revival_trailing_activation_pct=cg_raw.get(
+            "revival_trailing_activation_pct", cg_defaults.revival_trailing_activation_pct,
+        ),
+        revival_trailing_stop_pct=cg_raw.get(
+            "revival_trailing_stop_pct", cg_defaults.revival_trailing_stop_pct,
+        ),
+        revival_take_profit_ladder=(
+            _parse_take_profit_ladder(cg_raw.get("revival_take_profit_ladder"))
+            if cg_raw.get("revival_take_profit_ladder") is not None
+            else cg_defaults.revival_take_profit_ladder
+        ),
+        revival_stale_price_timeout_sec=cg_raw.get(
+            "revival_stale_price_timeout_sec", cg_defaults.revival_stale_price_timeout_sec,
+        ),
+        revival_max_hold_sec=cg_raw.get("revival_max_hold_sec", cg_defaults.revival_max_hold_sec),
     )
 
     mh_raw = strat_raw.get("moonshot_hunter", {})

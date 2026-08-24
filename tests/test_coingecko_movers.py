@@ -301,6 +301,76 @@ class ConsiderTests(unittest.TestCase):
         self.assertEqual(outcome_tracker._pending["MINTpump"]["stale_price_timeout_sec"], 60)
         self.assertEqual(outcome_tracker._pending["MINTpump"]["max_hold_sec"], 3600)
 
+    def test_a_fresh_candidate_gets_the_tight_exit_settings(self):
+        # pool_age_hours below revival_age_hours (default 24h) - the
+        # tight, proven-ish settings apply, not the wide revival ones
+        import time as time_module
+
+        store_file = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
+        store_file.close()
+        store_path = Path(store_file.name)
+        self.addCleanup(lambda: store_path.unlink(missing_ok=True))
+
+        client = FakeClient()
+        outcome_tracker = OutcomeTracker(ws_url="wss://example.invalid", position_store_path=store_path)
+        strategy, risk = _make_strategy(client, dry_run=True, outcome_tracker=outcome_tracker)
+        fresh_ts = time_module.time() - 2 * 3600  # 2 hours old
+
+        with _DEFAULT_HOLDER_PATCH, _DEFAULT_CONCENTRATION_PATCH:
+            asyncio.run(strategy._consider(_candidate(pool_created_ts=fresh_ts)))
+
+        pending = outcome_tracker._pending["MINTpump"]
+        self.assertEqual(pending["stop_loss_pct"], strategy.cfg.stop_loss_pct)
+        self.assertEqual(pending["max_hold_sec"], strategy.cfg.max_hold_sec)
+
+    def test_a_revival_candidate_gets_the_wide_patient_exit_settings(self):
+        # user-requested 2026-08-24 ("let those ride probably they wont
+        # rug") - a pool at/above revival_age_hours gets the looser,
+        # more patient revival_* settings instead
+        import time as time_module
+
+        store_file = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
+        store_file.close()
+        store_path = Path(store_file.name)
+        self.addCleanup(lambda: store_path.unlink(missing_ok=True))
+
+        client = FakeClient()
+        outcome_tracker = OutcomeTracker(ws_url="wss://example.invalid", position_store_path=store_path)
+        strategy, risk = _make_strategy(client, dry_run=True, outcome_tracker=outcome_tracker)
+        old_ts = time_module.time() - 48 * 3600  # 48 hours old, above the 24h default
+
+        with _DEFAULT_HOLDER_PATCH, _DEFAULT_CONCENTRATION_PATCH:
+            asyncio.run(strategy._consider(_candidate(pool_created_ts=old_ts)))
+
+        pending = outcome_tracker._pending["MINTpump"]
+        self.assertEqual(pending["stop_loss_pct"], strategy.cfg.revival_stop_loss_pct)
+        self.assertEqual(pending["max_hold_sec"], strategy.cfg.revival_max_hold_sec)
+        self.assertEqual(
+            pending["take_profit_ladder"],
+            [
+                {"multiplier": lvl.multiplier, "sell_pct": lvl.sell_pct}
+                for lvl in strategy.cfg.revival_take_profit_ladder
+            ],
+        )
+
+    def test_a_candidate_with_unknown_age_gets_the_tight_settings_not_revival(self):
+        # fail-safe default: no pool_created_ts at all must NOT be treated
+        # as a revival - unknown age is not evidence of low rug risk
+        store_file = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
+        store_file.close()
+        store_path = Path(store_file.name)
+        self.addCleanup(lambda: store_path.unlink(missing_ok=True))
+
+        client = FakeClient()
+        outcome_tracker = OutcomeTracker(ws_url="wss://example.invalid", position_store_path=store_path)
+        strategy, risk = _make_strategy(client, dry_run=True, outcome_tracker=outcome_tracker)
+
+        with _DEFAULT_HOLDER_PATCH, _DEFAULT_CONCENTRATION_PATCH:
+            asyncio.run(strategy._consider(_candidate()))  # no pool_created_ts
+
+        pending = outcome_tracker._pending["MINTpump"]
+        self.assertEqual(pending["stop_loss_pct"], strategy.cfg.stop_loss_pct)
+
     def test_live_buy_sends_a_real_trade(self):
         client = FakeClient()
         strategy, risk = _make_strategy(client, dry_run=False)
