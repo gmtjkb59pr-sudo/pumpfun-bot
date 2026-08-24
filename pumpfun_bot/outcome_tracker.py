@@ -1353,14 +1353,26 @@ class OutcomeTracker:
         around as exit_args, not the live tracked state) so the reduced
         remaining_fraction and newly-triggered rung actually stick.
 
-        Sizes the real sell in CURRENT SOL terms (slice_cost_sol_at_entry *
-        multiplier), since PumpPortal's amount_sol for a sell means "tokens
-        worth this much SOL right now" - selling the ORIGINAL entry-time SOL
-        cost of this slice would undersell the actual token quantity after
-        the price moved up (which is why a rung fired at all)."""
+        Real bug found live 2026-08-23: used to size the sell in SOL terms
+        (slice_cost_sol_at_entry * multiplier), asking PumpPortal to sell
+        "tokens worth this much SOL right now" - but that estimate is
+        built from our own trade_size_sol BOOKKEEPING, not the wallet's
+        actual token balance. A real buy fill can differ from the intended
+        trade_size_sol (confirmed elsewhere this session: real slippage is
+        significant), so this could ask to sell MORE tokens than were
+        actually held - confirmed live via getTransaction logs: AnchorError
+        NotEnoughTokensToSell (Custom 6023) on a ladder rung sell. Now sizes
+        the sell as a PERCENTAGE of whatever remaining_fraction currently
+        represents instead, via the same amount_pct mechanism the full-exit
+        path already uses (build_and_send_full_sell) - PumpPortal computes
+        that percentage against the wallet's REAL current balance, so this
+        can never ask for more than what's actually held, regardless of
+        what our own bookkeeping assumed."""
         slice_cost_sol_at_entry = info["trade_size_sol"] * sold_fraction_of_original
-        multiplier = 1 + ((pct_change or 0.0) / 100)
-        current_slice_value_sol = round(slice_cost_sol_at_entry * multiplier, 9)
+        remaining_fraction = info.get("remaining_fraction", 1.0) or 1.0
+        sell_pct_of_current_holdings = round(
+            min(sold_fraction_of_original / remaining_fraction, 1.0) * 100, 6
+        )
         tx_signature = ""
         real_sol_delta = None
 
@@ -1380,9 +1392,9 @@ class OutcomeTracker:
                 )
                 return False
             try:
-                result = await self.client.build_and_send_trade(
-                    action="sell", mint=mint, amount_sol=current_slice_value_sol,
-                    slippage_pct=self.sell_slippage_pct,
+                result = await self.client.build_and_send_full_sell(
+                    mint=mint, slippage_pct=self.sell_slippage_pct,
+                    amount_pct=sell_pct_of_current_holdings,
                 )
                 tx_signature = result["signature"]
                 real_sol_delta = result.get("real_sol_delta")

@@ -25,6 +25,17 @@ logger = logging.getLogger("pumpfun_bot.sniper")
 
 WALLET_BLOCKLIST_REFRESH_SEC = 60
 
+# user-requested, real finding 2026-08-23: bought "Rogue Rocket (ROGROC)",
+# and ~35s later a DIFFERENT mint launched under the exact same name and
+# symbol (confirmed via logs - the second one was correctly rejected by
+# min_buys_in_window, but only because it happened to have zero activity;
+# nothing before this stopped the bot from buying a copycat with the same
+# name outright). Reusing an identical name/symbol combo within a short
+# window is a real, free, no-RPC-call scam signal - a legitimate project
+# doesn't relaunch under its own name minutes later, but a copycat/rug-kit
+# reusing a recognizable or trending name to catch bots/humans does.
+DUPLICATE_NAME_WINDOW_SEC = 600
+
 # Standard total supply of a pump.fun token - used to turn initialBuy (how
 # many tokens the creator already bought in the creation tx itself) into a
 # %. Ported from an earlier version of this bot's sniper - verify against a
@@ -56,6 +67,9 @@ class SniperStrategy:
         # tokens - see wallet_reputation.py. Only ever grows (tighten-only,
         # same philosophy as auto_tuner.py), refreshed periodically below.
         self.blocked_wallets: set[str] = set()
+        # (name, symbol) -> last-seen timestamp, for the duplicate-name
+        # check below - see DUPLICATE_NAME_WINDOW_SEC's docstring
+        self._recent_names: dict[tuple[str, str], float] = {}
 
     def _passes_filters(self, event: dict) -> bool:
         # PumpPortal new-token events bevatten o.a. mint, name, symbol, initial
@@ -125,6 +139,29 @@ class SniperStrategy:
         if top10_concentration_pct is None:
             return False
         return top10_concentration_pct > self.cfg.max_top10_concentration_pct
+
+    def _is_duplicate_name(self, name: str, symbol: str) -> bool:
+        """See DUPLICATE_NAME_WINDOW_SEC's docstring - a free, no-RPC-call
+        check against every (name, symbol) sniper has seen in the last
+        DUPLICATE_NAME_WINDOW_SEC. Records the CURRENT candidate regardless
+        of outcome (even a rejected one) so a run of copycats reusing the
+        same name in quick succession all get caught, not just the first
+        repeat. Prunes expired entries on every call - bounded memory
+        without a separate cleanup loop, cheap since sniper is naturally
+        rate-limited by real launch volume."""
+        key = (name.strip().lower(), symbol.strip().lower())
+        # a missing name/symbol (event.get(..., "?") in run()) must never
+        # match itself across different real launches - that would flag
+        # every subsequent placeholder-named candidate as a false duplicate
+        if not key[0] or not key[1] or key in (("?", "?"),):
+            return False
+        now = time.time()
+        self._recent_names = {
+            k: ts for k, ts in self._recent_names.items() if now - ts < DUPLICATE_NAME_WINDOW_SEC
+        }
+        is_duplicate = key in self._recent_names
+        self._recent_names[key] = now
+        return is_duplicate
 
     async def _pre_buy_activity_check(self, mint: str) -> str | None:
         """Watches the token's live trade stream for bundle_check_window_ms
@@ -199,6 +236,13 @@ class SniperStrategy:
 
             if not self._passes_filters(event):
                 logger.debug("Token %s (%s) afgewezen door filters.", symbol, mint)
+                continue
+
+            if self._is_duplicate_name(name, symbol):
+                logger.info(
+                    "Sniper: %s (%s) geweerd - zelfde naam/symbool recent al gezien "
+                    "(mogelijk kopie/scam).", name, symbol,
+                )
                 continue
 
             reject_reason = await self._pre_buy_activity_check(mint)

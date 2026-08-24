@@ -2615,6 +2615,23 @@ class TakeProfitLadderTests(unittest.TestCase):
         self.assertEqual(pos["triggered_ladder_levels"], [2, 5])
         self.assertAlmostEqual(risk.state.open_exposure_sol, 0.05 - 0.015 - 0.014, places=6)
 
+    def test_live_second_rung_sells_percentage_of_remaining_not_of_original(self):
+        # the rung's configured sell_pct (40%) means 40% of what's
+        # CURRENTLY held (70% remaining after the first rung), not 40% of
+        # the original position - amount_pct must reflect that distinction
+        client = FakeClient(should_fail=False, signature="ladder_sig")
+        tracker, risk = self._make_tracker(
+            client=client, dry_run=False, entry_ref=100.0, trade_size_sol=0.05,
+            remaining_fraction=0.7, triggered_ladder_levels=[2],
+        )
+        risk.state.open_exposure_sol = 0.05 - 0.015
+
+        asyncio.run(tracker._handle_price_update("MINT", 500.0))  # 5x -> second rung (40% of 0.7 left)
+
+        self.assertEqual(len(client.sell_calls), 1)
+        mint, slippage_pct, amount_pct = client.sell_calls[0]
+        self.assertAlmostEqual(amount_pct, 40.0, places=6)
+
     def test_at_most_one_rung_fires_per_price_update(self):
         # a price jump that blows straight past both rungs at once still only
         # triggers the first untriggered one - the next tick catches the rest
@@ -2699,18 +2716,22 @@ class TakeProfitLadderTests(unittest.TestCase):
         self.assertIn("MINT", tracker._pending)  # partial ladder sell, not a full trailing-stop close
         self.assertEqual(tracker._pending["MINT"]["triggered_ladder_levels"], [2])
 
-    def test_live_rung_sell_calls_client_with_current_value_of_the_slice(self):
+    def test_live_rung_sell_calls_client_with_percentage_of_current_holdings(self):
+        # real bug found live: sizing the sell from our own trade_size_sol
+        # bookkeeping (rather than the wallet's real token balance) could
+        # ask to sell more than was actually held (Custom 6023,
+        # NotEnoughTokensToSell) - amount_pct against PumpPortal's own
+        # balance read sidesteps that entirely, see _partial_exit's docstring
         client = FakeClient(should_fail=False, signature="ladder_sig")
         tracker, risk = self._make_tracker(client=client, dry_run=False, entry_ref=100.0, trade_size_sol=0.05)
 
         asyncio.run(tracker._handle_price_update("MINT", 200.0))  # 2x -> first rung (30%)
 
         self.assertEqual(len(client.sell_calls), 1)
-        mint, slippage_pct, action, amount_sol = client.sell_calls[0]
+        mint, slippage_pct, amount_pct = client.sell_calls[0]
         self.assertEqual(mint, "MINT")
-        self.assertEqual(action, "sell")
-        # slice cost basis 0.015 SOL, now worth 2x that in current terms
-        self.assertAlmostEqual(amount_sol, 0.015 * 2, places=6)
+        # first rung sells 30% of what's currently held (100% remaining at this point)
+        self.assertAlmostEqual(amount_pct, 30.0, places=6)
         self.assertIn("MINT", tracker._pending)
         self.assertAlmostEqual(tracker._pending["MINT"]["remaining_fraction"], 0.7, places=6)
 
