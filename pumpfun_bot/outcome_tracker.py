@@ -277,6 +277,12 @@ class OutcomeTracker:
         # actually stuck), but it burns a real priority fee on a doomed tx
         # every time the timing lines up.
         self._recently_closed: dict[str, float] = {}
+        # mints with an exit sequence CURRENTLY in flight - see
+        # _attempt_exit's docstring for the real double-exit race this
+        # guards against (the normal per-tick evaluation and the
+        # scam-social background check can both reach the same mint at
+        # once)
+        self._exit_in_progress: set[str] = set()
         # the currently in-flight liquidation sweep (if any) - guards
         # against starting an overlapping sweep every reconciliation cycle,
         # which would pile up concurrent RPC/confirm-polling load on top of
@@ -1149,16 +1155,37 @@ class OutcomeTracker:
         """Calls _exit() and only removes the mint from _pending if it
         actually closed - a failed real sell leaves it exactly as it was.
         A partial ladder sell (_exit() returning False by design, not
-        failure) also leaves it tracked - see _exit()'s docstring."""
-        closed = await self._exit(
-            mint, info, reason, pct_change, sell_fraction_of_remaining, ladder_level_multiplier,
-        )
-        if closed:
+        failure) also leaves it tracked - see _exit()'s docstring.
+
+        Real bug found live 2026-08-23: the normal per-tick price
+        evaluation and the scam-social background check
+        (_check_socials_and_maybe_exit) can both independently decide to
+        exit the SAME mint at nearly the same instant - confirmed via
+        activity_log.jsonl: a position closed via BOTH "scam_socials" and
+        "take_profit" 82ms apart, sharing the exact same tx_signature (one
+        real on-chain sell, re-broadcast as an identical transaction and
+        deduped by Solana) - but risk.register_trade_closed() ran TWICE,
+        double-counting that position's pnl and double-releasing its
+        exposure. This guard makes sure only one exit sequence is ever in
+        flight per mint, regardless of which trigger reached it first -
+        the loser of the race returns immediately, a no-op."""
+        async with self._lock:
+            if mint in self._exit_in_progress:
+                return
+            self._exit_in_progress.add(mint)
+        try:
+            closed = await self._exit(
+                mint, info, reason, pct_change, sell_fraction_of_remaining, ladder_level_multiplier,
+            )
+            if closed:
+                async with self._lock:
+                    self._pending.pop(mint, None)
+                    self._persist_pending()
+                if not self.dry_run:
+                    self._recently_closed[mint] = time.time()
+        finally:
             async with self._lock:
-                self._pending.pop(mint, None)
-                self._persist_pending()
-            if not self.dry_run:
-                self._recently_closed[mint] = time.time()
+                self._exit_in_progress.discard(mint)
 
     async def _exit(
         self, mint: str, info: dict, reason: str, pct_change: float,
