@@ -31,6 +31,7 @@ from pumpfun_bot.candidate_price_tracker import CandidatePriceTracker
 from pumpfun_bot.config import load_config
 from pumpfun_bot.dashboard_server import start_dashboard_server
 from pumpfun_bot.logger_setup import setup_logging
+from pumpfun_bot.model_retrain import retrain_loop
 from pumpfun_bot.outcome_tracker import OutcomeTracker
 from pumpfun_bot.pumpportal_client import PumpPortalClient
 from pumpfun_bot.risk import RiskManager
@@ -312,6 +313,13 @@ async def main() -> None:
             "van outcome-stats (alleen strenger, nooit losser, zie pumpfun_bot/auto_tuner.py)."
         )
         tasks.append(asyncio.create_task(auto_tuner.run()))
+
+    if cfg.sniper.enabled:
+        logger.info(
+            "Model auto-retrain gestart: hertraint sniper_model.py automatisch zodra er "
+            "genoeg nieuwe echte trades bijkomen (zie pumpfun_bot/model_retrain.py)."
+        )
+        tasks.append(asyncio.create_task(retrain_loop(alerter)))
 
     if not cfg.risk.dry_run and cfg.risk.min_wallet_balance_usd > 0:
         logger.info(

@@ -65,6 +65,10 @@ from pathlib import Path
 logger = logging.getLogger("pumpfun_bot.sniper_model")
 
 MODEL_PATH = Path("data/sniper_model.json")
+ACTIVITY_LOG_PATH = Path("data/activity_log.jsonl")
+CORRECTIONS_PATH = Path("data/real_pnl_corrections.json")
+MIN_TRAINING_ROWS = 30
+HOLDOUT_FRACTION = 0.2
 
 FEATURES = ("initial_buy_pct", "liquidity_sol", "creator_win_rate", "activity_window_buy_count")
 
@@ -163,6 +167,140 @@ def build_point_in_time_creator_win_rates(activity_log_path: Path) -> dict[str, 
         rate_by_mint[mint] = (sum(prior) / len(prior)) if prior else DEFAULT_CREATOR_WIN_RATE
         history[creator].append(is_win)
     return rate_by_mint
+
+
+def load_corrections(path: Path | None = None) -> dict[str, dict]:
+    """See scripts/audit_real_pnl.py's module docstring for the full bug
+    story (user-reported 2026-08-24: "catecoin this is a false log",
+    "wojakius also not correct") - keyed by sell tx_signature, each entry
+    carries the TRUE on-chain pct_change for that exit, re-derived from
+    the wallet's real SOL delta instead of the stale price-tick estimate
+    _fetch_real_sol_delta silently fell back to before that fix. Missing
+    entirely (file not yet generated) or missing a specific signature
+    (audit script hasn't resolved it yet) both just mean "use the
+    originally-logged pct_change" - never an error. Only matters for the
+    HISTORICAL backlog from before that fix landed - a new real exit's own
+    pct_change is already correct at the source now, nothing to correct."""
+    path = path if path is not None else CORRECTIONS_PATH
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text())
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def load_labeled_dataset(
+    activity_log_path: Path | None = None, corrections: dict[str, dict] | None = None,
+) -> tuple[list[list[float]], list[int]]:
+    """Real bug found live 2026-08-23: using build_creator_win_rates()
+    (one global, full-log snapshot) here leaked each row's own label back
+    into its own creator_win_rate feature for any single-launch creator
+    (421 of 452, 93%, in this dataset) - see
+    build_point_in_time_creator_win_rates' docstring for the full story.
+    Uses the point-in-time version instead, and sorts by buy_ts so the
+    later train/holdout split is a genuine chronological forward-test,
+    not a random shuffle that could still leak across nearby-in-time rows."""
+    activity_log_path = activity_log_path if activity_log_path is not None else ACTIVITY_LOG_PATH
+    corrections = corrections if corrections is not None else {}
+    buys: dict[str, list[dict]] = defaultdict(list)
+    exits_by_mint: dict[str, dict] = {}
+
+    with activity_log_path.open(encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if (
+                record.get("type") == "trade" and record.get("action") == "buy"
+                and record.get("strategy") == "sniper" and record.get("dry_run") is False
+            ):
+                buys[record["mint"]].append(record)
+            elif record.get("type") == "exit" and record.get("dry_run") is False:
+                exits_by_mint[record["mint"]] = record
+
+    point_in_time_rates = build_point_in_time_creator_win_rates(activity_log_path)
+
+    rows: list[tuple[float, list[float], int]] = []
+    for mint, mint_buys in buys.items():
+        exit_record = exits_by_mint.get(mint)
+        if exit_record is None or exit_record.get("pct_change") is None:
+            continue
+        buy_record = mint_buys[-1]
+        meta = buy_record.get("meta") or {}
+        initial_buy_pct = meta.get("initial_buy_pct")
+        liquidity_sol = meta.get("liquidity_sol")
+        if initial_buy_pct is None or liquidity_sol is None:
+            continue
+        creator_win_rate = point_in_time_rates.get(mint, DEFAULT_CREATOR_WIN_RATE)
+        activity_window_buy_count = meta.get("activity_window_buy_count")
+        if activity_window_buy_count is None:
+            activity_window_buy_count = DEFAULT_ACTIVITY_WINDOW_BUY_COUNT
+        feature_values = [
+            float(initial_buy_pct), float(liquidity_sol), float(creator_win_rate),
+            float(activity_window_buy_count),
+        ]
+        correction = corrections.get(exit_record.get("tx_signature", ""))
+        pct_change = correction["corrected_pct_change"] if correction is not None else exit_record["pct_change"]
+        label = 1 if pct_change > WIN_MARGIN_PCT else 0
+        rows.append((buy_record["ts"], feature_values, label))
+
+    rows.sort(key=lambda r: r[0])
+    return [r[1] for r in rows], [r[2] for r in rows]
+
+
+def retrain_and_save(
+    activity_log_path: Path | None = None,
+    corrections_path: Path | None = None,
+    model_path: Path | None = None,
+) -> dict | None:
+    """Trains a fresh model from the current real trade history and saves
+    it, for BOTH scripts/train_sniper_model.py's manual CLI use and
+    model_retrain.py's automatic periodic background use (user-requested
+    2026-08-24: "build an AI in the bot so it learns more automatically").
+
+    Returns None (and saves nothing) below MIN_TRAINING_ROWS - a model
+    "trained" on a handful of examples is worse than no model at all. On
+    success, returns a result dict: {"n", "train_n", "holdout_n",
+    "accuracy", "baseline", "beats_baseline"} - callers decide what to log
+    or alert, this function only trains/evaluates/saves."""
+    activity_log_path = activity_log_path if activity_log_path is not None else ACTIVITY_LOG_PATH
+    if not activity_log_path.exists():
+        return None
+
+    corrections = load_corrections(corrections_path)
+    features, labels = load_labeled_dataset(activity_log_path, corrections)
+    n = len(features)
+    if n < MIN_TRAINING_ROWS:
+        return None
+
+    holdout_n = max(1, int(n * HOLDOUT_FRACTION))
+    train_features, holdout_features = features[:-holdout_n], features[-holdout_n:]
+    train_labels, holdout_labels = labels[:-holdout_n], labels[-holdout_n:]
+
+    model = train_logistic_regression(train_features, train_labels)
+
+    correct = 0
+    for feature_values, label in zip(holdout_features, holdout_labels):
+        predicted = 1 if score_with_model(model, feature_values) >= 0.5 else 0
+        correct += predicted == label
+    accuracy = correct / len(holdout_labels) if holdout_labels else 0.0
+    baseline = max(sum(train_labels), len(train_labels) - sum(train_labels)) / len(train_labels)
+
+    save_model(model, model_path)
+
+    return {
+        "n": n,
+        "train_n": len(train_features),
+        "holdout_n": len(holdout_features),
+        "accuracy": accuracy,
+        "baseline": baseline,
+        "beats_baseline": accuracy > baseline,
+    }
 
 
 def extract_features(meta: dict, creator_win_rates: dict[str, float]) -> list[float] | None:
