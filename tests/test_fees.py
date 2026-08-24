@@ -3,8 +3,12 @@ import unittest
 from pumpfun_bot.fees import (
     DRY_RUN_SLIPPAGE_PENALTY_PCT_BY_REASON,
     FEE_PCT_PER_LEG,
+    PRIORITY_FEE_SOL_PER_LEG,
+    TAKE_PROFIT_PRIORITY_FEE_SOL_PER_LEG,
     apply_dry_run_slippage_penalty,
     net_pct_change_after_fees,
+    priority_fee_sol_for_sell,
+    round_trip_priority_fee_sol_for_reason,
 )
 
 
@@ -59,6 +63,34 @@ class ApplyDryRunSlippagePenaltyTests(unittest.TestCase):
                 continue
             with self.subTest(reason=reason):
                 self.assertLess(penalty, stop_loss_penalty)
+
+
+class PrioritySellFeeTests(unittest.TestCase):
+    def test_take_profit_gets_the_boosted_fee(self):
+        self.assertEqual(priority_fee_sol_for_sell("take_profit"), TAKE_PROFIT_PRIORITY_FEE_SOL_PER_LEG)
+
+    def test_take_profit_ladder_gets_the_boosted_fee(self):
+        self.assertEqual(priority_fee_sol_for_sell("take_profit_ladder"), TAKE_PROFIT_PRIORITY_FEE_SOL_PER_LEG)
+
+    def test_the_boosted_fee_is_meaningfully_bigger_than_the_default(self):
+        self.assertGreater(TAKE_PROFIT_PRIORITY_FEE_SOL_PER_LEG, PRIORITY_FEE_SOL_PER_LEG)
+
+    def test_stop_loss_gets_the_normal_fee_not_the_boosted_one(self):
+        self.assertEqual(priority_fee_sol_for_sell("stop_loss"), PRIORITY_FEE_SOL_PER_LEG)
+
+    def test_trailing_stop_gets_the_normal_fee_not_the_boosted_one(self):
+        self.assertEqual(priority_fee_sol_for_sell("trailing_stop"), PRIORITY_FEE_SOL_PER_LEG)
+
+    def test_stale_price_gets_the_normal_fee(self):
+        self.assertEqual(priority_fee_sol_for_sell("stale_price"), PRIORITY_FEE_SOL_PER_LEG)
+
+    def test_round_trip_fee_for_take_profit_is_buy_leg_plus_boosted_sell_leg(self):
+        expected = PRIORITY_FEE_SOL_PER_LEG + TAKE_PROFIT_PRIORITY_FEE_SOL_PER_LEG
+        self.assertAlmostEqual(round_trip_priority_fee_sol_for_reason("take_profit"), expected)
+
+    def test_round_trip_fee_for_stop_loss_is_the_flat_default(self):
+        expected = PRIORITY_FEE_SOL_PER_LEG * 2
+        self.assertAlmostEqual(round_trip_priority_fee_sol_for_reason("stop_loss"), expected)
 
 
 if __name__ == "__main__":

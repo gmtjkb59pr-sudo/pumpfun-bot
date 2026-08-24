@@ -13,6 +13,7 @@ from pumpfun_bot.fees import (
     ROUND_TRIP_PRIORITY_FEE_SOL,
     apply_dry_run_slippage_penalty,
     net_pct_change_after_fees,
+    round_trip_priority_fee_sol_for_reason,
 )
 from pumpfun_bot.outcome_tracker import (
     CHECKPOINTS_SEC,
@@ -100,6 +101,7 @@ class FakeClient:
         self.fail_at_amount_pcts = fail_at_amount_pcts
         self.signature = signature
         self.sell_calls = []
+        self.sell_priority_fees = []
         self.keypair = _FakeKeypair()
         self.rpc_http_url = "https://example.invalid/rpc"
         # user-requested: simulates PumpPortalClient._fetch_real_sol_delta's
@@ -108,8 +110,9 @@ class FakeClient:
         # falling back to the fee-model estimate unchanged
         self.real_sol_delta = real_sol_delta
 
-    async def build_and_send_full_sell(self, mint, slippage_pct, amount_pct=100):
+    async def build_and_send_full_sell(self, mint, slippage_pct, amount_pct=100, priority_fee_sol=None):
         self.sell_calls.append((mint, slippage_pct, amount_pct))
+        self.sell_priority_fees.append(priority_fee_sol)
         if self.fail_at_amount_pcts is not None:
             if amount_pct in self.fail_at_amount_pcts:
                 raise RuntimeError(f"simulated RPC failure at {amount_pct}%")
@@ -213,7 +216,7 @@ class PerPositionThresholdTests(unittest.TestCase):
         # instance default, not the sign of the resulting pnl
         self.assertAlmostEqual(
             risk.state.realized_pnl_sol,
-            _net_pnl_sol_slipped(0.05, 51.0, "take_profit") - ROUND_TRIP_PRIORITY_FEE_SOL, places=4,
+            _net_pnl_sol_slipped(0.05, 51.0, "take_profit") - round_trip_priority_fee_sol_for_reason("take_profit"), places=4,
         )
 
 
@@ -515,7 +518,7 @@ class TakeProfitStopLossExitTests(unittest.TestCase):
 
         self.assertNotIn("MINT", tracker._pending)
         self.assertAlmostEqual(risk.state.open_exposure_sol, 0.0)
-        self.assertAlmostEqual(risk.state.realized_pnl_sol, (_net_pnl_sol_slipped(0.05, 51.0, "take_profit") - ROUND_TRIP_PRIORITY_FEE_SOL), places=4)
+        self.assertAlmostEqual(risk.state.realized_pnl_sol, (_net_pnl_sol_slipped(0.05, 51.0, "take_profit") - round_trip_priority_fee_sol_for_reason("take_profit")), places=4)
 
     def test_stop_loss_closes_position_immediately(self):
         tracker, risk = self._make_tracker(stop_loss_pct=25.0, entry_ref=100.0)
@@ -1312,7 +1315,7 @@ class DoubleExitRaceTests(unittest.TestCase):
             self.keypair = _FakeKeypair()
             self.rpc_http_url = "https://example.invalid/rpc"
 
-        async def build_and_send_full_sell(self, mint, slippage_pct, amount_pct=100):
+        async def build_and_send_full_sell(self, mint, slippage_pct, amount_pct=100, priority_fee_sol=None):
             self.sell_calls.append((mint, slippage_pct, amount_pct))
             await asyncio.sleep(0.01)
             return {
@@ -1562,7 +1565,7 @@ class LiquidationDispatchTests(unittest.TestCase):
     detached background task, never blocking reconciliation itself."""
 
     class _SlowFailingClient(FakeClient):
-        async def build_and_send_full_sell(self, mint, slippage_pct):
+        async def build_and_send_full_sell(self, mint, slippage_pct, amount_pct=100, priority_fee_sol=None):
             await asyncio.sleep(0.2)
             raise RuntimeError("simulated slow failure")
 
@@ -1901,7 +1904,7 @@ class LiveExitTests(unittest.TestCase):
         self.assertNotIn("MINT", tracker._pending)
         self.assertAlmostEqual(risk.state.open_exposure_sol, 0.0)
         self.assertAlmostEqual(
-            risk.state.realized_pnl_sol, _net_pnl_sol_slipped(0.05, 51.0, "take_profit") - ROUND_TRIP_PRIORITY_FEE_SOL, places=4
+            risk.state.realized_pnl_sol, _net_pnl_sol_slipped(0.05, 51.0, "take_profit") - round_trip_priority_fee_sol_for_reason("take_profit"), places=4
         )
 
     def test_failed_real_sell_leaves_position_open(self):
@@ -1942,7 +1945,7 @@ class LiveExitTests(unittest.TestCase):
 
         self.assertEqual(client.sell_calls, [])
         self.assertNotIn("MINT", tracker._pending)
-        self.assertAlmostEqual(risk.state.realized_pnl_sol, (_net_pnl_sol_slipped(0.05, 51.0, "take_profit") - ROUND_TRIP_PRIORITY_FEE_SOL), places=4)
+        self.assertAlmostEqual(risk.state.realized_pnl_sol, (_net_pnl_sol_slipped(0.05, 51.0, "take_profit") - round_trip_priority_fee_sol_for_reason("take_profit")), places=4)
 
 
 class RealSolDeltaPnlTests(unittest.TestCase):
@@ -2013,7 +2016,7 @@ class RealSolDeltaPnlTests(unittest.TestCase):
         asyncio.run(tracker._handle_price_update("MINT", 151.0))
 
         self.assertAlmostEqual(
-            risk.state.realized_pnl_sol, _net_pnl_sol_slipped(0.05, 51.0, "take_profit") - ROUND_TRIP_PRIORITY_FEE_SOL, places=4
+            risk.state.realized_pnl_sol, _net_pnl_sol_slipped(0.05, 51.0, "take_profit") - round_trip_priority_fee_sol_for_reason("take_profit"), places=4
         )
 
     def test_falls_back_to_the_estimate_when_real_delta_is_zero_or_negative(self):
@@ -2026,7 +2029,7 @@ class RealSolDeltaPnlTests(unittest.TestCase):
         asyncio.run(tracker._handle_price_update("MINT", 151.0))
 
         self.assertAlmostEqual(
-            risk.state.realized_pnl_sol, _net_pnl_sol_slipped(0.05, 51.0, "take_profit") - ROUND_TRIP_PRIORITY_FEE_SOL, places=4
+            risk.state.realized_pnl_sol, _net_pnl_sol_slipped(0.05, 51.0, "take_profit") - round_trip_priority_fee_sol_for_reason("take_profit"), places=4
         )
 
     def test_dry_run_never_uses_the_real_delta_even_if_present(self):
@@ -2047,7 +2050,7 @@ class RealSolDeltaPnlTests(unittest.TestCase):
 
         self.assertEqual(client.sell_calls, [])  # dry-run never touches the client
         self.assertAlmostEqual(
-            risk.state.realized_pnl_sol, _net_pnl_sol_slipped(0.05, 51.0, "take_profit") - ROUND_TRIP_PRIORITY_FEE_SOL, places=4,
+            risk.state.realized_pnl_sol, _net_pnl_sol_slipped(0.05, 51.0, "take_profit") - round_trip_priority_fee_sol_for_reason("take_profit"), places=4,
         )
 
 
@@ -2420,7 +2423,7 @@ class TrailingStopTests(unittest.TestCase):
         asyncio.run(tracker._handle_price_update("MINT", 151.0))  # crosses TP before any trailing logic matters
 
         self.assertNotIn("MINT", tracker._pending)
-        self.assertAlmostEqual(risk.state.realized_pnl_sol, (_net_pnl_sol_slipped(0.05, 51.0, "take_profit") - ROUND_TRIP_PRIORITY_FEE_SOL), places=4)
+        self.assertAlmostEqual(risk.state.realized_pnl_sol, (_net_pnl_sol_slipped(0.05, 51.0, "take_profit") - round_trip_priority_fee_sol_for_reason("take_profit")), places=4)
 
 
 class StalePriceExitTests(unittest.TestCase):
@@ -2750,7 +2753,7 @@ class RestFallbackPriceTests(unittest.TestCase):
         # take_profit_pct defaults to 50.0 on the tracker itself - +50% exits
         self.assertNotIn("MINT", tracker._pending)
         self.assertAlmostEqual(
-            risk.state.realized_pnl_sol, _net_pnl_sol_slipped(0.05, 50.0, "take_profit") - ROUND_TRIP_PRIORITY_FEE_SOL, places=4,
+            risk.state.realized_pnl_sol, _net_pnl_sol_slipped(0.05, 50.0, "take_profit") - round_trip_priority_fee_sol_for_reason("take_profit"), places=4,
         )
 
     def test_marks_rest_fallback_active_on_a_surviving_position(self):
@@ -2983,7 +2986,7 @@ class TakeProfitLadderTests(unittest.TestCase):
         # only 30% of the original 0.05 SOL position's cost basis is released
         self.assertAlmostEqual(risk.state.open_exposure_sol, 0.05 - 0.015, places=6)
         self.assertAlmostEqual(
-            risk.state.realized_pnl_sol, _net_pnl_sol_slipped(0.015, 100.0, "take_profit_ladder") - ROUND_TRIP_PRIORITY_FEE_SOL, places=6,
+            risk.state.realized_pnl_sol, _net_pnl_sol_slipped(0.015, 100.0, "take_profit_ladder") - round_trip_priority_fee_sol_for_reason("take_profit_ladder"), places=6,
         )
 
     def test_second_rung_fires_off_the_new_remaining_fraction(self):

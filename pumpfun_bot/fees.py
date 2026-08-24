@@ -46,6 +46,44 @@ FEE_PCT_PER_LEG = PUMPFUN_FEE_PCT + PUMPPORTAL_LOCAL_API_FEE_PCT  # 1.75%, paid 
 PRIORITY_FEE_SOL_PER_LEG = 0.0005
 ROUND_TRIP_PRIORITY_FEE_SOL = PRIORITY_FEE_SOL_PER_LEG * 2
 
+# user-requested 2026-08-24 ("how can we fix that problem" -> "build 3",
+# picking the "faster execution on take_profit sells" option from the
+# slippage-calibration finding above): take_profit/take_profit_ladder have
+# by far the worst real slippage gap of any exit reason (-87/-133 points),
+# and the mechanism behind it is specifically TIME - these exits fire on a
+# tick that's already near a local peak on a thin bonding curve that can
+# crash within seconds, so the real fill depends heavily on how fast the
+# sell actually lands. A bigger priority fee is the direct lever for
+# landing speed. The multiplier itself (5x) is a provisional placeholder,
+# NOT derived from real measured landing-time-vs-fee data (no real trade
+# has ever used a boosted fee yet, since real money isn't currently at
+# risk) - revisit once live trades with this fee actually exist. Applied
+# only to the SELL leg of take_profit/take_profit_ladder exits (see
+# priority_fee_sol_for_sell below) - the buy leg and every other exit
+# reason are unaffected.
+TAKE_PROFIT_PRIORITY_FEE_SOL_PER_LEG = PRIORITY_FEE_SOL_PER_LEG * 5
+_BOOSTED_SELL_PRIORITY_FEE_REASONS = frozenset({"take_profit", "take_profit_ladder"})
+
+
+def priority_fee_sol_for_sell(reason: str) -> float:
+    """The priority fee to attach to a real sell transaction for this exit
+    reason - boosted for take_profit/take_profit_ladder (see
+    TAKE_PROFIT_PRIORITY_FEE_SOL_PER_LEG's docstring), the normal flat fee
+    for everything else."""
+    if reason in _BOOSTED_SELL_PRIORITY_FEE_REASONS:
+        return TAKE_PROFIT_PRIORITY_FEE_SOL_PER_LEG
+    return PRIORITY_FEE_SOL_PER_LEG
+
+
+def round_trip_priority_fee_sol_for_reason(reason: str) -> float:
+    """Buy leg always pays the normal flat fee (the boost only applies to
+    the SELL decision, made after already knowing which exit fired) - sell
+    leg pays whatever priority_fee_sol_for_sell says for this reason. Used
+    by the dry-run/estimate-only pnl path so its assumed cost matches what
+    a real trade with this exit reason would actually submit, instead of
+    the flat ROUND_TRIP_PRIORITY_FEE_SOL every other reason still uses."""
+    return PRIORITY_FEE_SOL_PER_LEG + priority_fee_sol_for_sell(reason)
+
 
 def net_pct_change_after_fees(gross_pct_change: float) -> float:
     """Compounds the round-trip fee drag onto a gross (pre-fee) percentage
