@@ -164,6 +164,33 @@ class ConsiderTests(unittest.TestCase):
 
         self.assertEqual(len(client.buy_calls), 1)
 
+    def test_tags_an_old_pool_as_a_revival_in_the_alert_and_meta(self):
+        # user-requested 2026-08-24 ("how can i test more to be sure this
+        # strategy will work") - confirmed live: real pool_created_at
+        # values range from minutes to 841 DAYS old, previously fetched
+        # but never used anywhere - this is what lets real outcome data
+        # eventually answer whether catching "revivals" (old pool, just
+        # started moving again) specifically matters
+        import time as time_module
+
+        client = FakeClient()
+        strategy, risk = _make_strategy(client, dry_run=False)
+        old_ts = time_module.time() - 10 * 3600  # 10 hours old
+
+        with _DEFAULT_HOLDER_PATCH, _DEFAULT_CONCENTRATION_PATCH:
+            asyncio.run(strategy._consider(_candidate(pool_created_ts=old_ts)))
+
+        self.assertTrue(any("10u oud" in m for m in strategy.alerter.messages))
+
+    def test_no_age_shown_when_pool_created_ts_is_unavailable(self):
+        client = FakeClient()
+        strategy, risk = _make_strategy(client, dry_run=False)
+
+        with _DEFAULT_HOLDER_PATCH, _DEFAULT_CONCENTRATION_PATCH:
+            asyncio.run(strategy._consider(_candidate()))  # no pool_created_ts override
+
+        self.assertFalse(any("oud" in m for m in strategy.alerter.messages))
+
     def test_uses_the_configured_momentum_window_not_always_m5(self):
         client = FakeClient()
         strategy, risk = _make_strategy(client, dry_run=False, momentum_window="h1")

@@ -24,6 +24,7 @@ would be lossy to flatten prematurely.
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 
 import aiohttp
 
@@ -73,13 +74,34 @@ def _strip_network_prefix(token_id: str | None) -> str | None:
     return token_id.split("_", 1)[1] if "_" in token_id else token_id
 
 
+def _parse_pool_created_ts(attrs: dict) -> float | None:
+    """User-requested 2026-08-24 ("how can i test more to be sure this
+    strategy will work") - CoinGecko's raw pool data already includes
+    pool_created_at (confirmed live: real trending pools right now range
+    from 12 minutes to 841 DAYS old), previously fetched but never parsed
+    out or logged anywhere. Lets every real candidate/trade record show
+    whether it was a genuine "revival" (old pool, just started moving
+    again) or an always-fresh mover - the free, no-new-infrastructure way
+    to test whether catching revivals specifically matters, using the
+    strategy that's already running, before ever paying for a custom
+    on-chain detector to do the same thing."""
+    raw = attrs.get("pool_created_at")
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
 def parse_pool_candidate(pool: dict) -> dict | None:
     """Extracts {mint, pair_name, price_change_pct (dict of m5/m15/m30/h1/
-    h6/h24 -> float|None), market_cap_usd, volume_24h_usd} from one raw
-    CoinGecko pool dict - or None if the pool is missing the data needed to
-    even identify a candidate mint. Picks whichever side of the pool isn't
-    a known quote currency (SOL/USDC) as the real candidate - never guesses
-    when neither or both sides look like a quote currency."""
+    h6/h24 -> float|None), market_cap_usd, volume_24h_usd, pool_created_ts}
+    from one raw CoinGecko pool dict - or None if the pool is missing the
+    data needed to even identify a candidate mint. Picks whichever side of
+    the pool isn't a known quote currency (SOL/USDC) as the real candidate
+    - never guesses when neither or both sides look like a quote
+    currency."""
     try:
         attrs = pool["attributes"]
         relationships = pool["relationships"]
@@ -136,4 +158,5 @@ def parse_pool_candidate(pool: dict) -> dict | None:
         "price_change_pct": price_change_pct,
         "market_cap_usd": market_cap_usd,
         "volume_24h_usd": volume_24h_usd,
+        "pool_created_ts": _parse_pool_created_ts(attrs),
     }
