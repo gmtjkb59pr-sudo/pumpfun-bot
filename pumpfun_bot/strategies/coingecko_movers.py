@@ -97,7 +97,13 @@ class CoinGeckoMoversStrategy:
             return
 
         price_change_pct = candidate["price_change_pct"].get(self.cfg.momentum_window)
-        if price_change_pct is None or price_change_pct <= 0:
+        # user-requested 2026-08-24 ("narrow the buy trigger"): was
+        # "> 0" - bought on noise-level moves (0.04%, 0.08% confirmed
+        # live) indistinguishable from a token just sitting flat. Real
+        # dry-run data showed no relationship between entry momentum
+        # strength and outcome quality at that noise level - see
+        # CoinGeckoMoversConfig.min_price_change_pct's docstring.
+        if price_change_pct is None or price_change_pct < self.cfg.min_price_change_pct:
             return
 
         if self.cfg.max_market_cap_usd > 0:

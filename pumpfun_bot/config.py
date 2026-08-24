@@ -278,6 +278,17 @@ class CoinGeckoMoversConfig:
     # h6/h24) gates the buy decision - defaults to the shortest available,
     # matching social_watch's own evidence-based use of a 5-minute window
     momentum_window: str = "m5"
+    # user-requested 2026-08-24 ("narrow the buy trigger"): the ORIGINAL
+    # trigger was "price_change_pct > 0" - buys on ANY positive momentum
+    # window reading, including noise-level moves (0.04%, 0.08%
+    # confirmed live) indistinguishable from a token just sitting flat.
+    # Real dry-run data showed no relationship between entry momentum
+    # strength and outcome quality - low-single-digit entries performed no
+    # better or worse than the two real stop_loss losses, consistent with
+    # sub-1% moves carrying no real signal at all. Raised well above
+    # typical 5-minute noise so a candidate has to show an ACTUAL spike,
+    # not normal chop, before committing capital.
+    min_price_change_pct: float = 5.0
     min_holder_count: int = 0
     max_top10_concentration_pct: float = 0
     # SUPERSEDED - see BirdeyeMoversConfig.max_market_cap_usd's docstring
@@ -525,6 +536,7 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         poll_interval_sec=cg_raw.get("poll_interval_sec", 300),
         trending_limit=cg_raw.get("trending_limit", 20),
         momentum_window=cg_raw.get("momentum_window", "m5"),
+        min_price_change_pct=cg_raw.get("min_price_change_pct", 5.0),
         min_holder_count=cg_raw.get("min_holder_count", 0),
         max_top10_concentration_pct=cg_raw.get("max_top10_concentration_pct", 0),
         max_market_cap_usd=cg_raw.get("max_market_cap_usd", 0),

@@ -143,6 +143,27 @@ class ConsiderTests(unittest.TestCase):
 
         self.assertEqual(client.buy_calls, [])
 
+    def test_skips_a_noise_level_move_below_min_price_change_pct(self):
+        # user-requested 2026-08-24 ("narrow the buy trigger"): the
+        # original trigger was "> 0" - real data showed sub-1% moves
+        # (0.04%, 0.08% confirmed live) carry no real signal, indistinguishable
+        # from a token sitting flat
+        client = FakeClient()
+        strategy, risk = _make_strategy(client, dry_run=False)
+
+        asyncio.run(strategy._consider(_candidate(price_change_pct={"m5": 2.0})))
+
+        self.assertEqual(client.buy_calls, [])
+
+    def test_buys_a_candidate_at_or_above_min_price_change_pct(self):
+        client = FakeClient()
+        strategy, risk = _make_strategy(client, dry_run=False)
+
+        with _DEFAULT_HOLDER_PATCH, _DEFAULT_CONCENTRATION_PATCH:
+            asyncio.run(strategy._consider(_candidate(price_change_pct={"m5": 5.0})))
+
+        self.assertEqual(len(client.buy_calls), 1)
+
     def test_uses_the_configured_momentum_window_not_always_m5(self):
         client = FakeClient()
         strategy, risk = _make_strategy(client, dry_run=False, momentum_window="h1")
