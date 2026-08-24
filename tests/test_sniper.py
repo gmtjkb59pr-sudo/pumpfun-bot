@@ -384,5 +384,64 @@ class DuplicateNameFilterTests(unittest.TestCase):
         self.assertTrue(strategy_b._is_duplicate_name("Rogue Wizard", "ROGWIZ"))
 
 
+class ShadowModelScoreLoggingTests(unittest.TestCase):
+    """User-requested: sniper_model.py's win-probability score is computed
+    and logged for every real buy, but must NEVER affect the buy decision
+    itself (already made and executed by the time this runs) - see
+    sniper_model.py's module docstring for why this stays shadow-mode
+    until there's enough labeled real-trade history to validate it."""
+
+    def test_does_nothing_when_no_model_is_trained_yet(self):
+        strategy = _make_strategy()
+        with patch("pumpfun_bot.strategies.sniper.sniper_model.load_model", return_value=None):
+            with self.assertLogs("pumpfun_bot.sniper", level="INFO") as ctx:
+                import logging
+                logging.getLogger("pumpfun_bot.sniper").info("sentinel")  # ensures ctx has ≥1 record
+                strategy._log_shadow_model_score(
+                    "MINT", "TEST", {"liquidity_sol": 30.0, "creator": "W", "initial_buy_pct": 5.0},
+                )
+        self.assertFalse(any("model score" in m for m in ctx.output))
+
+    def test_logs_the_score_when_a_model_is_available(self):
+        strategy = _make_strategy()
+        fake_model = {"weights": [0.0], "bias": 0.0, "means": [0.0], "stds": [1.0], "features": []}
+        with patch(
+            "pumpfun_bot.strategies.sniper.sniper_model.load_model", return_value=fake_model,
+        ), patch(
+            "pumpfun_bot.strategies.sniper.sniper_model.build_creator_win_rates", return_value={},
+        ), patch(
+            "pumpfun_bot.strategies.sniper.sniper_model.score", return_value=0.73,
+        ):
+            with self.assertLogs("pumpfun_bot.sniper", level="INFO") as ctx:
+                strategy._log_shadow_model_score(
+                    "MINT", "TEST", {"liquidity_sol": 30.0, "creator": "W", "initial_buy_pct": 5.0},
+                )
+        self.assertTrue(any("0.73" in m for m in ctx.output))
+        self.assertTrue(any("schaduwmodus" in m for m in ctx.output))
+
+    def test_a_score_of_none_logs_nothing(self):
+        strategy = _make_strategy()
+        fake_model = {"weights": [0.0], "bias": 0.0, "means": [0.0], "stds": [1.0], "features": []}
+        with patch(
+            "pumpfun_bot.strategies.sniper.sniper_model.load_model", return_value=fake_model,
+        ), patch(
+            "pumpfun_bot.strategies.sniper.sniper_model.build_creator_win_rates", return_value={},
+        ), patch(
+            "pumpfun_bot.strategies.sniper.sniper_model.score", return_value=None,
+        ):
+            with self.assertLogs("pumpfun_bot.sniper", level="INFO") as ctx:
+                import logging
+                logging.getLogger("pumpfun_bot.sniper").info("sentinel")
+                strategy._log_shadow_model_score("MINT", "TEST", {})
+        self.assertFalse(any("model score" in m for m in ctx.output))
+
+    def test_an_exception_is_caught_and_never_propagates(self):
+        strategy = _make_strategy()
+        with patch(
+            "pumpfun_bot.strategies.sniper.sniper_model.load_model", side_effect=RuntimeError("boom"),
+        ):
+            strategy._log_shadow_model_score("MINT", "TEST", {})  # must not raise
+
+
 if __name__ == "__main__":
     unittest.main()
