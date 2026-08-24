@@ -57,6 +57,16 @@ class BotState:
         self.current_balance_sol: float | None = None
         self.real_pnl_sol: float | None = None
         self.real_pnl_usd: float | None = None
+        # user-requested 2026-08-24 ("the actual profit is not right
+        # because i topped up the bot with 10 dollar") - a manual deposit
+        # (or withdrawal) landing mid-session showed up entirely as
+        # "trading profit" in real_pnl_sol, since that was just
+        # current_balance - session_start_balance with no way to know a
+        # transfer had happened in between. Accumulated by
+        # external_transfer_watch.py (detects any wallet-affecting
+        # transaction that ISN'T one of the bot's own logged trades) and
+        # subtracted back out below - see add_external_transfer.
+        self.net_external_transfers_sol: float = 0.0
         # open_exposure_sol only sums positions the bot itself tracked
         # opening (_pending) - confirmed live: the wallet held real balances
         # of several mints (leftovers from earlier sessions/bugs) that were
@@ -109,15 +119,41 @@ class BotState:
 
     def update_real_balance(self, balance_sol: float, balance_usd: float | None) -> None:
         """Called periodically with the current real wallet balance -
-        recomputes real_pnl_* against session_start_balance_*. A no-op on
-        the delta (balance still recorded) if the session start was never
-        captured (e.g. the very first lookup at startup failed)."""
+        recomputes real_pnl_* against session_start_balance_*, net of any
+        detected external transfers (see net_external_transfers_sol). A
+        no-op on the delta (balance still recorded) if the session start
+        was never captured (e.g. the very first lookup at startup failed)."""
         with self._lock:
             self.current_balance_sol = balance_sol
             if self.session_start_balance_sol is not None:
-                self.real_pnl_sol = round(balance_sol - self.session_start_balance_sol, 6)
+                self.real_pnl_sol = round(
+                    balance_sol - self.session_start_balance_sol - self.net_external_transfers_sol, 6
+                )
                 if balance_usd is not None and self.session_start_balance_usd is not None:
-                    self.real_pnl_usd = round(balance_usd - self.session_start_balance_usd, 2)
+                    # approximates the transfer(s)' USD value at the CURRENT
+                    # sol/usd rate, not their own historical rate at transfer
+                    # time - real_pnl_usd is already just as approximate
+                    # (session_start_balance_usd was itself captured at ITS
+                    # own historical rate), acceptable for a secondary display
+                    external_usd = (
+                        self.net_external_transfers_sol * (balance_usd / balance_sol) if balance_sol else 0.0
+                    )
+                    self.real_pnl_usd = round(balance_usd - self.session_start_balance_usd - external_usd, 2)
+
+    def add_external_transfer(self, delta_sol: float) -> None:
+        """Called by external_transfer_watch.py whenever it detects a
+        wallet-affecting transaction that ISN'T one of the bot's own
+        logged trades (a manual deposit or withdrawal) - folds it into
+        net_external_transfers_sol and immediately recomputes real_pnl_*
+        so the next dashboard read already reflects it, not just the next
+        balance poll."""
+        with self._lock:
+            self.net_external_transfers_sol = round(self.net_external_transfers_sol + delta_sol, 9)
+            if self.session_start_balance_sol is not None and self.current_balance_sol is not None:
+                self.real_pnl_sol = round(
+                    self.current_balance_sol - self.session_start_balance_sol
+                    - self.net_external_transfers_sol, 6,
+                )
 
     def log_trade(
         self,
@@ -169,6 +205,7 @@ class BotState:
                 "current_balance_sol": self.current_balance_sol,
                 "real_pnl_sol": self.real_pnl_sol,
                 "real_pnl_usd": self.real_pnl_usd,
+                "net_external_transfers_sol": self.net_external_transfers_sol,
                 "untracked_holdings_count": self.untracked_holdings_count,
                 "trades": [asdict(t) for t in list(self._trades)[:50]],
                 "alerts": list(self._alerts)[:50],

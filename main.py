@@ -13,6 +13,8 @@ Gebruik:
 from __future__ import annotations
 
 import asyncio
+import time
+
 import base58
 from solders.keypair import Keypair
 
@@ -30,6 +32,7 @@ from pumpfun_bot.balance_watch import (
 from pumpfun_bot.candidate_price_tracker import CandidatePriceTracker
 from pumpfun_bot.config import load_config
 from pumpfun_bot.dashboard_server import start_dashboard_server
+from pumpfun_bot.external_transfer_watch import watch_external_transfers
 from pumpfun_bot.logger_setup import setup_logging
 from pumpfun_bot.model_retrain import retrain_loop
 from pumpfun_bot.outcome_tracker import OutcomeTracker
@@ -264,6 +267,7 @@ async def main() -> None:
             cfg.dashboard_port,
         )
 
+    session_start_ts = time.time()
     if not cfg.risk.dry_run:
         # ground-truth baseline for real_pnl_* - best-effort, doesn't block
         # startup if the lookup fails (real_pnl_* just stays unset until a
@@ -301,6 +305,14 @@ async def main() -> None:
     if not cfg.risk.dry_run:
         tasks.append(asyncio.create_task(
             _track_real_balance_loop(str(keypair.pubkey()), cfg.rpc_http_url)
+        ))
+        logger.info(
+            "Externe-overboeking detector gestart: houdt real_pnl_sol correct als er "
+            "buiten de bot om SOL bij- of afgeschreven wordt (zie "
+            "pumpfun_bot/external_transfer_watch.py)."
+        )
+        tasks.append(asyncio.create_task(
+            watch_external_transfers(str(keypair.pubkey()), cfg.rpc_http_url, session_start_ts)
         ))
 
     if cfg.sniper.enabled or cfg.social_watch.enabled or cfg.birdeye_movers.enabled:
