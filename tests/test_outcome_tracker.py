@@ -68,9 +68,17 @@ class FakeClient:
 
     def __init__(
         self, *, should_fail=False, signature="fake_sig", fail_at_amount_pcts=None,
-        real_sol_delta=None,
+        real_sol_delta=None, buy_real_sol_delta=None,
     ):
         self.should_fail = should_fail
+        # user-requested 2026-08-24: simulates
+        # PumpPortalClient._fetch_real_sol_delta's result when
+        # _fetch_real_buy_cost calls it directly on a BUY's own signature
+        # (not through build_and_send_trade, which never fetches this for
+        # buys - see that method's docstring) - None (default) matches
+        # every pre-existing test, keeping real_cost_sol unset
+        self.buy_real_sol_delta = buy_real_sol_delta
+        self.fetch_real_sol_delta_calls = []
         # user-requested: simulates the real 99% fallback-sell path (see
         # outcome_tracker.py's _exit()) - fail only at these specific
         # amount_pct values (e.g. {100} to always fail the first attempt
@@ -107,6 +115,10 @@ class FakeClient:
             "signature": self.signature, "action": action, "mint": mint, "amount_sol": amount_sol,
             "real_sol_delta": self.real_sol_delta if action == "sell" else None,
         }
+
+    async def _fetch_real_sol_delta(self, signature):
+        self.fetch_real_sol_delta_calls.append(signature)
+        return self.buy_real_sol_delta
 
 
 class PerPositionThresholdTests(unittest.TestCase):
@@ -2015,6 +2027,130 @@ class RealSolDeltaPnlTests(unittest.TestCase):
         self.assertAlmostEqual(
             risk.state.realized_pnl_sol, _net_pnl_sol(0.05, 51.0) - ROUND_TRIP_PRIORITY_FEE_SOL, places=4,
         )
+
+
+class RealBuyCostBasisTests(unittest.TestCase):
+    """User-requested 2026-08-24 ("the actual profit is not right"): real
+    buy-side slippage (confirmed live: a real buy cost up to ~24% over its
+    nominal trade_size_sol) was silently making realized_pnl_sol too
+    optimistic even after the sell-side real_sol_delta fix, since pnl's
+    cost basis was still the nominal bookkeeping value. _fetch_real_buy_cost
+    fetches the real on-chain cost in the background right after a real
+    buy; _exit()/_partial_exit() then use it (when available) as the pnl
+    cost basis instead."""
+
+    def _make_tracker(self, *, client, real_cost_sol=None, entry_ref=100.0, trade_size_sol=0.05):
+        risk = RiskManager(RiskConfig())
+        risk.register_trade_opened(trade_size_sol)
+        tracker = OutcomeTracker(
+            ws_url="wss://example.invalid", risk=risk, client=client, dry_run=False,
+            take_profit_pct=50.0,
+        )
+        tracker._pending["MINT"] = {
+            "entry_ts": time.time() - 100, "entry_ref": entry_ref, "last_ref": entry_ref,
+            "peak_ref": entry_ref, "name": "Test", "symbol": "TEST", "trade_size_sol": trade_size_sol,
+            "hit": set(), "has_real_update": False, "real_cost_sol": real_cost_sol,
+        }
+        return tracker, risk
+
+    def test_fetch_real_buy_cost_populates_the_pending_position(self):
+        client = FakeClient(buy_real_sol_delta=-0.061)  # a buy always spends (negative delta)
+        tracker, _ = self._make_tracker(client=client)
+
+        asyncio.run(tracker._fetch_real_buy_cost("MINT", "buy_sig"))
+
+        self.assertAlmostEqual(tracker._pending["MINT"]["real_cost_sol"], 0.061)
+        self.assertEqual(client.fetch_real_sol_delta_calls, ["buy_sig"])
+
+    def test_fetch_real_buy_cost_ignores_a_none_or_non_negative_delta(self):
+        for bad_delta in (None, 0.0, 0.01):
+            with self.subTest(bad_delta=bad_delta):
+                client = FakeClient(buy_real_sol_delta=bad_delta)
+                tracker, _ = self._make_tracker(client=client)
+
+                asyncio.run(tracker._fetch_real_buy_cost("MINT", "buy_sig"))
+
+                self.assertIsNone(tracker._pending["MINT"]["real_cost_sol"])
+
+    def test_fetch_real_buy_cost_is_a_no_op_if_the_position_already_closed(self):
+        client = FakeClient(buy_real_sol_delta=-0.061)
+        tracker, _ = self._make_tracker(client=client)
+        del tracker._pending["MINT"]  # simulates a fast in-and-out trade
+
+        asyncio.run(tracker._fetch_real_buy_cost("MINT", "buy_sig"))  # must not raise
+
+        self.assertNotIn("MINT", tracker._pending)
+
+    def test_track_schedules_the_background_fetch_for_a_real_buy(self):
+        client = FakeClient()
+        risk = RiskManager(RiskConfig())
+        tracker = OutcomeTracker(ws_url="wss://example.invalid", risk=risk, client=client, dry_run=False)
+
+        with patch.object(tracker, "_fetch_real_buy_cost") as mock_fetch:
+            async def _noop(*args, **kwargs):
+                return None
+            mock_fetch.side_effect = _noop
+            asyncio.run(tracker.track(
+                "MINT", "Test", "TEST", entry_ref=100.0, trade_size_sol=0.05,
+                buy_tx_signature="buy_sig",
+            ))
+        mock_fetch.assert_called_once_with("MINT", "buy_sig")
+
+    def test_track_does_not_schedule_the_fetch_in_dry_run(self):
+        client = FakeClient()
+        risk = RiskManager(RiskConfig())
+        tracker = OutcomeTracker(ws_url="wss://example.invalid", risk=risk, client=client, dry_run=True)
+
+        with patch.object(tracker, "_fetch_real_buy_cost") as mock_fetch:
+            asyncio.run(tracker.track(
+                "MINT", "Test", "TEST", entry_ref=100.0, trade_size_sol=0.05,
+                buy_tx_signature="buy_sig",
+            ))
+        mock_fetch.assert_not_called()
+
+    def test_track_does_not_schedule_the_fetch_without_a_signature(self):
+        client = FakeClient()
+        risk = RiskManager(RiskConfig())
+        tracker = OutcomeTracker(ws_url="wss://example.invalid", risk=risk, client=client, dry_run=False)
+
+        with patch.object(tracker, "_fetch_real_buy_cost") as mock_fetch:
+            asyncio.run(tracker.track(
+                "MINT", "Test", "TEST", entry_ref=100.0, trade_size_sol=0.05,
+            ))
+        mock_fetch.assert_not_called()
+
+    def test_exit_uses_the_real_cost_basis_over_the_nominal_trade_size(self):
+        # bought for a real 0.061 SOL (nominal bookkeeping said 0.05),
+        # sold back for a real 0.055 SOL - a real LOSS against the real
+        # cost, even though it would look like a gain against nominal
+        client = FakeClient(real_sol_delta=0.055)
+        tracker, risk = self._make_tracker(client=client, real_cost_sol=0.061, trade_size_sol=0.05)
+
+        asyncio.run(tracker._handle_price_update("MINT", 151.0))
+
+        self.assertAlmostEqual(risk.state.realized_pnl_sol, 0.055 - 0.061, places=6)
+        self.assertNotAlmostEqual(risk.state.realized_pnl_sol, 0.055 - 0.05, places=4)
+
+    def test_exit_falls_back_to_nominal_when_no_real_cost_basis_was_fetched(self):
+        client = FakeClient(real_sol_delta=0.02)
+        tracker, risk = self._make_tracker(client=client, real_cost_sol=None, trade_size_sol=0.05)
+
+        asyncio.run(tracker._handle_price_update("MINT", 151.0))
+
+        self.assertAlmostEqual(risk.state.realized_pnl_sol, 0.02 - 0.05, places=6)
+
+    def test_exit_releases_exposure_using_the_nominal_size_not_the_real_cost(self):
+        # the real cost basis changes the PNL calculation, but exposure was
+        # registered (register_trade_opened) using the nominal size at buy
+        # time - releasing it must match that same nominal amount, or
+        # open_exposure_sol drifts out of sync with what's actually tracked
+        client = FakeClient(real_sol_delta=0.055)
+        tracker, risk = self._make_tracker(client=client, real_cost_sol=0.061, trade_size_sol=0.05)
+        self.assertAlmostEqual(risk.state.open_exposure_sol, 0.05)
+
+        asyncio.run(tracker._handle_price_update("MINT", 151.0))
+
+        self.assertAlmostEqual(risk.state.open_exposure_sol, 0.0)
 
 
 class SellFailurePauseTests(unittest.TestCase):

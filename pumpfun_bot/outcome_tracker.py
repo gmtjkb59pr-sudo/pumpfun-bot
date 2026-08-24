@@ -383,6 +383,7 @@ class OutcomeTracker:
         max_hold_sec: float | None = None,
         stale_price_timeout_sec: float | None = None,
         metadata_uri: str | None = None,
+        buy_tx_signature: str | None = None,
     ) -> None:
         """take_profit_pct/stop_loss_pct/trailing_*_pct default to this
         instance's own thresholds - pass explicit values when a DIFFERENT
@@ -440,7 +441,18 @@ class OutcomeTracker:
         force-sell immediately if the declared website/twitter look fake.
         Runs as a background task, live positions only (dry_run has
         nothing real to protect) - None (default) skips the check
-        entirely for callers that don't have it handy."""
+        entirely for callers that don't have it handy.
+
+        buy_tx_signature: user-requested 2026-08-24 ("the actual profit is
+        not right"): the real buy transaction's signature, used to fetch
+        its TRUE on-chain SOL cost in the background (never blocking the
+        buy itself - see _fetch_real_buy_cost) so a later exit's pnl_sol
+        is computed against what was actually spent, not the nominal
+        trade_size_sol bookkeeping value. Real finding: a real buy's cost
+        was up to ~24% over its nominal trade_size_sol from real slippage
+        alone - realized_pnl_sol was silently too optimistic by that whole
+        gap on every trade until this. None (default, e.g. dry-run) skips
+        the fetch entirely - there's no real transaction to look up."""
         if entry_ref is None:
             logger.debug("Geen price-ref beschikbaar voor %s, sla outcome-tracking over.", mint)
             return
@@ -513,11 +525,38 @@ class OutcomeTracker:
                 ),
                 "triggered_ladder_levels": [],
                 "remaining_fraction": 1.0,
+                # populated in the background by _fetch_real_buy_cost once
+                # (if) the lookup succeeds - None means "use the nominal
+                # trade_size_sol instead" (dry-run, lookup still pending, or
+                # lookup failed), see _exit()/_partial_exit()
+                "real_cost_sol": None,
             }
             self._persist_pending()
 
         if metadata_uri and not self.dry_run:
             asyncio.create_task(self._check_socials_and_maybe_exit(mint, metadata_uri))
+        if buy_tx_signature and not self.dry_run:
+            asyncio.create_task(self._fetch_real_buy_cost(mint, buy_tx_signature))
+
+    async def _fetch_real_buy_cost(self, mint: str, tx_signature: str) -> None:
+        """Fires in the background right after a real buy, never blocking
+        the buy itself (speed-critical, same reasoning
+        PumpPortalClient._fetch_real_sol_delta's own docstring gives for
+        why buys never fetch this synchronously) - fetches the REAL
+        on-chain SOL cost of that buy, so a later exit's pnl_sol can be
+        computed against what was actually spent instead of the nominal
+        trade_size_sol. If the position has already closed by the time
+        this resolves (a fast in-and-out trade), there's nothing left to
+        update - not an error, just a race this loses gracefully."""
+        if self.client is None:
+            return
+        delta = await self.client._fetch_real_sol_delta(tx_signature)
+        if delta is None or delta >= 0:
+            return  # a buy must be a real spend (negative delta) to trust
+        async with self._lock:
+            info = self._pending.get(mint)
+            if info is not None:
+                info["real_cost_sol"] = -delta
 
     async def _check_socials_and_maybe_exit(self, mint: str, metadata_uri: str) -> None:
         """Background task kicked off by track() right after a real buy -
@@ -1322,6 +1361,17 @@ class OutcomeTracker:
         # fraction defaults to 1.0 (the full original size) for every
         # position that never had a ladder, so this is a no-op for them
         effective_trade_size_sol = round(info["trade_size_sol"] * remaining_fraction, 9)
+        # user-requested 2026-08-24 ("the actual profit is not right"):
+        # prefer the REAL on-chain buy cost (see _fetch_real_buy_cost) over
+        # the nominal trade_size_sol bookkeeping value as the cost basis for
+        # pnl/pct_change - real buy-side slippage was silently making
+        # realized_pnl_sol too optimistic (confirmed live: up to ~24% over
+        # nominal on one real trade). Still uses effective_trade_size_sol
+        # (nominal) for register_trade_closed's exposure-release amount
+        # below - that must match what was actually REGISTERED as opened
+        # (also nominal), or exposure accounting would drift.
+        real_cost_sol = info.get("real_cost_sol")
+        cost_basis_sol = round(real_cost_sol * remaining_fraction, 9) if real_cost_sol else effective_trade_size_sol
         if self.risk is not None and effective_trade_size_sol:
             # pct_change is None for a blind forced sell (timeout_unmeasured -
             # never got price data) - pnl is genuinely unknown, so record 0
@@ -1334,20 +1384,20 @@ class OutcomeTracker:
                 # see _fetch_real_sol_delta's docstring for why the flat
                 # fee-model estimate below is systematically too optimistic
                 # on a fast-dying/illiquid token's forced exit
-                pnl_sol = round(real_sol_delta - effective_trade_size_sol, 6)
+                pnl_sol = round(real_sol_delta - cost_basis_sol, 6)
                 # user-requested: the alert/logged "@ +X%" must reflect what
                 # actually happened, not the price-tick reading from BEFORE
                 # the sell executed (that's still what decided whether to
                 # exit, but the real fill can differ meaningfully - see
                 # _fetch_real_sol_delta's docstring) - overwrite pct_change
                 # for everything logged/shown from here on
-                pct_change = round((real_sol_delta / effective_trade_size_sol - 1) * 100, 2)
+                pct_change = round((real_sol_delta / cost_basis_sol - 1) * 100, 2)
             else:
                 # estimate-only path - real_sol_delta wasn't available (dry
                 # run, or the lookup itself failed)
                 if pct_change is not None:
                     net_pct = net_pct_change_after_fees(pct_change)
-                    pnl_sol = round(effective_trade_size_sol * (net_pct / 100), 6)
+                    pnl_sol = round(cost_basis_sol * (net_pct / 100), 6)
                 else:
                     # pnl is genuinely unknown (a blind forced sell that
                     # never got price data) - record 0 rather than guessing
@@ -1469,18 +1519,26 @@ class OutcomeTracker:
                     )
                 return False
 
+        # see _exit()'s identical comment - real buy cost over nominal
+        # bookkeeping for the pnl cost basis, nominal kept for the
+        # exposure-release amount below
+        real_cost_sol = info.get("real_cost_sol")
+        cost_basis_sol = (
+            round(real_cost_sol * sold_fraction_of_original, 9) if real_cost_sol
+            else slice_cost_sol_at_entry
+        )
         if self.risk is not None and slice_cost_sol_at_entry:
             if not self.dry_run and real_sol_delta is not None and real_sol_delta > 0:
                 # see _fetch_real_sol_delta's docstring - real, ground-truth
                 # proceeds for this rung instead of the flat fee-model estimate
-                pnl_sol = round(real_sol_delta - slice_cost_sol_at_entry, 6)
+                pnl_sol = round(real_sol_delta - cost_basis_sol, 6)
                 # user-requested: same as _exit() - the alert/logged "@ +X%"
                 # must reflect the actual fill, not the price-tick reading
                 # from before the sell executed
-                pct_change = round((real_sol_delta / slice_cost_sol_at_entry - 1) * 100, 2)
+                pct_change = round((real_sol_delta / cost_basis_sol - 1) * 100, 2)
             else:
                 net_pct = net_pct_change_after_fees(pct_change) if pct_change is not None else 0.0
-                pnl_sol = round(slice_cost_sol_at_entry * (net_pct / 100), 6)
+                pnl_sol = round(cost_basis_sol * (net_pct / 100), 6)
                 # a real buy and sell would each carry a real priority fee -
                 # this was previously never subtracted here (live OR dry-
                 # run) even though every OTHER exit path accounts for it,
