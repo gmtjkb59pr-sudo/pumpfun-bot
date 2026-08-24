@@ -32,8 +32,10 @@ class _FakeSession:
     def __init__(self, responses):
         self._responses = list(responses)
         self.call_count = 0
+        self.post_calls = []  # (args, kwargs) for every post() call, in order
 
-    def post(self, url, json=None, timeout=None):
+    def post(self, *args, **kwargs):
+        self.post_calls.append((args, kwargs))
         idx = min(self.call_count, len(self._responses) - 1)
         self.call_count += 1
         return _FakeResponse(self._responses[idx])
@@ -43,6 +45,11 @@ class _FakeSession:
 
     async def __aexit__(self, *args):
         return False
+
+
+async def _fast_sleep(_seconds):
+    """Drop-in for asyncio.sleep in retry-loop tests - avoids real delays."""
+    return None
 
 
 def _status_response(*, err=None, confirmation_status="confirmed"):
@@ -223,12 +230,61 @@ class FetchRealSolDeltaTests(unittest.TestCase):
             delta = asyncio.run(client._fetch_real_sol_delta("SIG"))
         self.assertAlmostEqual(delta, -0.05)
 
+    def test_requests_confirmed_commitment_not_the_finalized_default(self):
+        # Real bug found live 2026-08-24 (user-reported: "catecoin this is
+        # a false log", "wojakius also not correct"): no commitment meant
+        # the RPC default of "finalized" - far stricter/slower than the
+        # "confirmed" status _confirm_transaction() already waited for, so
+        # called seconds later this almost always silently returned None,
+        # falling back to a stale pre-sell price estimate (confirmed live:
+        # two real trades logged as +40.2% and +101.9% "wins" that were
+        # actually real on-chain losses). Must request "confirmed" to
+        # match what's already been waited for.
+        client = self._make_client()
+        our_key = str(client.keypair.pubkey())
+        response = {
+            "result": {
+                "transaction": {"message": {"accountKeys": [our_key]}},
+                "meta": {"preBalances": [1_000_000_000], "postBalances": [1_050_000_000]},
+            },
+        }
+        session = _FakeSession([response])
+        with patch("pumpfun_bot.pumpportal_client.aiohttp.ClientSession", return_value=session):
+            asyncio.run(client._fetch_real_sol_delta("SIG"))
+        sent_payload = session.post_calls[0][1]["json"]
+        self.assertEqual(sent_payload["params"][1]["commitment"], "confirmed")
+
+    def test_retries_when_not_yet_visible_then_succeeds(self):
+        # the transaction can land a beat before getTransaction can see it
+        # even at "confirmed" commitment (different RPC replica) - a short
+        # retry recovers the real delta instead of silently giving up on
+        # the first null result.
+        client = self._make_client()
+        our_key = str(client.keypair.pubkey())
+        not_found = {"result": None}
+        found = {
+            "result": {
+                "transaction": {"message": {"accountKeys": [our_key]}},
+                "meta": {"preBalances": [1_000_000_000], "postBalances": [1_050_000_000]},
+            },
+        }
+        session = _FakeSession([not_found, found])
+        with patch(
+            "pumpfun_bot.pumpportal_client.aiohttp.ClientSession", return_value=session,
+        ), patch("pumpfun_bot.pumpportal_client.asyncio.sleep", new=_fast_sleep):
+            delta = asyncio.run(client._fetch_real_sol_delta("SIG", retry_delay_sec=0))
+        self.assertAlmostEqual(delta, 0.05)
+        self.assertEqual(session.call_count, 2)
+
     def test_returns_none_when_the_transaction_is_not_found(self):
         client = self._make_client()
         session = _FakeSession([{"result": None}])
-        with patch("pumpfun_bot.pumpportal_client.aiohttp.ClientSession", return_value=session):
-            delta = asyncio.run(client._fetch_real_sol_delta("SIG"))
+        with patch(
+            "pumpfun_bot.pumpportal_client.aiohttp.ClientSession", return_value=session,
+        ), patch("pumpfun_bot.pumpportal_client.asyncio.sleep", new=_fast_sleep):
+            delta = asyncio.run(client._fetch_real_sol_delta("SIG", retry_delay_sec=0))
         self.assertIsNone(delta)
+        self.assertEqual(session.call_count, 4)  # exhausted every retry, gave up
 
     def test_returns_none_on_fetch_exception(self):
         client = self._make_client()
