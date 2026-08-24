@@ -6,8 +6,10 @@ rugpulls - pump.fun launches zijn per ontwerp permissionless en risicovol.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
+from pathlib import Path
 
 from ..activity_log import DATA_LOG_PATH
 from ..alerts import Alerter
@@ -30,17 +32,42 @@ WALLET_BLOCKLIST_REFRESH_SEC = 60
 # symbol (confirmed via logs - the second one was correctly rejected by
 # min_buys_in_window, but only because it happened to have zero activity;
 # nothing before this stopped the bot from buying a copycat with the same
-# name outright). Reusing an identical name/symbol combo within a short
-# window is a real, free, no-RPC-call scam signal - a legitimate project
-# doesn't relaunch under its own name minutes later, but a copycat/rug-kit
-# reusing a recognizable or trending name to catch bots/humans does.
-DUPLICATE_NAME_WINDOW_SEC = 600
+# name outright). Reusing an identical name/symbol combo is a real, free,
+# no-RPC-call scam signal - a legitimate project doesn't relaunch under
+# its own name from scratch, but a copycat/rug-kit reusing a recognizable
+# or trending name to catch bots/humans does.
+#
+# PERSISTED, no expiry - confirmed live the SAME day: "Rogue Wizard"
+# (ROGWIZ) was bought, and a THIRD relaunch of that exact name appeared
+# ~55 HOURS after the first two (which themselves were only ~90s apart) -
+# a scam kit clearly resurfaces a name over days, not just minutes, so an
+# in-memory/short-window check isn't enough. Also noticed "Rogue Rocket"
+# and "Rogue Wizard" share a "Rogue ___" template, consistent with the
+# same actor/kit behind both.
+SEEN_LAUNCH_NAMES_PATH = Path("data/sniper_seen_launch_names.json")
 
 # Standard total supply of a pump.fun token - used to turn initialBuy (how
 # many tokens the creator already bought in the creation tx itself) into a
 # %. Ported from an earlier version of this bot's sniper - verify against a
 # live launch if pump.fun ever changes this.
 DEFAULT_TOTAL_SUPPLY = 1_000_000_000
+
+
+def _load_seen_launch_names() -> set[str]:
+    if not SEEN_LAUNCH_NAMES_PATH.exists():
+        return set()
+    try:
+        data = json.loads(SEEN_LAUNCH_NAMES_PATH.read_text())
+        return set(data) if isinstance(data, list) else set()
+    except Exception:  # noqa: BLE001
+        logger.debug("Kon sniper_seen_launch_names.json niet lezen, start leeg.")
+        return set()
+
+
+def _record_seen_launch_name(key: str, existing: set[str]) -> None:
+    existing.add(key)
+    SEEN_LAUNCH_NAMES_PATH.parent.mkdir(parents=True, exist_ok=True)
+    SEEN_LAUNCH_NAMES_PATH.write_text(json.dumps(sorted(existing), indent=2))
 
 
 class SniperStrategy:
@@ -67,9 +94,9 @@ class SniperStrategy:
         # tokens - see wallet_reputation.py. Only ever grows (tighten-only,
         # same philosophy as auto_tuner.py), refreshed periodically below.
         self.blocked_wallets: set[str] = set()
-        # (name, symbol) -> last-seen timestamp, for the duplicate-name
-        # check below - see DUPLICATE_NAME_WINDOW_SEC's docstring
-        self._recent_names: dict[tuple[str, str], float] = {}
+        # every (name, symbol) combo sniper has ever seen, persisted to
+        # disk with no expiry - see SEEN_LAUNCH_NAMES_PATH's docstring
+        self._seen_names: set[str] = _load_seen_launch_names()
 
     def _passes_filters(self, event: dict) -> bool:
         # PumpPortal new-token events bevatten o.a. mint, name, symbol, initial
@@ -141,26 +168,21 @@ class SniperStrategy:
         return top10_concentration_pct > self.cfg.max_top10_concentration_pct
 
     def _is_duplicate_name(self, name: str, symbol: str) -> bool:
-        """See DUPLICATE_NAME_WINDOW_SEC's docstring - a free, no-RPC-call
-        check against every (name, symbol) sniper has seen in the last
-        DUPLICATE_NAME_WINDOW_SEC. Records the CURRENT candidate regardless
-        of outcome (even a rejected one) so a run of copycats reusing the
-        same name in quick succession all get caught, not just the first
-        repeat. Prunes expired entries on every call - bounded memory
-        without a separate cleanup loop, cheap since sniper is naturally
-        rate-limited by real launch volume."""
-        key = (name.strip().lower(), symbol.strip().lower())
+        """See SEEN_LAUNCH_NAMES_PATH's docstring - a free, no-RPC-call
+        check against every (name, symbol) sniper has EVER seen, persisted
+        to disk with no expiry (a scam kit reuses a name across days, not
+        just minutes - a short in-memory window isn't enough, confirmed
+        live). Records the CURRENT candidate regardless of outcome (even a
+        rejected one) so a run of copycats reusing the same name all get
+        caught, not just the first repeat."""
+        key = f"{name.strip().lower()}|{symbol.strip().lower()}"
         # a missing name/symbol (event.get(..., "?") in run()) must never
         # match itself across different real launches - that would flag
         # every subsequent placeholder-named candidate as a false duplicate
-        if not key[0] or not key[1] or key in (("?", "?"),):
+        if name.strip() == "?" or symbol.strip() == "?" or not name.strip() or not symbol.strip():
             return False
-        now = time.time()
-        self._recent_names = {
-            k: ts for k, ts in self._recent_names.items() if now - ts < DUPLICATE_NAME_WINDOW_SEC
-        }
-        is_duplicate = key in self._recent_names
-        self._recent_names[key] = now
+        is_duplicate = key in self._seen_names
+        _record_seen_launch_name(key, self._seen_names)
         return is_duplicate
 
     async def _pre_buy_activity_check(self, mint: str) -> str | None:
