@@ -20,6 +20,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from pumpfun_bot.sniper_model import (  # noqa: E402
+    DEFAULT_ACTIVITY_WINDOW_BUY_COUNT,
     DEFAULT_CREATOR_WIN_RATE,
     WIN_MARGIN_PCT,
     build_point_in_time_creator_win_rates,
@@ -76,7 +77,13 @@ def _load_labeled_dataset(activity_log_path: Path) -> tuple[list[list[float]], l
         if initial_buy_pct is None or liquidity_sol is None:
             continue
         creator_win_rate = point_in_time_rates.get(mint, DEFAULT_CREATOR_WIN_RATE)
-        feature_values = [float(initial_buy_pct), float(liquidity_sol), float(creator_win_rate)]
+        activity_window_buy_count = meta.get("activity_window_buy_count")
+        if activity_window_buy_count is None:
+            activity_window_buy_count = DEFAULT_ACTIVITY_WINDOW_BUY_COUNT
+        feature_values = [
+            float(initial_buy_pct), float(liquidity_sol), float(creator_win_rate),
+            float(activity_window_buy_count),
+        ]
         label = 1 if exit_record["pct_change"] > WIN_MARGIN_PCT else 0
         rows.append((buy_record["ts"], feature_values, label))
 

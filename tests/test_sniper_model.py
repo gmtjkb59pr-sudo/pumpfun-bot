@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from pumpfun_bot.sniper_model import (
+    DEFAULT_ACTIVITY_WINDOW_BUY_COUNT,
     DEFAULT_CREATOR_WIN_RATE,
     WIN_MARGIN_PCT,
     build_creator_win_rates,
@@ -19,10 +20,13 @@ from pumpfun_bot.sniper_model import (
 
 
 class ExtractFeaturesTests(unittest.TestCase):
-    def test_extracts_the_three_features_in_order(self):
-        meta = {"initial_buy_pct": 5.0, "liquidity_sol": 30.0, "creator": "WALLET_A"}
+    def test_extracts_the_four_features_in_order(self):
+        meta = {
+            "initial_buy_pct": 5.0, "liquidity_sol": 30.0, "creator": "WALLET_A",
+            "activity_window_buy_count": 3,
+        }
         features = extract_features(meta, {"WALLET_A": 0.7})
-        self.assertEqual(features, [5.0, 30.0, 0.7])
+        self.assertEqual(features, [5.0, 30.0, 0.7, 3.0])
 
     def test_missing_creator_falls_back_to_the_default_prior(self):
         meta = {"initial_buy_pct": 5.0, "liquidity_sol": 30.0}
@@ -33,6 +37,16 @@ class ExtractFeaturesTests(unittest.TestCase):
         meta = {"initial_buy_pct": 5.0, "liquidity_sol": 30.0, "creator": "NEVER_SEEN"}
         features = extract_features(meta, {"SOME_OTHER_WALLET": 0.9})
         self.assertEqual(features[2], DEFAULT_CREATOR_WIN_RATE)
+
+    def test_missing_activity_window_buy_count_falls_back_to_the_sentinel(self):
+        meta = {"initial_buy_pct": 5.0, "liquidity_sol": 30.0}
+        features = extract_features(meta, {})
+        self.assertEqual(features[3], DEFAULT_ACTIVITY_WINDOW_BUY_COUNT)
+
+    def test_a_genuinely_observed_zero_buy_count_is_not_confused_with_the_sentinel(self):
+        meta = {"initial_buy_pct": 5.0, "liquidity_sol": 30.0, "activity_window_buy_count": 0}
+        features = extract_features(meta, {})
+        self.assertEqual(features[3], 0.0)
 
     def test_returns_none_when_initial_buy_pct_is_missing(self):
         meta = {"liquidity_sol": 30.0, "creator": "WALLET_A"}
@@ -190,8 +204,17 @@ class ScoreTests(unittest.TestCase):
         self.assertIsNone(result)
 
     def test_returns_a_probability_when_everything_is_available(self):
-        model = {"weights": [0.1, 0.1, 0.1], "bias": 0.0, "means": [0, 0, 0], "stds": [1, 1, 1], "features": []}
-        result = score({"initial_buy_pct": 5.0, "liquidity_sol": 30.0, "creator": "W"}, {"W": 0.6}, model=model)
+        model = {
+            "weights": [0.1, 0.1, 0.1, 0.1], "bias": 0.0,
+            "means": [0, 0, 0, 0], "stds": [1, 1, 1, 1], "features": [],
+        }
+        result = score(
+            {
+                "initial_buy_pct": 5.0, "liquidity_sol": 30.0, "creator": "W",
+                "activity_window_buy_count": 2,
+            },
+            {"W": 0.6}, model=model,
+        )
         self.assertIsNotNone(result)
         self.assertTrue(0.0 <= result <= 1.0)
 

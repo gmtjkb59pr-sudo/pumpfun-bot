@@ -112,6 +112,15 @@ class SniperStrategy:
         # SEEN_LAUNCH_NAME_WINDOW_SEC expiry - see SEEN_LAUNCH_NAMES_PATH's
         # docstring
         self._seen_names: dict[str, float] = _load_seen_launch_names()
+        # user-requested 2026-08-24: real buy-count observed by the most
+        # recent _pre_buy_activity_check() call, for sniper_model.py's
+        # shadow-mode scoring - None when the check was skipped (both
+        # enable_bundle_check and min_buys_in_window disabled) or failed,
+        # distinct from a genuinely-observed 0. See that method's docstring
+        # for why this is a separate attribute rather than a return value -
+        # avoids touching _pre_buy_activity_check's existing str|None return
+        # type and the many tests asserting against it directly.
+        self._last_activity_window_buy_count: int | None = None
 
     def _passes_filters(self, event: dict) -> bool:
         # PumpPortal new-token events bevatten o.a. mint, name, symbol, initial
@@ -249,6 +258,7 @@ class SniperStrategy:
         time when either check is enabled - a conscious trade of sniper's
         speed advantage for these signals, which is why both are off by
         default."""
+        self._last_activity_window_buy_count = None
         if not self.cfg.enable_bundle_check and self.cfg.min_buys_in_window <= 0:
             return None
 
@@ -267,6 +277,7 @@ class SniperStrategy:
                 if event.get("txType") == "buy":
                     count += 1
                 if self.cfg.enable_bundle_check and count > self.cfg.bundle_check_max_buys:
+                    self._last_activity_window_buy_count = count
                     return "gebundeld (te veel snelle buys)"
         except Exception:  # noqa: BLE001
             logger.exception("Activiteit-check mislukt voor %s - filter wordt overgeslagen.", mint)
@@ -279,6 +290,7 @@ class SniperStrategy:
                 except Exception:  # noqa: BLE001
                     pass
 
+        self._last_activity_window_buy_count = count
         if self.cfg.enable_bundle_check and count > self.cfg.bundle_check_max_buys:
             return "gebundeld (te veel snelle buys)"
         if self.cfg.min_buys_in_window > 0 and count < self.cfg.min_buys_in_window:
@@ -351,6 +363,7 @@ class SniperStrategy:
                     meta={
                         "liquidity_sol": liquidity_sol, "has_socials": has_socials,
                         "creator": creator, "initial_buy_pct": initial_buy_pct,
+                        "activity_window_buy_count": self._last_activity_window_buy_count,
                     },
                 )
                 asyncio.create_task(record_holder_count(mint, self.client.rpc_http_url))
@@ -383,12 +396,14 @@ class SniperStrategy:
                     meta={
                         "liquidity_sol": liquidity_sol, "has_socials": has_socials,
                         "creator": creator, "initial_buy_pct": initial_buy_pct,
+                        "activity_window_buy_count": self._last_activity_window_buy_count,
                     },
                 )
                 asyncio.create_task(record_holder_count(mint, self.client.rpc_http_url))
                 self._log_shadow_model_score(mint, symbol, {
                     "liquidity_sol": liquidity_sol, "creator": creator,
                     "initial_buy_pct": initial_buy_pct,
+                    "activity_window_buy_count": self._last_activity_window_buy_count,
                 })
                 await self.alerter.send(f"✅ Gekocht: {symbol} | tx: {result['signature']}")
                 if self.outcome_tracker is not None:
