@@ -51,7 +51,7 @@ from . import activity_log, position_store
 from .activity_log import append_jsonl
 from .alerts import Alerter
 from .dexscreener import fetch_price_usd
-from .fees import ROUND_TRIP_PRIORITY_FEE_SOL, net_pct_change_after_fees
+from .fees import ROUND_TRIP_PRIORITY_FEE_SOL, apply_dry_run_slippage_penalty, net_pct_change_after_fees
 from .price_ref import extract_price_ref, extract_price_ref_for_field
 from .pumpportal_client import authenticated_ws_url
 from .risk import RiskManager
@@ -1396,7 +1396,12 @@ class OutcomeTracker:
                 # estimate-only path - real_sol_delta wasn't available (dry
                 # run, or the lookup itself failed)
                 if pct_change is not None:
-                    net_pct = net_pct_change_after_fees(pct_change)
+                    # user-requested 2026-08-24 ("calibrate") - the raw tick
+                    # reading has no slippage baked in at all, confirmed to
+                    # run meaningfully more optimistic than real trading -
+                    # see fees.py's DRY_RUN_SLIPPAGE_PENALTY_PCT_BY_REASON
+                    slipped_pct_change = apply_dry_run_slippage_penalty(pct_change, reason)
+                    net_pct = net_pct_change_after_fees(slipped_pct_change)
                     pnl_sol = round(cost_basis_sol * (net_pct / 100), 6)
                 else:
                     # pnl is genuinely unknown (a blind forced sell that
@@ -1537,7 +1542,12 @@ class OutcomeTracker:
                 # from before the sell executed
                 pct_change = round((real_sol_delta / cost_basis_sol - 1) * 100, 2)
             else:
-                net_pct = net_pct_change_after_fees(pct_change) if pct_change is not None else 0.0
+                # user-requested 2026-08-24 ("calibrate") - see _exit()'s
+                # identical comment
+                slipped_pct_change = (
+                    apply_dry_run_slippage_penalty(pct_change, reason) if pct_change is not None else None
+                )
+                net_pct = net_pct_change_after_fees(slipped_pct_change) if slipped_pct_change is not None else 0.0
                 pnl_sol = round(cost_basis_sol * (net_pct / 100), 6)
                 # a real buy and sell would each carry a real priority fee -
                 # this was previously never subtracted here (live OR dry-
