@@ -324,5 +324,56 @@ class LiveBuyTests(unittest.TestCase):
         self.assertAlmostEqual(risk.state.open_exposure_sol, 0.0)
 
 
+class PollOnceScamSocialCheckTests(unittest.TestCase):
+    """User-requested: check socials BEFORE spending real money, not after
+    - a sus link found during the pre-buy metadata poll must never reach
+    _buy() at all."""
+
+    def test_does_not_buy_when_socials_look_fake(self):
+        client = FakeClient(trade_events=[{"marketCapSol": 30.0}])
+        strategy, risk = _make_strategy(client, dry_run=False)
+        strategy._watching["MINT"] = {
+            "event": {"mint": "MINT", "uri": "https://example.invalid/meta.json"},
+            "added_ts": time.time() - 5,
+        }
+
+        async def _fake_fake_links(uri):
+            return {"twitter": "https://example.invalid/definitely-not-x"}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scam_links_path = Path(tmpdir) / "known_scam_social_links.json"
+            with patch(
+                "pumpfun_bot.strategies.moonshot_hunter.fetch_social_links", _fake_fake_links,
+            ), patch("pumpfun_bot.scam_social_check.KNOWN_SCAM_LINKS_PATH", scam_links_path):
+                asyncio.run(strategy._poll_once())
+
+        self.assertNotIn("MINT", strategy._watching)  # dropped, not left to expire naturally
+        self.assertEqual(client.buy_calls, [])
+        self.assertAlmostEqual(risk.state.open_exposure_sol, 0.0)
+
+    def test_buys_when_socials_look_real(self):
+        client = FakeClient(trade_events=[{"marketCapSol": 30.0}])
+        strategy, risk = _make_strategy(client, dry_run=False)
+        strategy._watching["MINT"] = {
+            "event": {
+                "mint": "MINT", "name": "Test", "symbol": "TEST",
+                "uri": "https://example.invalid/meta.json", "vSolInBondingCurve": 30.0,
+            },
+            "added_ts": time.time() - 25,
+        }
+
+        async def _fake_real_links(uri):
+            return {"twitter": "https://x.com/realproject"}
+
+        with patch(
+            "pumpfun_bot.strategies.moonshot_hunter.fetch_social_links", _fake_real_links,
+        ):
+            asyncio.run(strategy._poll_once())
+
+        self.assertNotIn("MINT", strategy._watching)  # bought, removed
+        self.assertEqual(len(client.buy_calls), 1)
+        self.assertAlmostEqual(risk.state.open_exposure_sol, 0.02)
+
+
 if __name__ == "__main__":
     unittest.main()
