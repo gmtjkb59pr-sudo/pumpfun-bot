@@ -176,6 +176,154 @@ class TradeRequestBodyTests(unittest.TestCase):
         self.assertEqual(captured["pool"], "auto")
 
 
+class FetchRealSolDeltaTests(unittest.TestCase):
+    """User-requested, real finding 2026-08-23: the flat fee-model pnl
+    estimate was systematically too optimistic (real wallet balance drop
+    was ~4x the bot's own tracked pnl over one session) - this fetches the
+    actual on-chain SOL delta for a confirmed transaction so pnl on a sell
+    can be computed from ground truth instead."""
+
+    def _make_client(self):
+        return PumpPortalClient(
+            ws_url="wss://example.invalid",
+            trade_api_url="https://example.invalid/trade-local",
+            rpc_http_url="https://example.invalid/rpc",
+            keypair=Keypair(),
+        )
+
+    def test_computes_the_wallets_own_balance_delta(self):
+        client = self._make_client()
+        our_key = str(client.keypair.pubkey())
+        response = {
+            "result": {
+                "transaction": {"message": {"accountKeys": ["OTHER_KEY", our_key]}},
+                "meta": {"preBalances": [0, 1_000_000_000], "postBalances": [0, 1_050_000_000]},
+            },
+        }
+        session = _FakeSession([response])
+        with patch("pumpfun_bot.pumpportal_client.aiohttp.ClientSession", return_value=session):
+            delta = asyncio.run(client._fetch_real_sol_delta("SIG"))
+        self.assertAlmostEqual(delta, 0.05)
+
+    def test_a_negative_delta_for_a_buy_style_transaction(self):
+        client = self._make_client()
+        our_key = str(client.keypair.pubkey())
+        response = {
+            "result": {
+                "transaction": {"message": {"accountKeys": [our_key]}},
+                "meta": {"preBalances": [1_000_000_000], "postBalances": [950_000_000]},
+            },
+        }
+        session = _FakeSession([response])
+        with patch("pumpfun_bot.pumpportal_client.aiohttp.ClientSession", return_value=session):
+            delta = asyncio.run(client._fetch_real_sol_delta("SIG"))
+        self.assertAlmostEqual(delta, -0.05)
+
+    def test_returns_none_when_the_transaction_is_not_found(self):
+        client = self._make_client()
+        session = _FakeSession([{"result": None}])
+        with patch("pumpfun_bot.pumpportal_client.aiohttp.ClientSession", return_value=session):
+            delta = asyncio.run(client._fetch_real_sol_delta("SIG"))
+        self.assertIsNone(delta)
+
+    def test_returns_none_on_fetch_exception(self):
+        client = self._make_client()
+
+        class _RaisingSession:
+            def post(self, url, json=None, timeout=None):
+                raise TimeoutError("simulated timeout")
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+        with patch("pumpfun_bot.pumpportal_client.aiohttp.ClientSession", return_value=_RaisingSession()):
+            delta = asyncio.run(client._fetch_real_sol_delta("SIG"))
+        self.assertIsNone(delta)
+
+    def test_returns_none_when_our_key_is_not_in_account_keys(self):
+        client = self._make_client()
+        response = {
+            "result": {
+                "transaction": {"message": {"accountKeys": ["SOME_OTHER_KEY"]}},
+                "meta": {"preBalances": [1_000_000_000], "postBalances": [950_000_000]},
+            },
+        }
+        session = _FakeSession([response])
+        with patch("pumpfun_bot.pumpportal_client.aiohttp.ClientSession", return_value=session):
+            delta = asyncio.run(client._fetch_real_sol_delta("SIG"))
+        self.assertIsNone(delta)
+
+
+class RealSolDeltaWiringTests(unittest.TestCase):
+    """A sell's result must carry the real delta (used by outcome_tracker.py
+    for ground-truth pnl); a buy must NOT trigger the extra lookup at all -
+    buys are speed-critical (sniper's whole edge depends on it)."""
+
+    def _make_client(self):
+        return PumpPortalClient(
+            ws_url="wss://example.invalid",
+            trade_api_url="https://example.invalid/trade-local",
+            rpc_http_url="https://example.invalid/rpc",
+            keypair=Keypair(),
+        )
+
+    def test_full_sell_result_includes_the_real_delta(self):
+        client = self._make_client()
+
+        async def fake_sign_and_send(body):
+            return "fake_signature"
+
+        async def fake_fetch_delta(sig):
+            return 0.0423
+
+        client._sign_and_send = fake_sign_and_send
+        client._fetch_real_sol_delta = fake_fetch_delta
+        result = asyncio.run(client.build_and_send_full_sell(mint="MINT123", slippage_pct=10))
+
+        self.assertAlmostEqual(result["real_sol_delta"], 0.0423)
+
+    def test_sell_via_build_and_send_trade_includes_the_real_delta(self):
+        client = self._make_client()
+
+        async def fake_sign_and_send(body):
+            return "fake_signature"
+
+        async def fake_fetch_delta(sig):
+            return 0.0111
+
+        client._sign_and_send = fake_sign_and_send
+        client._fetch_real_sol_delta = fake_fetch_delta
+        result = asyncio.run(client.build_and_send_trade(
+            action="sell", mint="MINT123", amount_sol=0.02, slippage_pct=10,
+        ))
+
+        self.assertAlmostEqual(result["real_sol_delta"], 0.0111)
+
+    def test_a_buy_never_triggers_the_real_delta_lookup(self):
+        client = self._make_client()
+
+        async def fake_sign_and_send(body):
+            return "fake_signature"
+
+        called = []
+
+        async def fake_fetch_delta(sig):
+            called.append(sig)
+            return 0.01
+
+        client._sign_and_send = fake_sign_and_send
+        client._fetch_real_sol_delta = fake_fetch_delta
+        result = asyncio.run(client.build_and_send_trade(
+            action="buy", mint="MINT123", amount_sol=0.05, slippage_pct=10,
+        ))
+
+        self.assertEqual(called, [])
+        self.assertIsNone(result["real_sol_delta"])
+
+
 class ConfirmTransactionTests(unittest.TestCase):
     """Regression coverage for a real bug: with skipPreflight on,
     sendTransaction returning a signature only means the tx was ACCEPTED for

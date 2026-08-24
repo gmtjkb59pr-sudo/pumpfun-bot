@@ -153,7 +153,15 @@ class PumpPortalClient:
             "pool": pool,
         }
         sig = await self._sign_and_send(body)
-        return {"signature": sig, "action": action, "mint": mint, "amount_sol": amount_sol}
+        # only fetched for sells - a buy is speed-critical (sniper's whole
+        # edge depends on it) and doesn't need this, see _fetch_real_sol_
+        # delta's docstring for what it's actually used for (real, ground-
+        # truth pnl on a SELL, not buy-side accounting)
+        real_sol_delta = await self._fetch_real_sol_delta(sig) if action == "sell" else None
+        return {
+            "signature": sig, "action": action, "mint": mint, "amount_sol": amount_sol,
+            "real_sol_delta": real_sol_delta,
+        }
 
     async def build_and_send_full_sell(
         self,
@@ -201,7 +209,11 @@ class PumpPortalClient:
             "pool": pool,
         }
         sig = await self._sign_and_send(body)
-        return {"signature": sig, "action": "sell", "mint": mint, "amount": amount}
+        real_sol_delta = await self._fetch_real_sol_delta(sig)
+        return {
+            "signature": sig, "action": "sell", "mint": mint, "amount": amount,
+            "real_sol_delta": real_sol_delta,
+        }
 
     async def _sign_and_send(self, body: dict) -> str:
         # timing + blockhash-validity diagnostics for BlockhashNotFound
@@ -323,6 +335,48 @@ class PumpPortalClient:
             f"Transactie {signature} nog niet bevestigd na {timeout_sec}s - "
             f"status onbekend, behandel als mislukt."
         )
+
+    async def _fetch_real_sol_delta(self, signature: str) -> float | None:
+        """Returns the wallet's actual net SOL change from this confirmed
+        transaction (postBalance - preBalance for our own account, already
+        fee-inclusive since Solana debits the fee from the same balance) -
+        None if the lookup itself fails.
+
+        User-requested, real finding 2026-08-23: over one 23-minute live
+        session, real wallet balance dropped 0.155 SOL while the bot's own
+        fee-model P&L tracker (a flat 1.75%-per-leg assumption, see
+        fees.py) showed +0.057 SOL - a real, large gap NOT explained by
+        fees (only ~24% of it). The rest is real slippage on fast-dying,
+        thin-liquidity tokens the flat fee-model has no way to see. This
+        gives _exit()/_partial_exit() the actual on-chain proceeds of a
+        sell to compute real pnl_sol from, instead of estimating it."""
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getTransaction",
+            "params": [signature, {"encoding": "json", "maxSupportedTransactionVersion": 0}],
+        }
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(self.rpc_http_url, json=payload, timeout=10) as resp:
+                    data = await resp.json()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Kon transactie %s niet ophalen voor real-delta: %s", signature, exc)
+            return None
+
+        result = data.get("result")
+        if not result:
+            return None
+        try:
+            account_keys = result["transaction"]["message"]["accountKeys"]
+            our_key = str(self.keypair.pubkey())
+            idx = account_keys.index(our_key)
+            pre = result["meta"]["preBalances"][idx]
+            post = result["meta"]["postBalances"][idx]
+            return (post - pre) / 1_000_000_000
+        except (KeyError, ValueError, IndexError) as exc:
+            logger.debug("Kon real SOL-delta niet bepalen uit transactie %s: %s", signature, exc)
+            return None
 
     async def _send_raw_transaction(self, raw_tx: bytes) -> str:
         payload = {
