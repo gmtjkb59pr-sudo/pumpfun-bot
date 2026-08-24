@@ -30,11 +30,32 @@ from pumpfun_bot.sniper_model import (  # noqa: E402
 )
 
 ACTIVITY_LOG_PATH = Path("data/activity_log.jsonl")
+CORRECTIONS_PATH = Path("data/real_pnl_corrections.json")
 MIN_TRAINING_ROWS = 30
 HOLDOUT_FRACTION = 0.2
 
 
-def _load_labeled_dataset(activity_log_path: Path) -> tuple[list[list[float]], list[int]]:
+def _load_corrections(path: Path) -> dict[str, dict]:
+    """See scripts/audit_real_pnl.py's module docstring for the full bug
+    story (user-reported 2026-08-24: "catecoin this is a false log",
+    "wojakius also not correct") - keyed by sell tx_signature, each entry
+    carries the TRUE on-chain pct_change for that exit, re-derived from
+    the wallet's real SOL delta instead of the stale price-tick estimate
+    _fetch_real_sol_delta silently fell back to before that fix. Missing
+    entirely (file not yet generated) or missing a specific signature
+    (audit script hasn't resolved it yet) both just mean "use the
+    originally-logged pct_change" - never an error."""
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text())
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _load_labeled_dataset(
+    activity_log_path: Path, corrections: dict[str, dict] | None = None,
+) -> tuple[list[list[float]], list[int]]:
     """Real bug found live 2026-08-23: using build_creator_win_rates()
     (one global, full-log snapshot) here leaked each row's own label back
     into its own creator_win_rate feature for any single-launch creator
@@ -43,6 +64,7 @@ def _load_labeled_dataset(activity_log_path: Path) -> tuple[list[list[float]], l
     Uses the point-in-time version instead, and sorts by buy_ts so the
     later train/holdout split is a genuine chronological forward-test,
     not a random shuffle that could still leak across nearby-in-time rows."""
+    corrections = corrections if corrections is not None else {}
     buys: dict[str, list[dict]] = defaultdict(list)
     exits_by_mint: dict[str, dict] = {}
 
@@ -66,6 +88,7 @@ def _load_labeled_dataset(activity_log_path: Path) -> tuple[list[list[float]], l
     point_in_time_rates = build_point_in_time_creator_win_rates(activity_log_path)
 
     rows: list[tuple[float, list[float], int]] = []
+    corrected_label_count = 0
     for mint, mint_buys in buys.items():
         exit_record = exits_by_mint.get(mint)
         if exit_record is None or exit_record.get("pct_change") is None:
@@ -84,8 +107,21 @@ def _load_labeled_dataset(activity_log_path: Path) -> tuple[list[list[float]], l
             float(initial_buy_pct), float(liquidity_sol), float(creator_win_rate),
             float(activity_window_buy_count),
         ]
-        label = 1 if exit_record["pct_change"] > WIN_MARGIN_PCT else 0
+        correction = corrections.get(exit_record.get("tx_signature", ""))
+        if correction is not None:
+            pct_change = correction["corrected_pct_change"]
+            corrected_label_count += 1
+        else:
+            pct_change = exit_record["pct_change"]
+        label = 1 if pct_change > WIN_MARGIN_PCT else 0
         rows.append((buy_record["ts"], feature_values, label))
+
+    if corrections:
+        print(
+            f"{corrected_label_count}/{len(rows)} labels gebruiken de real on-chain "
+            f"gecorrigeerde pct_change (zie {CORRECTIONS_PATH}) i.p.v. de origineel "
+            f"gelogde waarde."
+        )
 
     rows.sort(key=lambda r: r[0])
     return [r[1] for r in rows], [r[2] for r in rows]
@@ -96,7 +132,8 @@ def main() -> None:
         print(f"Geen {ACTIVITY_LOG_PATH} gevonden - niets om op te trainen.")
         return
 
-    features, labels = _load_labeled_dataset(ACTIVITY_LOG_PATH)
+    corrections = _load_corrections(CORRECTIONS_PATH)
+    features, labels = _load_labeled_dataset(ACTIVITY_LOG_PATH, corrections)
     n = len(features)
     print(f"{n} gelabelde real sniper trade(s) gevonden (met initial_buy_pct beschikbaar).")
 
