@@ -20,9 +20,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from pumpfun_bot.sniper_model import (  # noqa: E402
+    DEFAULT_CREATOR_WIN_RATE,
     WIN_MARGIN_PCT,
-    build_creator_win_rates,
-    extract_features,
+    build_point_in_time_creator_win_rates,
     save_model,
     score_with_model,
     train_logistic_regression,
@@ -34,6 +34,14 @@ HOLDOUT_FRACTION = 0.2
 
 
 def _load_labeled_dataset(activity_log_path: Path) -> tuple[list[list[float]], list[int]]:
+    """Real bug found live 2026-08-23: using build_creator_win_rates()
+    (one global, full-log snapshot) here leaked each row's own label back
+    into its own creator_win_rate feature for any single-launch creator
+    (421 of 452, 93%, in this dataset) - see
+    build_point_in_time_creator_win_rates' docstring for the full story.
+    Uses the point-in-time version instead, and sorts by buy_ts so the
+    later train/holdout split is a genuine chronological forward-test,
+    not a random shuffle that could still leak across nearby-in-time rows."""
     buys: dict[str, list[dict]] = defaultdict(list)
     exits_by_mint: dict[str, dict] = {}
 
@@ -54,22 +62,26 @@ def _load_labeled_dataset(activity_log_path: Path) -> tuple[list[list[float]], l
             elif record.get("type") == "exit" and record.get("dry_run") is False:
                 exits_by_mint[record["mint"]] = record
 
-    creator_win_rates = build_creator_win_rates(activity_log_path)
+    point_in_time_rates = build_point_in_time_creator_win_rates(activity_log_path)
 
-    features: list[list[float]] = []
-    labels: list[int] = []
+    rows: list[tuple[float, list[float], int]] = []
     for mint, mint_buys in buys.items():
         exit_record = exits_by_mint.get(mint)
         if exit_record is None or exit_record.get("pct_change") is None:
             continue
-        meta = mint_buys[-1].get("meta") or {}
-        feature_values = extract_features(meta, creator_win_rates)
-        if feature_values is None:
+        buy_record = mint_buys[-1]
+        meta = buy_record.get("meta") or {}
+        initial_buy_pct = meta.get("initial_buy_pct")
+        liquidity_sol = meta.get("liquidity_sol")
+        if initial_buy_pct is None or liquidity_sol is None:
             continue
-        features.append(feature_values)
-        labels.append(1 if exit_record["pct_change"] > WIN_MARGIN_PCT else 0)
+        creator_win_rate = point_in_time_rates.get(mint, DEFAULT_CREATOR_WIN_RATE)
+        feature_values = [float(initial_buy_pct), float(liquidity_sol), float(creator_win_rate)]
+        label = 1 if exit_record["pct_change"] > WIN_MARGIN_PCT else 0
+        rows.append((buy_record["ts"], feature_values, label))
 
-    return features, labels
+    rows.sort(key=lambda r: r[0])
+    return [r[1] for r in rows], [r[2] for r in rows]
 
 
 def main() -> None:

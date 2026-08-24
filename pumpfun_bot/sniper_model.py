@@ -60,11 +60,13 @@ WIN_MARGIN_PCT = 5.0
 DEFAULT_CREATOR_WIN_RATE = 0.5
 
 
-def build_creator_win_rates(activity_log_path: Path) -> dict[str, float]:
-    """Real win rate per creator wallet, from every real (dry_run=false)
-    sniper trade with a matched buy+exit in the activity log. Used both to
-    build the creator_win_rate FEATURE for a past trade (when training)
-    and to score a brand-new candidate (using history up to now)."""
+def _load_creator_outcomes(activity_log_path: Path) -> list[tuple[float, str, str, bool]]:
+    """(buy_ts, mint, creator, is_win) for every real sniper trade with a
+    matched buy+exit, chronologically unsorted - callers sort as needed.
+    Shared by build_creator_win_rates (as-of-now, for live scoring) and
+    build_point_in_time_creator_win_rates (as-of-each-row, for training -
+    see that function's docstring for why these must NOT share one
+    global dict)."""
     buys: dict[str, list[dict]] = defaultdict(list)
     exits_by_mint: dict[str, dict] = {}
 
@@ -85,20 +87,61 @@ def build_creator_win_rates(activity_log_path: Path) -> dict[str, float]:
             elif record.get("type") == "exit" and record.get("dry_run") is False:
                 exits_by_mint[record["mint"]] = record
 
-    outcomes_by_creator: dict[str, list[bool]] = defaultdict(list)
+    outcomes = []
     for mint, mint_buys in buys.items():
         exit_record = exits_by_mint.get(mint)
         if exit_record is None or exit_record.get("pct_change") is None:
             continue
-        creator = (mint_buys[-1].get("meta") or {}).get("creator")
+        buy_record = mint_buys[-1]
+        creator = (buy_record.get("meta") or {}).get("creator")
         if not creator:
             continue
-        outcomes_by_creator[creator].append(exit_record["pct_change"] > WIN_MARGIN_PCT)
+        outcomes.append((buy_record["ts"], mint, creator, exit_record["pct_change"] > WIN_MARGIN_PCT))
+    return outcomes
 
+
+def build_creator_win_rates(activity_log_path: Path) -> dict[str, float]:
+    """Real win rate per creator wallet, from EVERY real (dry_run=false)
+    sniper trade with a matched buy+exit in the activity log, as of right
+    now - for LIVE scoring only (sniper.py calls this right after a real
+    buy, so "now" naturally can't include that trade's own not-yet-known
+    outcome). Do NOT use this for building a TRAINING dataset - see
+    build_point_in_time_creator_win_rates for why."""
+    outcomes_by_creator: dict[str, list[bool]] = defaultdict(list)
+    for _ts, _mint, creator, is_win in _load_creator_outcomes(activity_log_path):
+        outcomes_by_creator[creator].append(is_win)
     return {
         creator: sum(wins) / len(wins)
         for creator, wins in outcomes_by_creator.items()
     }
+
+
+def build_point_in_time_creator_win_rates(activity_log_path: Path) -> dict[str, float]:
+    """Real bug found live 2026-08-23: training on build_creator_win_rates()
+    (computed once from the FULL log) leaks each row's own label back into
+    its creator_win_rate feature - confirmed live, 421 of 452 creators
+    (93%) launched exactly ONE token, so their win rate is EXACTLY 0.0 or
+    1.0, a verbatim copy of that single trade's own outcome. The model
+    wasn't learning anything - it was trivially echoing the label back to
+    itself for the vast majority of rows (the suspiciously clean ~0.02 vs
+    ~0.98 score separation, and the inflated 86.54% holdout accuracy,
+    were both artifacts of this leak, not real signal).
+
+    Returns, per MINT, that mint's creator's win rate computed ONLY from
+    trades that happened STRICTLY BEFORE it - exactly what a live buy
+    decision would have had access to at that moment (matching
+    build_creator_win_rates' live-scoring semantics, just replayed
+    historically instead of frozen at "now"). Keyed by mint, not creator -
+    the same creator can appear at multiple points in training, each
+    occurrence needs its OWN point-in-time rate, not one shared value."""
+    outcomes = sorted(_load_creator_outcomes(activity_log_path))
+    history: dict[str, list[bool]] = defaultdict(list)
+    rate_by_mint: dict[str, float] = {}
+    for _ts, mint, creator, is_win in outcomes:
+        prior = history[creator]
+        rate_by_mint[mint] = (sum(prior) / len(prior)) if prior else DEFAULT_CREATOR_WIN_RATE
+        history[creator].append(is_win)
+    return rate_by_mint
 
 
 def extract_features(meta: dict, creator_win_rates: dict[str, float]) -> list[float] | None:
@@ -159,12 +202,18 @@ def train_logistic_regression(
     return {"weights": weights, "bias": bias, "means": means, "stds": stds, "features": list(FEATURES)}
 
 
-def save_model(model: dict, path: Path = MODEL_PATH) -> None:
+def save_model(model: dict, path: Path | None = None) -> None:
+    # resolved inside the body, not as a default-arg value - a default arg
+    # is bound ONCE at function-definition time, so patching the module-
+    # level MODEL_PATH afterward (as tests do) would silently have no
+    # effect on it otherwise
+    path = path if path is not None else MODEL_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(model, indent=2))
 
 
-def load_model(path: Path = MODEL_PATH) -> dict | None:
+def load_model(path: Path | None = None) -> dict | None:
+    path = path if path is not None else MODEL_PATH
     if not path.exists():
         return None
     try:
