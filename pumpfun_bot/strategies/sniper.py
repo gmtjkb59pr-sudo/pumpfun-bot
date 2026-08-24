@@ -20,6 +20,7 @@ from ..outcome_tracker import OutcomeTracker
 from ..price_ref import extract_price_ref_with_field
 from ..pumpportal_client import PumpPortalClient
 from ..risk import RiskManager
+from .. import sniper_model
 from ..state import bot_state
 from ..wallet_reputation import blocked_wallets
 
@@ -152,6 +153,31 @@ class SniperStrategy:
             return False
 
         return True
+
+    def _log_shadow_model_score(self, mint: str, symbol: str, meta: dict) -> None:
+        """User-requested: computes and logs sniper_model.py's win-
+        probability score for this real buy, WITHOUT touching the buy
+        decision itself (already made and executed by the time this
+        runs) - see sniper_model.py's module docstring for why this stays
+        shadow-mode-only until there's enough labeled real-trade history
+        to validate it against the existing hard filters. Any failure here
+        (no model trained yet, a bad read) must never affect the strategy
+        - caught and logged, not raised."""
+        try:
+            model = sniper_model.load_model()
+            if model is None:
+                return
+            creator_win_rates = sniper_model.build_creator_win_rates(DATA_LOG_PATH)
+            win_probability = sniper_model.score(meta, creator_win_rates, model=model)
+            if win_probability is None:
+                return
+            logger.info(
+                "Sniper: model score voor %s (%s) = %.2f (schaduwmodus, "
+                "heeft geen invloed op de koopbeslissing).",
+                symbol, mint, win_probability,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Kon shadow-mode model score niet berekenen voor %s.", mint)
 
     async def _refresh_blocked_wallets_loop(self) -> None:
         while True:
@@ -297,6 +323,14 @@ class SniperStrategy:
             open_positions_count = (
                 self.outcome_tracker.open_position_count() if self.outcome_tracker is not None else None
             )
+            # user-requested: logged for sniper_model.py's shadow-mode
+            # scoring - the SAME free, no-RPC-call signal
+            # max_initial_buy_pct already computes above, just not
+            # previously logged anywhere past the filter check itself
+            initial_buy_tokens = event.get("initialBuy")
+            initial_buy_pct = (
+                (initial_buy_tokens / DEFAULT_TOTAL_SUPPLY) * 100 if initial_buy_tokens else None
+            )
             ok, reason = self.risk.can_trade(
                 self.trade_size_sol, liquidity_sol, open_positions_count=open_positions_count,
             )
@@ -314,7 +348,10 @@ class SniperStrategy:
                 has_socials = any(event.get(k) for k in ("twitter", "telegram", "website"))
                 bot_state.log_trade(
                     "sniper", "buy", mint, self.trade_size_sol, dry_run=True,
-                    meta={"liquidity_sol": liquidity_sol, "has_socials": has_socials, "creator": creator},
+                    meta={
+                        "liquidity_sol": liquidity_sol, "has_socials": has_socials,
+                        "creator": creator, "initial_buy_pct": initial_buy_pct,
+                    },
                 )
                 asyncio.create_task(record_holder_count(mint, self.client.rpc_http_url))
                 if self.outcome_tracker is not None:
@@ -343,9 +380,16 @@ class SniperStrategy:
                 bot_state.log_trade(
                     "sniper", "buy", mint, self.trade_size_sol,
                     dry_run=False, tx_signature=result["signature"],
-                    meta={"liquidity_sol": liquidity_sol, "has_socials": has_socials, "creator": creator},
+                    meta={
+                        "liquidity_sol": liquidity_sol, "has_socials": has_socials,
+                        "creator": creator, "initial_buy_pct": initial_buy_pct,
+                    },
                 )
                 asyncio.create_task(record_holder_count(mint, self.client.rpc_http_url))
+                self._log_shadow_model_score(mint, symbol, {
+                    "liquidity_sol": liquidity_sol, "creator": creator,
+                    "initial_buy_pct": initial_buy_pct,
+                })
                 await self.alerter.send(f"✅ Gekocht: {symbol} | tx: {result['signature']}")
                 if self.outcome_tracker is not None:
                     await self.outcome_tracker.track(
