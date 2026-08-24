@@ -51,7 +51,12 @@ from . import activity_log, position_store
 from .activity_log import append_jsonl
 from .alerts import Alerter
 from .dexscreener import fetch_price_usd
-from .fees import ROUND_TRIP_PRIORITY_FEE_SOL, apply_dry_run_slippage_penalty, net_pct_change_after_fees
+from .fees import (
+    apply_dry_run_slippage_penalty,
+    net_pct_change_after_fees,
+    priority_fee_sol_for_sell,
+    round_trip_priority_fee_sol_for_reason,
+)
 from .price_ref import extract_price_ref, extract_price_ref_for_field
 from .pumpportal_client import authenticated_ws_url
 from .risk import RiskManager
@@ -1289,6 +1294,13 @@ class OutcomeTracker:
             try:
                 result = await self.client.build_and_send_full_sell(
                     mint=mint, slippage_pct=self.sell_slippage_pct,
+                    # user-requested 2026-08-24 ("build 3" - faster
+                    # execution on take_profit sells) - take_profit's real
+                    # slippage gap is the worst of any exit reason, and the
+                    # mechanism is time: a bigger fee here aims to land
+                    # before the peak this exit is chasing has fully
+                    # reversed. See fees.py's priority_fee_sol_for_sell.
+                    priority_fee_sol=priority_fee_sol_for_sell(reason),
                 )
                 tx_signature = result["signature"]
                 real_sol_delta = result.get("real_sol_delta")
@@ -1411,8 +1423,10 @@ class OutcomeTracker:
                 # subtract that known, fixed cost here too (not just in
                 # live mode) so dry-run pnl reflects what would actually
                 # happen, not an overly-optimistic estimate that pretends
-                # this fee away
-                pnl_sol = round(pnl_sol - ROUND_TRIP_PRIORITY_FEE_SOL, 6)
+                # this fee away. Reason-aware since 2026-08-24 ("build 3") -
+                # take_profit/take_profit_ladder now submit a boosted real
+                # fee, see fees.py's round_trip_priority_fee_sol_for_reason.
+                pnl_sol = round(pnl_sol - round_trip_priority_fee_sol_for_reason(reason), 6)
             self.risk.register_trade_closed(effective_trade_size_sol, pnl_sol)
         append_jsonl({
             "type": "exit",
@@ -1507,6 +1521,11 @@ class OutcomeTracker:
                 result = await self.client.build_and_send_full_sell(
                     mint=mint, slippage_pct=self.sell_slippage_pct,
                     amount_pct=sell_pct_of_current_holdings,
+                    # user-requested 2026-08-24 ("build 3") - see _exit()'s
+                    # identical comment; _partial_exit is only ever reached
+                    # for take_profit_ladder rungs (see this method's own
+                    # docstring), so this is always the boosted fee
+                    priority_fee_sol=priority_fee_sol_for_sell(reason),
                 )
                 tx_signature = result["signature"]
                 real_sol_delta = result.get("real_sol_delta")
@@ -1552,8 +1571,10 @@ class OutcomeTracker:
                 # a real buy and sell would each carry a real priority fee -
                 # this was previously never subtracted here (live OR dry-
                 # run) even though every OTHER exit path accounts for it,
-                # making a ladder rung's pnl look better than reality
-                pnl_sol = round(pnl_sol - ROUND_TRIP_PRIORITY_FEE_SOL, 6)
+                # making a ladder rung's pnl look better than reality.
+                # Reason-aware since 2026-08-24 ("build 3") - see _exit()'s
+                # identical comment
+                pnl_sol = round(pnl_sol - round_trip_priority_fee_sol_for_reason(reason), 6)
             self.risk.register_trade_closed(slice_cost_sol_at_entry, pnl_sol)
 
         append_jsonl({
