@@ -1252,6 +1252,106 @@ class ScamSocialCheckExitTests(unittest.TestCase):
         self.assertEqual(client.sell_calls, [])  # nothing to sell, no crash
 
 
+class DoubleExitRaceTests(unittest.TestCase):
+    """Real bug found live 2026-08-23: the normal per-tick price
+    evaluation and the scam-social background check can both
+    independently decide to exit the SAME mint at nearly the same
+    instant - confirmed via activity_log.jsonl: a position closed via
+    BOTH "scam_socials" and "take_profit" 82ms apart, sharing the exact
+    same tx_signature, but risk.register_trade_closed() ran TWICE,
+    double-counting that position's pnl and double-releasing its
+    exposure. _attempt_exit must let only one exit sequence run per mint
+    at a time."""
+
+    class _SlowFakeClient:
+        """Like FakeClient, but build_and_send_full_sell has a real await
+        point (asyncio.sleep) - matching the real PumpPortalClient (real
+        HTTP + RPC confirmation polling), which is what actually makes the
+        production race possible. The plain FakeClient's sell has no
+        internal await at all, so two calls to it never genuinely
+        interleave - it would (incorrectly) make this guard look
+        unnecessary in a test even if it were missing in the real code."""
+
+        def __init__(self, real_sol_delta):
+            self.real_sol_delta = real_sol_delta
+            self.sell_calls = []
+            self.keypair = _FakeKeypair()
+            self.rpc_http_url = "https://example.invalid/rpc"
+
+        async def build_and_send_full_sell(self, mint, slippage_pct, amount_pct=100):
+            self.sell_calls.append((mint, slippage_pct, amount_pct))
+            await asyncio.sleep(0.01)
+            return {
+                "signature": "shared_sig", "action": "sell", "mint": mint,
+                "amount": f"{amount_pct}%", "real_sol_delta": self.real_sol_delta,
+            }
+
+    def _make_tracker(self):
+        risk = RiskManager(RiskConfig())
+        risk.register_trade_opened(0.05)
+        client = self._SlowFakeClient(real_sol_delta=0.0359)  # +34%-ish real fill
+        tracker = OutcomeTracker(ws_url="wss://example.invalid", risk=risk, client=client, dry_run=False)
+        tracker._pending["MINT"] = {
+            "entry_ts": time.time() - 100, "entry_ref": 100.0, "last_ref": 134.0,
+            "peak_ref": 134.0, "name": "Viewers", "symbol": "VIEWERS", "trade_size_sol": 0.05,
+            "hit": set(), "has_real_update": False,
+        }
+        return tracker, risk, client
+
+    def test_two_concurrent_exits_for_the_same_mint_only_close_it_once(self):
+        tracker, risk, client = self._make_tracker()
+        info = dict(tracker._pending["MINT"])
+
+        async def _drive():
+            await asyncio.gather(
+                tracker._attempt_exit("MINT", info, "scam_socials", 34.0, 1.0),
+                tracker._attempt_exit("MINT", dict(info), "take_profit", 34.0, 1.0),
+            )
+
+        asyncio.run(_drive())
+
+        self.assertEqual(len(client.sell_calls), 1)  # only one real sell ever attempted
+        self.assertAlmostEqual(risk.state.realized_pnl_sol, 0.0359 - 0.05, places=6)  # not doubled
+        self.assertNotIn("MINT", tracker._pending)
+
+    def test_three_way_concurrent_race_still_only_closes_it_once(self):
+        # strengthens the two-way case above - only ever one winner no
+        # matter how many triggers race on the same mint at once
+        tracker, risk, client = self._make_tracker()
+        info = dict(tracker._pending["MINT"])
+
+        async def _drive():
+            await asyncio.gather(
+                tracker._attempt_exit("MINT", dict(info), "scam_socials", 34.0, 1.0),
+                tracker._attempt_exit("MINT", dict(info), "take_profit", 34.0, 1.0),
+                tracker._attempt_exit("MINT", dict(info), "trailing_stop", 34.0, 1.0),
+            )
+
+        asyncio.run(_drive())
+
+        self.assertEqual(len(client.sell_calls), 1)
+        self.assertAlmostEqual(risk.state.realized_pnl_sol, 0.0359 - 0.05, places=6)
+
+    def test_the_guard_releases_after_completion_so_a_later_real_retry_still_works(self):
+        # a genuinely separate LATER exit attempt (e.g. a retry after a
+        # transient failure) for a DIFFERENT mint must be unaffected -
+        # confirms the guard doesn't leak and block everything forever
+        tracker, risk, client = self._make_tracker()
+        info = dict(tracker._pending["MINT"])
+        asyncio.run(tracker._attempt_exit("MINT", info, "scam_socials", 34.0, 1.0))
+
+        tracker._pending["MINT2"] = {
+            "entry_ts": time.time() - 100, "entry_ref": 100.0, "last_ref": 110.0,
+            "peak_ref": 110.0, "name": "Other", "symbol": "OTHER", "trade_size_sol": 0.05,
+            "hit": set(), "has_real_update": False,
+        }
+        asyncio.run(tracker._attempt_exit("MINT2", dict(tracker._pending["MINT2"]), "take_profit", 10.0, 1.0))
+
+        self.assertEqual(len(client.sell_calls), 2)
+        self.assertNotIn("MINT", tracker._pending)
+        self.assertNotIn("MINT2", tracker._pending)
+
+
 class RecentlyExitedGraceWindowTests(unittest.TestCase):
     """Real bug found live (Alpha, social_watch, 2026-08-23): a position
     exited normally via trailing_stop, its sell fully confirmed on-chain
