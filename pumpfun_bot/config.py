@@ -106,6 +106,20 @@ class SniperConfig:
     enable_bundle_check: bool = False
     bundle_check_window_ms: int = 300
     bundle_check_max_buys: int = 5
+    # user-requested, real finding 2026-08-23: 57.1% of everything sniper
+    # bought went stale_price (zero real trade activity) within seconds -
+    # min_liquidity_sol can't catch this, since every pump.fun launch
+    # starts at essentially the same bonding-curve liquidity (confirmed
+    # live: 391 of ~401 real buys all fell in the exact same 30-40 SOL
+    # band, functionally a constant, not a signal). Reuses the SAME
+    # bundle_check_window_ms trade-stream watch (see
+    # _bundle_check_flags_bundle/_pre_buy_activity_check) to also reject a
+    # candidate with FEWER than this many real buys in that window - the
+    # opposite failure mode from bundle_check_max_buys, checked in the same
+    # pass so this doesn't cost a second window's worth of real time. 0 =
+    # disabled (default). Only takes effect once the window is actually
+    # being watched (enable_bundle_check=true or this > 0).
+    min_buys_in_window: int = 0
 
 
 @dataclass
@@ -445,6 +459,7 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         enable_bundle_check=sniper_raw.get("enable_bundle_check", False),
         bundle_check_window_ms=sniper_raw.get("bundle_check_window_ms", 300),
         bundle_check_max_buys=sniper_raw.get("bundle_check_max_buys", 5),
+        min_buys_in_window=sniper_raw.get("min_buys_in_window", 0),
     )
 
     sw_raw = strat_raw.get("social_watch", {})

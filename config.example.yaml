@@ -89,6 +89,12 @@ strategies:
     enable_bundle_check: false
     bundle_check_window_ms: 300
     bundle_check_max_buys: 5
+    # rejects a candidate with FEWER than this many real buys in the SAME
+    # window above (shares one window-watch with bundle_check, not a
+    # second one) - min_liquidity_sol can't catch a dead-on-arrival token
+    # since every pump.fun launch starts at essentially the same bonding-
+    # curve liquidity. 0 = disabled (default).
+    min_buys_in_window: 0
 
   social_watch:
     # Wacht op socials in plaats van direct te kopen bij launch (zoals
