@@ -10,13 +10,21 @@ from pumpfun_bot.risk import RiskManager
 from pumpfun_bot.strategies.sniper import SniperStrategy
 
 
-def _make_strategy(*, outcome_tracker=None, cfg=None, client=None):
+class _FakeAlerter:
+    def __init__(self):
+        self.sent = []
+
+    async def send(self, message):
+        self.sent.append(message)
+
+
+def _make_strategy(*, outcome_tracker=None, cfg=None, client=None, alerter=None):
     risk = RiskManager(RiskConfig())
     return SniperStrategy(
         client=client,
         cfg=cfg if cfg is not None else SniperConfig(enabled=True),
         risk=risk,
-        alerter=None,
+        alerter=alerter,
         trade_size_sol=0.03,
         slippage_pct=10,
         dry_run=True,
@@ -434,6 +442,117 @@ class ShadowModelScoreLoggingTests(unittest.TestCase):
                 logging.getLogger("pumpfun_bot.sniper").info("sentinel")
                 strategy._log_shadow_model_score("MINT", "TEST", {})
         self.assertFalse(any("model score" in m for m in ctx.output))
+
+
+class PreBuyModelScoreGateTests(unittest.TestCase):
+    """User-requested 2026-08-24: promotes sniper_model.py's score from
+    shadow-mode logging to an actual pre-buy gate, once corrected real
+    trade data showed it beats baseline and that dead-on-arrival tokens
+    are the single biggest real loss category - see
+    SniperConfig.model_score_min_to_buy's docstring in config.py."""
+
+    def setUp(self):
+        # a run()-level test exercises _is_duplicate_name too, which
+        # persists to the REAL SEEN_LAUNCH_NAMES_PATH by default (see
+        # DuplicateNameFilterTests above) - isolate it so a name used here
+        # doesn't get falsely flagged as a duplicate on a later test run
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._path = Path(self._tmpdir.name) / "sniper_seen_launch_names.json"
+        self._patcher = patch(
+            "pumpfun_bot.strategies.sniper.SEEN_LAUNCH_NAMES_PATH", self._path,
+        )
+        self._patcher.start()
+
+    def tearDown(self):
+        self._patcher.stop()
+        self._tmpdir.cleanup()
+
+    def test_returns_none_when_no_model_is_cached_yet(self):
+        # cold start: self._model is None until the first background
+        # refresh - must fail OPEN (never gate), same as sniper's other
+        # checks, not raise or block on an inconclusive read
+        strategy = _make_strategy(cfg=SniperConfig(enabled=True, model_score_min_to_buy=0.5))
+        self.assertIsNone(strategy._model)
+        result = strategy._pre_buy_model_score(
+            {"liquidity_sol": 30.0, "creator": "W", "initial_buy_pct": 5.0},
+        )
+        self.assertIsNone(result)
+
+    def test_uses_the_cached_model_and_win_rates_not_a_fresh_disk_read(self):
+        strategy = _make_strategy(cfg=SniperConfig(enabled=True, model_score_min_to_buy=0.5))
+        strategy._model = {"weights": [0.0], "bias": 0.0, "means": [0.0], "stds": [1.0], "features": []}
+        strategy._creator_win_rates = {"W": 0.9}
+        with patch(
+            "pumpfun_bot.strategies.sniper.sniper_model.load_model",
+        ) as mock_load, patch(
+            "pumpfun_bot.strategies.sniper.sniper_model.build_creator_win_rates",
+        ) as mock_build:
+            result = strategy._pre_buy_model_score(
+                {"liquidity_sol": 30.0, "creator": "W", "initial_buy_pct": 5.0},
+            )
+        mock_load.assert_not_called()
+        mock_build.assert_not_called()
+        self.assertIsNotNone(result)
+        self.assertTrue(0.0 <= result <= 1.0)
+
+    def test_run_rejects_a_candidate_scoring_below_the_threshold(self):
+        cfg = SniperConfig(enabled=True, model_score_min_to_buy=0.5)
+        client = FakeTokenTradeStreamClient(events=[])
+        strategy = _make_strategy(cfg=cfg, client=client)
+        strategy._model = {"weights": [0.0], "bias": 0.0, "means": [0.0], "stds": [1.0], "features": []}
+
+        async def _fake_stream_new_tokens():
+            yield {
+                "mint": "MINT", "name": "Low Score", "symbol": "LOW",
+                "vSolInBondingCurve": 30.0, "traderPublicKey": "CREATOR", "initialBuy": 1_000_000,
+            }
+        client.stream_new_tokens = _fake_stream_new_tokens
+
+        with patch(
+            "pumpfun_bot.strategies.sniper.sniper_model.score", return_value=0.1,
+        ):
+            with self.assertLogs("pumpfun_bot.sniper", level="INFO") as ctx:
+                asyncio.run(strategy.run())
+        self.assertTrue(any("model score te laag" in m for m in ctx.output))
+
+    def test_run_buys_a_candidate_scoring_at_or_above_the_threshold(self):
+        cfg = SniperConfig(enabled=True, model_score_min_to_buy=0.5)
+        client = FakeTokenTradeStreamClient(events=[])
+        strategy = _make_strategy(cfg=cfg, client=client, alerter=_FakeAlerter())
+        strategy._model = {"weights": [0.0], "bias": 0.0, "means": [0.0], "stds": [1.0], "features": []}
+
+        async def _fake_stream_new_tokens():
+            yield {
+                "mint": "MINT", "name": "High Score", "symbol": "HIGH",
+                "vSolInBondingCurve": 30.0, "traderPublicKey": "CREATOR", "initialBuy": 1_000_000,
+            }
+        client.stream_new_tokens = _fake_stream_new_tokens
+
+        with patch(
+            "pumpfun_bot.strategies.sniper.sniper_model.score", return_value=0.9,
+        ):
+            with self.assertLogs("pumpfun_bot.sniper", level="INFO") as ctx:
+                asyncio.run(strategy.run())
+        self.assertFalse(any("model score te laag" in m for m in ctx.output))
+        self.assertTrue(any("Zou kopen" in m for m in ctx.output))
+
+    def test_disabled_by_default_never_scores_or_blocks(self):
+        cfg = SniperConfig(enabled=True, model_score_min_to_buy=0)
+        client = FakeTokenTradeStreamClient(events=[])
+        strategy = _make_strategy(cfg=cfg, client=client, alerter=_FakeAlerter())
+
+        async def _fake_stream_new_tokens():
+            yield {
+                "mint": "MINT", "name": "Any", "symbol": "ANY",
+                "vSolInBondingCurve": 30.0, "traderPublicKey": "CREATOR",
+            }
+        client.stream_new_tokens = _fake_stream_new_tokens
+
+        with patch("pumpfun_bot.strategies.sniper.sniper_model.score") as mock_score:
+            with self.assertLogs("pumpfun_bot.sniper", level="INFO") as ctx:
+                asyncio.run(strategy.run())
+        mock_score.assert_not_called()
+        self.assertTrue(any("Zou kopen" in m for m in ctx.output))
 
     def test_an_exception_is_caught_and_never_propagates(self):
         strategy = _make_strategy()
