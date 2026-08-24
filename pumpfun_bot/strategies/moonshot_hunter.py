@@ -313,6 +313,7 @@ class MoonshotHunterStrategy:
                     price_ref_field=price_ref_field,
                     max_hold_sec=self.cfg.max_hold_sec,
                     stale_price_timeout_sec=self.cfg.stale_price_timeout_sec,
+                    metadata_uri=event.get("uri"),
                 )
         except Exception as exc:  # noqa: BLE001
             logger.exception("Moonshot-hunter buy mislukt voor %s: %s", mint, exc)

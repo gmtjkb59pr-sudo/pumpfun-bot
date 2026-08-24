@@ -55,6 +55,8 @@ from .fees import ROUND_TRIP_PRIORITY_FEE_SOL, net_pct_change_after_fees
 from .price_ref import extract_price_ref, extract_price_ref_for_field
 from .pumpportal_client import authenticated_ws_url
 from .risk import RiskManager
+from .scam_social_check import evaluate_social_links, record_scam_links
+from .social_metadata import fetch_social_links
 from .state import bot_state
 from .wallet_reconciliation import fetch_wallet_token_mints
 
@@ -146,6 +148,7 @@ RECENTLY_EXITED_GRACE_SEC = 120
 EXIT_EMOJI = {
     "take_profit": "🟢", "stop_loss": "🔴", "trailing_stop": "🟡", "timeout": "⏱️",
     "timeout_unmeasured": "❔", "stale_price": "💤", "stale_price_unmeasured": "💤",
+    "scam_socials": "🚩",
 }
 
 
@@ -373,6 +376,7 @@ class OutcomeTracker:
         price_ref_field: str | None = None,
         max_hold_sec: float | None = None,
         stale_price_timeout_sec: float | None = None,
+        metadata_uri: str | None = None,
     ) -> None:
         """take_profit_pct/stop_loss_pct/trailing_*_pct default to this
         instance's own thresholds - pass explicit values when a DIFFERENT
@@ -422,7 +426,15 @@ class OutcomeTracker:
         fast-moving sniper/social_watch positions and would force-exit a
         genuinely healthy long-hold position the moment it saw one natural
         trading lull. None (default) keeps the existing shared-constant
-        behavior for every other strategy unchanged."""
+        behavior for every other strategy unchanged.
+
+        metadata_uri: user-requested - the token's off-chain metadata URI
+        (same field social_watch already fetches has_socials from), used
+        to run a post-buy scam-social check (see scam_social_check.py) and
+        force-sell immediately if the declared website/twitter look fake.
+        Runs as a background task, live positions only (dry_run has
+        nothing real to protect) - None (default) skips the check
+        entirely for callers that don't have it handy."""
         if entry_ref is None:
             logger.debug("Geen price-ref beschikbaar voor %s, sla outcome-tracking over.", mint)
             return
@@ -497,6 +509,54 @@ class OutcomeTracker:
                 "remaining_fraction": 1.0,
             }
             self._persist_pending()
+
+        if metadata_uri and not self.dry_run:
+            asyncio.create_task(self._check_socials_and_maybe_exit(mint, metadata_uri))
+
+    async def _check_socials_and_maybe_exit(self, mint: str, metadata_uri: str) -> None:
+        """Background task kicked off by track() right after a real buy -
+        see scam_social_check.py's module docstring for what "sus" means
+        here. Deliberately doesn't hold self._lock across the network
+        fetch (fetch_social_links can take up to its own timeout) - only
+        the final pending-lookup + forced exit need it, same pattern as
+        every other background sweep in this file."""
+        try:
+            links = await fetch_social_links(metadata_uri)
+            if not links:
+                return
+            is_sus, reason = await evaluate_social_links(links)
+            if not is_sus:
+                return
+
+            async with self._lock:
+                info = self._pending.get(mint)
+            if info is None:
+                return  # already exited normally before this check finished
+
+            # _exit() itself refuses any real sell before MIN_SELL_DELAY_SEC
+            # has passed since entry (PumpPortal's own balance index needs
+            # a moment to catch up with the buy - see its docstring) - the
+            # metadata fetch above is often faster than that floor, so
+            # without this wait a fast-confirmed scam would silently defer
+            # its own forced exit and never actually retry it, since
+            # "scam_socials" isn't a condition the normal per-tick exit
+            # evaluation loop re-checks on its own.
+            wait_sec = MIN_SELL_DELAY_SEC - (time.time() - info["entry_ts"])
+            if wait_sec > 0:
+                await asyncio.sleep(wait_sec)
+
+            message = f"🚩 Verdachte socials voor {info.get('symbol', mint)}: {reason} - direct verkocht."
+            logger.warning(message)
+            if self.alerter is not None:
+                await self.alerter.send(message)
+            record_scam_links([v for v in links.values() if v])
+
+            entry_ref = info.get("entry_ref") or 0.0
+            last_ref = info.get("last_ref") or entry_ref
+            pct_change = ((last_ref - entry_ref) / entry_ref * 100.0) if entry_ref else 0.0
+            await self._attempt_exit(mint, dict(info), "scam_socials", pct_change, 1.0)
+        except Exception:  # noqa: BLE001
+            logger.exception("Onverwachte fout tijdens scam-social-check voor %s.", mint)
 
     async def run(self) -> None:
         while True:

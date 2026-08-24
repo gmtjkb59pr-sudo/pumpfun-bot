@@ -257,6 +257,7 @@ class SniperStrategy:
                         trailing_stop_pct=self.cfg.trailing_stop_pct,
                         take_profit_ladder=self.cfg.take_profit_ladder,
                         price_ref_field=price_ref_field,
+                        metadata_uri=event.get("uri"),
                     )
             except Exception as exc:  # noqa: BLE001
                 logger.exception("Snipe buy mislukt voor %s: %s", mint, exc)
