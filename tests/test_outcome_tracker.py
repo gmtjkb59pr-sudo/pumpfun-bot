@@ -1316,6 +1316,107 @@ class RecentlyExitedGraceWindowTests(unittest.TestCase):
         mock_bot_state.set_untracked_holdings_count.assert_called_once_with(1)
 
 
+class ReleaseExposureOnConfirmedUnsellableTests(unittest.TestCase):
+    """Real finding 2026-08-23: a permanently-stuck position's exposure was
+    never released, since it can never close through the normal sell path.
+    4 such positions' combined exposure grew bigger than 50% of the actual
+    (much smaller, after losses) wallet balance, so
+    max_exposure_pct_of_balance blocked EVERY new trade indefinitely,
+    regardless of quality. This capital is realistically gone/illiquid
+    already - released the SAME moment a position is confirmed permanently
+    unsellable (sell_paused AND still genuinely held per the wallet), not
+    a moment sooner."""
+
+    def _make_tracker(self, *, trade_size_sol=0.03, remaining_fraction=1.0):
+        risk = RiskManager(RiskConfig())
+        risk.register_trade_opened(trade_size_sol * remaining_fraction)
+        client = FakeClient()
+        tracker = OutcomeTracker(ws_url="wss://example.invalid", risk=risk, client=client, dry_run=False)
+        tracker._pending["STUCK_MINT"] = {
+            "entry_ts": time.time(), "entry_ref": 100.0, "last_ref": 100.0, "peak_ref": 100.0,
+            "name": "Stuck", "symbol": "STUCK", "trade_size_sol": trade_size_sol,
+            "remaining_fraction": remaining_fraction,
+            "hit": set(), "has_real_update": False,
+            "sell_paused": True, "consecutive_sell_failures": 2,
+        }
+        return tracker, risk
+
+    def test_releases_exposure_the_moment_a_position_is_confirmed_unsellable(self):
+        tracker, risk = self._make_tracker(trade_size_sol=0.05)
+
+        async def _fake_fetch(wallet_pubkey, rpc_http_url):
+            return {"STUCK_MINT"}  # still genuinely held - confirms the pause is real
+
+        with patch("pumpfun_bot.outcome_tracker.fetch_wallet_token_mints", _fake_fetch), \
+             patch("pumpfun_bot.outcome_tracker.bot_state"):
+            asyncio.run(tracker._reconcile_with_wallet())
+
+        self.assertAlmostEqual(risk.state.open_exposure_sol, 0.0)
+        self.assertIn("STUCK_MINT", tracker._pending)  # still tracked, just not counted as exposure
+
+    def test_only_releases_the_remaining_fraction_not_the_original_size(self):
+        # a position with ladder rungs already sold off before getting
+        # stuck should only release what's ACTUALLY still exposed
+        tracker, risk = self._make_tracker(trade_size_sol=0.05, remaining_fraction=0.4)
+
+        async def _fake_fetch(wallet_pubkey, rpc_http_url):
+            return {"STUCK_MINT"}
+
+        with patch("pumpfun_bot.outcome_tracker.fetch_wallet_token_mints", _fake_fetch), \
+             patch("pumpfun_bot.outcome_tracker.bot_state"):
+            asyncio.run(tracker._reconcile_with_wallet())
+
+        self.assertAlmostEqual(risk.state.open_exposure_sol, 0.0)
+
+    def test_does_not_release_exposure_twice_across_reconcile_cycles(self):
+        tracker, risk = self._make_tracker(trade_size_sol=0.05)
+
+        async def _fake_fetch(wallet_pubkey, rpc_http_url):
+            return {"STUCK_MINT"}
+
+        with patch("pumpfun_bot.outcome_tracker.fetch_wallet_token_mints", _fake_fetch), \
+             patch("pumpfun_bot.outcome_tracker.bot_state"):
+            asyncio.run(tracker._reconcile_with_wallet())
+            risk.register_trade_opened(0.02)  # simulates a real, unrelated new position opening
+            asyncio.run(tracker._reconcile_with_wallet())
+
+        self.assertAlmostEqual(risk.state.open_exposure_sol, 0.02)  # not double-released into negative
+
+    def test_does_not_release_exposure_for_a_position_not_yet_paused(self):
+        tracker, risk = self._make_tracker(trade_size_sol=0.05)
+        tracker._pending["STUCK_MINT"]["sell_paused"] = False
+
+        async def _fake_fetch(wallet_pubkey, rpc_http_url):
+            return {"STUCK_MINT"}
+
+        with patch("pumpfun_bot.outcome_tracker.fetch_wallet_token_mints", _fake_fetch), \
+             patch("pumpfun_bot.outcome_tracker.bot_state"):
+            asyncio.run(tracker._reconcile_with_wallet())
+
+        self.assertAlmostEqual(risk.state.open_exposure_sol, 0.05)  # untouched - not actually stuck
+
+    def test_sends_an_alert_when_exposure_is_released(self):
+        class _FakeAlerter:
+            def __init__(self):
+                self.messages = []
+
+            async def send(self, message):
+                self.messages.append(message)
+
+        tracker, risk = self._make_tracker(trade_size_sol=0.05)
+        alerter = _FakeAlerter()
+        tracker.alerter = alerter
+
+        async def _fake_fetch(wallet_pubkey, rpc_http_url):
+            return {"STUCK_MINT"}
+
+        with patch("pumpfun_bot.outcome_tracker.fetch_wallet_token_mints", _fake_fetch), \
+             patch("pumpfun_bot.outcome_tracker.bot_state"):
+            asyncio.run(tracker._reconcile_with_wallet())
+
+        self.assertTrue(any("Exposure vrijgegeven" in m for m in alerter.messages))
+
+
 class LiquidationDispatchTests(unittest.TestCase):
     """Real bug found live: _reconcile_with_wallet() used to await the
     liquidation sweep inline - since a failing sell can take up to 30s to
