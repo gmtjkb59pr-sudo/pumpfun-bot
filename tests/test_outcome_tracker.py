@@ -1845,6 +1845,33 @@ class RealSolDeltaPnlTests(unittest.TestCase):
         # NOT anywhere near what the fee-model estimate for +51% would be
         self.assertNotAlmostEqual(risk.state.realized_pnl_sol, _net_pnl_sol(0.05, 51.0), places=2)
 
+    def test_the_logged_and_alerted_pct_change_reflects_the_real_fill_not_the_trigger_price(self):
+        # user-requested: the price tick that TRIGGERED the exit (+51%) is
+        # not what actually got sold - 0.02 SOL back on a 0.05 SOL cost
+        # basis is really -60%, and that's what must be shown/logged, not
+        # the stale +51% that only decided WHETHER to exit
+        class _FakeAlerter:
+            def __init__(self):
+                self.messages = []
+
+            async def send(self, message):
+                self.messages.append(message)
+
+        alerter = _FakeAlerter()
+        client = FakeClient(should_fail=False, real_sol_delta=0.02)
+        tracker, risk = self._make_tracker(client=client)
+        tracker.alerter = alerter
+
+        asyncio.run(tracker._handle_price_update("MINT", 151.0))  # +51% at trigger time
+
+        self.assertAlmostEqual((0.02 / 0.05 - 1) * 100, -60.0)
+        self.assertTrue(any("-60.0%" in m for m in alerter.messages))
+        self.assertFalse(any("+51" in m for m in alerter.messages))
+
+        with open(activity_log.DATA_LOG_PATH, encoding="utf-8") as f:
+            exits = [json.loads(line) for line in f if json.loads(line).get("type") == "exit"]
+        self.assertAlmostEqual(exits[-1]["pct_change"], -60.0)
+
     def test_falls_back_to_the_estimate_when_no_real_delta_is_available(self):
         client = FakeClient(should_fail=False, real_sol_delta=None)
         tracker, risk = self._make_tracker(client=client)
@@ -2846,6 +2873,18 @@ class TakeProfitLadderTests(unittest.TestCase):
         asyncio.run(tracker._handle_price_update("MINT", 200.0))  # 2x -> first rung (30%)
 
         self.assertAlmostEqual(risk.state.realized_pnl_sol, 0.05 - 0.015, places=6)
+
+    def test_live_rung_pct_change_reflects_the_real_fill_not_the_trigger_price(self):
+        # slice cost basis 0.015 SOL, real proceeds 0.05 SOL -> real
+        # +233.3%, not the +100% the 2x trigger tick would suggest
+        client = FakeClient(should_fail=False, real_sol_delta=0.05)
+        tracker, risk = self._make_tracker(client=client, dry_run=False, entry_ref=100.0, trade_size_sol=0.05)
+
+        asyncio.run(tracker._handle_price_update("MINT", 200.0))  # 2x -> first rung (30%)
+
+        with open(activity_log.DATA_LOG_PATH, encoding="utf-8") as f:
+            exits = [json.loads(line) for line in f if json.loads(line).get("type") == "exit"]
+        self.assertAlmostEqual(exits[-1]["pct_change"], (0.05 / 0.015 - 1) * 100, places=1)
 
     def test_failed_live_rung_sell_leaves_remaining_fraction_untouched(self):
         client = FakeClient(should_fail=True)

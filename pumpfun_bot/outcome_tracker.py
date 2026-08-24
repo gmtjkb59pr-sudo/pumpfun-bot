@@ -1308,6 +1308,13 @@ class OutcomeTracker:
                 # fee-model estimate below is systematically too optimistic
                 # on a fast-dying/illiquid token's forced exit
                 pnl_sol = round(real_sol_delta - effective_trade_size_sol, 6)
+                # user-requested: the alert/logged "@ +X%" must reflect what
+                # actually happened, not the price-tick reading from BEFORE
+                # the sell executed (that's still what decided whether to
+                # exit, but the real fill can differ meaningfully - see
+                # _fetch_real_sol_delta's docstring) - overwrite pct_change
+                # for everything logged/shown from here on
+                pct_change = round((real_sol_delta / effective_trade_size_sol - 1) * 100, 2)
             else:
                 # estimate-only path - real_sol_delta wasn't available (dry
                 # run, or the lookup itself failed)
@@ -1440,6 +1447,10 @@ class OutcomeTracker:
                 # see _fetch_real_sol_delta's docstring - real, ground-truth
                 # proceeds for this rung instead of the flat fee-model estimate
                 pnl_sol = round(real_sol_delta - slice_cost_sol_at_entry, 6)
+                # user-requested: same as _exit() - the alert/logged "@ +X%"
+                # must reflect the actual fill, not the price-tick reading
+                # from before the sell executed
+                pct_change = round((real_sol_delta / slice_cost_sol_at_entry - 1) * 100, 2)
             else:
                 net_pct = net_pct_change_after_fees(pct_change) if pct_change is not None else 0.0
                 pnl_sol = round(slice_cost_sol_at_entry * (net_pct / 100), 6)
