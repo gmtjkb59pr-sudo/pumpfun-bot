@@ -391,7 +391,9 @@ class PumpPortalClient:
             f"status onbekend, behandel als mislukt."
         )
 
-    async def _fetch_real_sol_delta(self, signature: str) -> float | None:
+    async def _fetch_real_sol_delta(
+        self, signature: str, max_attempts: int = 4, retry_delay_sec: float = 0.5,
+    ) -> float | None:
         """Returns the wallet's actual net SOL change from this confirmed
         transaction (postBalance - preBalance for our own account, already
         fee-inclusive since Solana debits the fee from the same balance) -
@@ -404,34 +406,78 @@ class PumpPortalClient:
         fees (only ~24% of it). The rest is real slippage on fast-dying,
         thin-liquidity tokens the flat fee-model has no way to see. This
         gives _exit()/_partial_exit() the actual on-chain proceeds of a
-        sell to compute real pnl_sol from, instead of estimating it."""
+        sell to compute real pnl_sol from, instead of estimating it.
+
+        Real bug found live 2026-08-24, user-reported ("catecoin this is a
+        false log", "wojakius also not correct"): the getTransaction call
+        below specified no commitment level, so it defaulted to
+        "finalized" - a MUCH stricter, slower level than the "confirmed"
+        status _confirm_transaction() already waited for before this is
+        ever called (see that method - it returns as soon as
+        confirmationStatus is "confirmed", not "finalized"). Called only
+        ~100ms after send, "finalized" data for the transaction usually
+        isn't available yet, so this silently returned None almost every
+        time - falling back to the stale PRE-SELL price-tick estimate in
+        outcome_tracker.py's _exit(), instead of failing loudly. Confirmed
+        directly via getTransaction on two real trades tonight: Catecoin
+        was logged as "+40.2%" (est. from a stale tick) when the real
+        on-chain result was roughly -87% (bought 0.012248 SOL, sold back
+        only 0.001615 SOL); WOJAKIUS was logged as "+101.9%" when real
+        proceeds were a real LOSS (bought 0.014879 SOL, sold back 0.008042
+        SOL) - both mislabeled real losses as real gains, which also
+        corrupted every downstream consumer of pct_change: the realized
+        daily pnl total, and sniper_model.py's training labels (WIN_MARGIN_PCT
+        comparison).
+
+        Fixed by requesting "confirmed" explicitly (matching what was
+        already waited for), plus a short retry loop - even "confirmed"
+        can occasionally lag a beat behind getSignatureStatuses on a
+        different RPC replica, and a silent wrong fallback is far more
+        costly than one or two extra 500ms retries."""
         payload = {
             "jsonrpc": "2.0",
             "id": 1,
             "method": "getTransaction",
-            "params": [signature, {"encoding": "json", "maxSupportedTransactionVersion": 0}],
+            "params": [
+                signature,
+                {
+                    "encoding": "json", "maxSupportedTransactionVersion": 0,
+                    "commitment": "confirmed",
+                },
+            ],
         }
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(self.rpc_http_url, json=payload, timeout=10) as resp:
-                    data = await resp.json()
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("Kon transactie %s niet ophalen voor real-delta: %s", signature, exc)
-            return None
+        for attempt in range(max_attempts):
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(self.rpc_http_url, json=payload, timeout=10) as resp:
+                        data = await resp.json()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Kon transactie %s niet ophalen voor real-delta: %s", signature, exc)
+                return None
 
-        result = data.get("result")
-        if not result:
-            return None
-        try:
-            account_keys = result["transaction"]["message"]["accountKeys"]
-            our_key = str(self.keypair.pubkey())
-            idx = account_keys.index(our_key)
-            pre = result["meta"]["preBalances"][idx]
-            post = result["meta"]["postBalances"][idx]
-            return (post - pre) / 1_000_000_000
-        except (KeyError, ValueError, IndexError) as exc:
-            logger.debug("Kon real SOL-delta niet bepalen uit transactie %s: %s", signature, exc)
-            return None
+            result = data.get("result")
+            if result:
+                try:
+                    account_keys = result["transaction"]["message"]["accountKeys"]
+                    our_key = str(self.keypair.pubkey())
+                    idx = account_keys.index(our_key)
+                    pre = result["meta"]["preBalances"][idx]
+                    post = result["meta"]["postBalances"][idx]
+                    return (post - pre) / 1_000_000_000
+                except (KeyError, ValueError, IndexError) as exc:
+                    logger.debug(
+                        "Kon real SOL-delta niet bepalen uit transactie %s: %s", signature, exc,
+                    )
+                    return None
+
+            if attempt < max_attempts - 1:
+                await asyncio.sleep(retry_delay_sec)
+
+        logger.debug(
+            "Transactie %s nog niet zichtbaar via getTransaction na %d pogingen - "
+            "real-delta niet beschikbaar, valt terug op schatting.", signature, max_attempts,
+        )
+        return None
 
     async def _send_raw_transaction(self, raw_tx: bytes) -> str:
         payload = {
