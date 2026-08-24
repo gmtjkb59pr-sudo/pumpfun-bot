@@ -18,7 +18,7 @@ class _FakeAlerter:
         self.sent.append(message)
 
 
-def _make_strategy(*, outcome_tracker=None, cfg=None, client=None, alerter=None):
+def _make_strategy(*, outcome_tracker=None, cfg=None, client=None, alerter=None, dry_run=True):
     risk = RiskManager(RiskConfig())
     return SniperStrategy(
         client=client,
@@ -27,7 +27,7 @@ def _make_strategy(*, outcome_tracker=None, cfg=None, client=None, alerter=None)
         alerter=alerter,
         trade_size_sol=0.03,
         slippage_pct=10,
-        dry_run=True,
+        dry_run=dry_run,
         outcome_tracker=outcome_tracker,
     )
 
@@ -560,6 +560,88 @@ class PreBuyModelScoreGateTests(unittest.TestCase):
             "pumpfun_bot.strategies.sniper.sniper_model.load_model", side_effect=RuntimeError("boom"),
         ):
             strategy._log_shadow_model_score("MINT", "TEST", {})  # must not raise
+
+
+class _FakeOnChainFailClient:
+    """A live buy that fails ON-CHAIN (e.g. Custom 6002 TooMuchSolRequired,
+    a real, common buy-side slippage failure) - still pays a real priority
+    fee, unlike an RPC/network-level failure before the tx ever landed."""
+
+    def __init__(self, events, error):
+        self._events = events
+        self._error = error
+        self.rpc_http_url = "https://example.invalid/rpc"
+
+    async def stream_new_tokens(self):
+        for event in self._events:
+            yield event
+
+    def stream_token_trades(self, mints):
+        async def _stream():
+            await asyncio.sleep(3600)
+            yield {}  # pragma: no cover - never reached, keeps this an async generator
+        return _stream()
+
+    async def build_and_send_trade(self, action, mint, amount_sol, slippage_pct):
+        raise self._error
+
+
+class FailedBuyFeeAccountingTests(unittest.TestCase):
+    """User-requested 2026-08-24 ("the actual profit is not right"): a buy
+    that fails ON-CHAIN still pays a real priority fee - realized_pnl_sol
+    never accounted for this at all before, looking better than reality by
+    the sum of every failed buy's fee."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._path = Path(self._tmpdir.name) / "sniper_seen_launch_names.json"
+        self._patcher = patch(
+            "pumpfun_bot.strategies.sniper.SEEN_LAUNCH_NAMES_PATH", self._path,
+        )
+        self._patcher.start()
+
+    def tearDown(self):
+        self._patcher.stop()
+        self._tmpdir.cleanup()
+
+    def test_an_onchain_buy_failure_registers_a_real_fee_loss(self):
+        from pumpfun_bot.fees import PRIORITY_FEE_SOL_PER_LEG
+        from pumpfun_bot.pumpportal_client import OnChainTransactionError
+
+        error = OnChainTransactionError("Transactie X is gefaald on-chain: ...", custom_error_code=6002)
+        client = _FakeOnChainFailClient(
+            events=[{
+                "mint": "MINT", "name": "Fails", "symbol": "FAIL",
+                "vSolInBondingCurve": 30.0, "traderPublicKey": "CREATOR",
+            }],
+            error=error,
+        )
+        strategy = _make_strategy(
+            cfg=SniperConfig(enabled=True), client=client, alerter=_FakeAlerter(), dry_run=False,
+        )
+
+        asyncio.run(strategy.run())
+
+        self.assertAlmostEqual(strategy.risk.state.realized_pnl_sol, -PRIORITY_FEE_SOL_PER_LEG, places=6)
+        self.assertAlmostEqual(strategy.risk.state.open_exposure_sol, 0.0)  # never registered as opened
+
+    def test_a_non_onchain_failure_does_not_register_a_fee_loss(self):
+        # e.g. an RPC timeout before the transaction ever landed on-chain -
+        # no real fee was paid, nothing to record
+        client = _FakeOnChainFailClient(
+            events=[{
+                "mint": "MINT", "name": "Fails", "symbol": "FAIL",
+                "vSolInBondingCurve": 30.0, "traderPublicKey": "CREATOR",
+            }],
+            error=RuntimeError("simulated network timeout"),
+        )
+        strategy = _make_strategy(
+            cfg=SniperConfig(enabled=True), client=client, alerter=_FakeAlerter(), dry_run=False,
+        )
+
+        asyncio.run(strategy.run())
+
+        self.assertAlmostEqual(strategy.risk.state.realized_pnl_sol, 0.0)
 
 
 if __name__ == "__main__":

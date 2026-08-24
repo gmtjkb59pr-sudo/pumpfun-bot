@@ -14,11 +14,12 @@ from pathlib import Path
 from ..activity_log import DATA_LOG_PATH
 from ..alerts import Alerter
 from ..config import SniperConfig
+from ..fees import PRIORITY_FEE_SOL_PER_LEG
 from ..holder_concentration import fetch_top10_concentration_pct
 from ..holder_count import record_holder_count
 from ..outcome_tracker import OutcomeTracker
 from ..price_ref import extract_price_ref_with_field
-from ..pumpportal_client import PumpPortalClient
+from ..pumpportal_client import OnChainTransactionError, PumpPortalClient
 from ..risk import RiskManager
 from .. import sniper_model
 from ..state import bot_state
@@ -480,8 +481,22 @@ class SniperStrategy:
                         take_profit_ladder=self.cfg.take_profit_ladder,
                         price_ref_field=price_ref_field,
                         metadata_uri=event.get("uri"),
+                        buy_tx_signature=result["signature"],
                     )
             except Exception as exc:  # noqa: BLE001
                 logger.exception("Snipe buy mislukt voor %s: %s", mint, exc)
                 await self.risk.report_buy_result(success=False)
+                if isinstance(exc, OnChainTransactionError):
+                    # user-requested 2026-08-24 ("the actual profit is not
+                    # right"): a buy that fails ON-CHAIN (not e.g. a
+                    # network/RPC error before the transaction ever landed)
+                    # still pays a real priority fee - register_trade_opened
+                    # was never called (still inside the try above it), so
+                    # there's no exposure to release, only a real cost to
+                    # record. Estimate (the configured priority fee, not the
+                    # exact on-chain fee - avoids an extra RPC round-trip on
+                    # the failure path) - realized_pnl_sol never accounted
+                    # for this at all before, looking better than reality by
+                    # the sum of every failed buy's fee.
+                    self.risk.register_trade_closed(0.0, -PRIORITY_FEE_SOL_PER_LEG)
                 await self.alerter.send(f"❌ Snipe mislukt voor {symbol}: {exc}")
