@@ -121,6 +121,16 @@ class SniperStrategy:
         # avoids touching _pre_buy_activity_check's existing str|None return
         # type and the many tests asserting against it directly.
         self._last_activity_window_buy_count: int | None = None
+        # user-requested 2026-08-24: cached for _passes_model_score_gate()
+        # (see that method's docstring) - starts empty/None like
+        # blocked_wallets above, populated by _refresh_background_state_loop
+        # within WALLET_BLOCKLIST_REFRESH_SEC of startup. Rebuilding
+        # creator_win_rates from the full activity log on EVERY candidate
+        # (as _log_shadow_model_score already does, but only for successful
+        # buys - much rarer) would cost real time on sniper's much
+        # higher-volume pre-buy path, working against its whole speed edge.
+        self._creator_win_rates: dict[str, float] = {}
+        self._model: dict | None = None
 
     def _passes_filters(self, event: dict) -> bool:
         # PumpPortal new-token events bevatten o.a. mint, name, symbol, initial
@@ -163,6 +173,32 @@ class SniperStrategy:
 
         return True
 
+    def _pre_buy_model_score(self, meta: dict) -> float | None:
+        """User-requested 2026-08-24: real gate on sniper_model.py's win-
+        probability score, once corrected real trade data showed it beats
+        baseline (66.13% vs 60.64% holdout) and that dead-on-arrival tokens
+        (stale_price) are the single biggest real loss category. Only
+        active when cfg.model_score_min_to_buy > 0 (default 0/off) - see
+        that field's docstring in config.py for the full reasoning and the
+        caution about still-modest training data.
+
+        Uses the CACHED self._model/self._creator_win_rates (refreshed
+        every WALLET_BLOCKLIST_REFRESH_SEC by _refresh_background_state_loop)
+        rather than sniper_model.load_model()/build_creator_win_rates()
+        fresh on every call, unlike _log_shadow_model_score below - this
+        runs on every candidate that reaches this point (much higher
+        volume than "successful buys only"), and rebuilding creator_win_rates
+        from the whole activity log on each one would cost real time on
+        sniper's speed-critical path.
+
+        Returns None (never gates) if no model is cached yet or the
+        candidate is missing a required raw feature - fails OPEN, same
+        philosophy as sniper's other checks (holder_concentration,
+        activity-window)."""
+        if self._model is None:
+            return None
+        return sniper_model.score(meta, self._creator_win_rates, model=self._model)
+
     def _log_shadow_model_score(self, mint: str, symbol: str, meta: dict) -> None:
         """User-requested: computes and logs sniper_model.py's win-
         probability score for this real buy, WITHOUT touching the buy
@@ -188,7 +224,7 @@ class SniperStrategy:
         except Exception:  # noqa: BLE001
             logger.exception("Kon shadow-mode model score niet berekenen voor %s.", mint)
 
-    async def _refresh_blocked_wallets_loop(self) -> None:
+    async def _refresh_background_state_loop(self) -> None:
         while True:
             await asyncio.sleep(WALLET_BLOCKLIST_REFRESH_SEC)
             newly_blocked = blocked_wallets(DATA_LOG_PATH) - self.blocked_wallets
@@ -200,6 +236,13 @@ class SniperStrategy:
                 )
                 logger.warning(message)
                 await self.alerter.send(message)
+
+            if self.cfg.model_score_min_to_buy > 0:
+                try:
+                    self._creator_win_rates = sniper_model.build_creator_win_rates(DATA_LOG_PATH)
+                    self._model = sniper_model.load_model()
+                except Exception:  # noqa: BLE001
+                    logger.exception("Kon model/creator win-rates niet verversen voor de model-gate.")
 
     async def _holder_concentration_flags_risk(self, mint: str) -> bool:
         """user-requested, ported from an earlier version of this bot's
@@ -301,7 +344,13 @@ class SniperStrategy:
         if not self.cfg.enabled:
             return
         logger.info("Sniper strategie gestart (dry_run=%s).", self.dry_run)
-        asyncio.create_task(self._refresh_blocked_wallets_loop())
+        if self.cfg.model_score_min_to_buy > 0:
+            try:
+                self._creator_win_rates = sniper_model.build_creator_win_rates(DATA_LOG_PATH)
+                self._model = sniper_model.load_model()
+            except Exception:  # noqa: BLE001
+                logger.exception("Kon model/creator win-rates niet initieel laden voor de model-gate.")
+        asyncio.create_task(self._refresh_background_state_loop())
 
         async for event in self.client.stream_new_tokens():
             mint = event.get("mint")
@@ -343,6 +392,21 @@ class SniperStrategy:
             initial_buy_pct = (
                 (initial_buy_tokens / DEFAULT_TOTAL_SUPPLY) * 100 if initial_buy_tokens else None
             )
+            creator = event.get("traderPublicKey")
+
+            if self.cfg.model_score_min_to_buy > 0:
+                score = self._pre_buy_model_score({
+                    "liquidity_sol": liquidity_sol, "creator": creator,
+                    "initial_buy_pct": initial_buy_pct,
+                    "activity_window_buy_count": self._last_activity_window_buy_count,
+                })
+                if score is not None and score < self.cfg.model_score_min_to_buy:
+                    logger.info(
+                        "Sniper: %s (%s) geweerd - model score te laag (%.2f < %.2f).",
+                        name, symbol, score, self.cfg.model_score_min_to_buy,
+                    )
+                    continue
+
             ok, reason = self.risk.can_trade(
                 self.trade_size_sol, liquidity_sol, open_positions_count=open_positions_count,
             )
@@ -353,7 +417,6 @@ class SniperStrategy:
             msg = f"🎯 Snipe kandidaat: {name} ({symbol}) - {mint}"
             await self.alerter.send(msg)
 
-            creator = event.get("traderPublicKey")
             if self.dry_run:
                 logger.info("[DRY RUN] Zou kopen: %s SOL van %s", self.trade_size_sol, mint)
                 self.risk.register_trade_opened(self.trade_size_sol)

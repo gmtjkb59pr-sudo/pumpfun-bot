@@ -120,6 +120,22 @@ class SniperConfig:
     # disabled (default). Only takes effect once the window is actually
     # being watched (enable_bundle_check=true or this > 0).
     min_buys_in_window: int = 0
+    # user-requested 2026-08-24: promotes sniper_model.py's win-probability
+    # score from pure shadow-mode logging to an actual pre-buy gate, once
+    # real (corrected) trade data showed it beats baseline (66.13% vs
+    # 60.64% holdout accuracy) and that stale_price (dead-on-arrival) is
+    # the single biggest real loss category (-0.68 SOL of the strategy's
+    # -0.6854 SOL total). Rejects a candidate whose score is BELOW this
+    # threshold (probability of a real win, 0-1). 0 = disabled (default,
+    # matches every other 0-disabled filter here) - stays off unless
+    # deliberately turned on, since sniper_model.py's own docs still note
+    # the training set (a few hundred rows) is below the 1000+ it'd want
+    # before fully trusting a model over the hard filters. Fails OPEN
+    # (never rejects) if no model is trained yet or a candidate is missing
+    # a required raw feature - same fail-open philosophy as sniper's other
+    # checks (holder_concentration, activity-window), prioritizing speed
+    # over blocking on an inconclusive read.
+    model_score_min_to_buy: float = 0
 
 
 @dataclass
@@ -460,6 +476,7 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         bundle_check_window_ms=sniper_raw.get("bundle_check_window_ms", 300),
         bundle_check_max_buys=sniper_raw.get("bundle_check_max_buys", 5),
         min_buys_in_window=sniper_raw.get("min_buys_in_window", 0),
+        model_score_min_to_buy=sniper_raw.get("model_score_min_to_buy", 0),
     )
 
     sw_raw = strat_raw.get("social_watch", {})
