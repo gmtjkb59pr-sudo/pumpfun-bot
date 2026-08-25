@@ -191,6 +191,26 @@ def _make_tuner(**kwargs):
 
 
 class ApplyTests(unittest.TestCase):
+    """Real bug found live 2026-08-25, while verifying restore_persisted_
+    changes actually worked: _apply() calls the module-level append_jsonl()
+    unconditionally (it does NOT respect self.log_path - that's only ever
+    used for the READ side, via compute_stats/decide_min_holder_count),
+    which always writes to the real DATA_LOG_PATH. These two tests call
+    _apply() directly without patching it, so every test run was silently
+    appending a bogus 'reason: "test"' autotune_change record into the
+    REAL data/activity_log.jsonl - confirmed live: dozens of these,
+    matching how often this test file ran across one long session, and
+    restore_persisted_changes (added the same night) then read that fake
+    data back and used it to override real min_holder_count/birdeye_
+    movers_min_holder_count config on a real bot startup. Patching
+    append_jsonl here is the fix - _apply()'s own in-memory mutation
+    behavior is still exercised exactly as before."""
+
+    def setUp(self):
+        patcher = patch("pumpfun_bot.auto_tuner.append_jsonl")
+        self.addCleanup(patcher.stop)
+        patcher.start()
+
     def test_routes_birdeye_movers_min_holder_count_to_its_own_config(self):
         birdeye_cfg = SimpleNamespace(min_holder_count=1)
         social_cfg = SimpleNamespace(min_holder_count=1)
