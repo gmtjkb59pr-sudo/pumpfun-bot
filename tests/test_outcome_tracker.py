@@ -83,6 +83,7 @@ class FakeClient:
     def __init__(
         self, *, should_fail=False, signature="fake_sig", fail_at_amount_pcts=None,
         real_sol_delta=None, buy_real_sol_delta=None,
+        real_token_amount=None, should_fail_by_amount=False,
     ):
         self.should_fail = should_fail
         # user-requested 2026-08-24: simulates
@@ -110,6 +111,15 @@ class FakeClient:
         # (no real_sol_delta key from the real client until this was added),
         # falling back to the fee-model estimate unchanged
         self.real_sol_delta = real_sol_delta
+        # user-requested 2026-08-25 ("how can we improve the baseline" ->
+        # "build") - simulates PumpPortalClient._fetch_real_token_amount's
+        # result (None matches every pre-existing test: no absolute-amount
+        # sell attempted, unchanged percentage-based behavior) and the
+        # absolute-amount sell path itself, see build_and_send_full_sell_
+        # by_amount_calls/should_fail_by_amount below
+        self.real_token_amount = real_token_amount
+        self.should_fail_by_amount = should_fail_by_amount
+        self.build_and_send_full_sell_by_amount_calls = []
 
     async def build_and_send_full_sell(self, mint, slippage_pct, amount_pct=100, priority_fee_sol=None):
         self.sell_calls.append((mint, slippage_pct, amount_pct))
@@ -147,9 +157,23 @@ class FakeClient:
             "real_sol_delta": self.real_sol_delta if action == "sell" else None,
         }
 
+    async def build_and_send_full_sell_by_amount(
+        self, mint, token_amount, slippage_pct, priority_fee_sol=None,
+    ):
+        self.build_and_send_full_sell_by_amount_calls.append((mint, token_amount, slippage_pct))
+        if self.should_fail_by_amount:
+            raise RuntimeError("simulated absolute-amount sell failure")
+        return {
+            "signature": self.signature, "action": "sell", "mint": mint, "amount": token_amount,
+            "real_sol_delta": self.real_sol_delta,
+        }
+
     async def _fetch_real_sol_delta(self, signature):
         self.fetch_real_sol_delta_calls.append(signature)
         return self.buy_real_sol_delta
+
+    async def _fetch_real_token_amount(self, signature, mint):
+        return self.real_token_amount
 
 
 class PerPositionThresholdTests(unittest.TestCase):
@@ -782,6 +806,106 @@ class MinSellDelayTests(unittest.TestCase):
         self.assertTrue(allowed_now)  # immediate - no leftover cooldown wait
 
 
+class AbsoluteAmountSellTests(unittest.TestCase):
+    """User-requested 2026-08-25 ("how can we improve the baseline" ->
+    "build") - real 8h live data found 76% of all sniper exits held for
+    exactly the 15-18s MIN_SELL_DELAY_SEC floor, by which point take_profit
+    itself (previously the ONE exit reason with a proven real edge,
+    +28%/trade) had flipped to -23.2%/trade. Once the buy's exact on-chain
+    token amount is known (real_token_amount, populated in the background
+    by _fetch_real_token_amount_bg), a sell can specify that amount
+    directly and skip MIN_SELL_DELAY_SEC entirely - see
+    build_and_send_full_sell_by_amount's docstring for why that doesn't
+    need PumpPortal's balance index to catch up."""
+
+    def _make_tracker(self, *, entry_ts: float, client, real_token_amount=None):
+        risk = RiskManager(RiskConfig())
+        risk.register_trade_opened(0.05)
+        tracker = OutcomeTracker(
+            ws_url="wss://example.invalid", risk=risk, client=client, dry_run=False,
+            take_profit_pct=50.0,
+        )
+        tracker._pending["MINT"] = {
+            "entry_ts": entry_ts,
+            "entry_ref": 100.0,
+            "last_ref": 100.0,
+            "peak_ref": 100.0,
+            "name": "Test Token",
+            "symbol": "TEST",
+            "trade_size_sol": 0.05,
+            "hit": set(),
+            "has_real_update": False,
+            "real_token_amount": real_token_amount,
+        }
+        return tracker, risk
+
+    def test_sells_immediately_when_real_token_amount_is_already_known(self):
+        client = FakeClient(signature="sig")
+        tracker, risk = self._make_tracker(
+            entry_ts=time.time(), client=client, real_token_amount=1_500_000,
+        )
+        asyncio.run(tracker._handle_price_update("MINT", 151.0))  # +51%, crosses TP
+
+        self.assertEqual(client.build_and_send_full_sell_by_amount_calls, [("MINT", 1_500_000, 10.0)])
+        self.assertEqual(client.sell_calls, [])  # percentage path never touched
+        self.assertNotIn("MINT", tracker._pending)  # closed, not deferred
+
+    def test_still_defers_when_real_token_amount_is_not_yet_known(self):
+        # background fetch (_fetch_real_token_amount_bg) hasn't resolved
+        # yet - unchanged pre-existing behavior, must not regress
+        client = FakeClient(signature="sig")
+        tracker, risk = self._make_tracker(
+            entry_ts=time.time(), client=client, real_token_amount=None,
+        )
+        asyncio.run(tracker._handle_price_update("MINT", 151.0))
+
+        self.assertEqual(client.build_and_send_full_sell_by_amount_calls, [])
+        self.assertEqual(client.sell_calls, [])
+        self.assertIn("MINT", tracker._pending)
+
+    def test_falls_back_to_percentage_sell_if_amount_sell_fails_past_the_floor(self):
+        client = FakeClient(signature="sig", should_fail_by_amount=True)
+        tracker, risk = self._make_tracker(
+            entry_ts=time.time() - MIN_SELL_DELAY_SEC - 1,  # floor already passed
+            client=client, real_token_amount=1_500_000,
+        )
+        asyncio.run(tracker._handle_price_update("MINT", 151.0))
+
+        self.assertEqual(len(client.build_and_send_full_sell_by_amount_calls), 1)  # tried first
+        self.assertEqual(len(client.sell_calls), 1)  # then fell back and succeeded
+        self.assertNotIn("MINT", tracker._pending)
+
+    def test_defers_rather_than_double_spending_a_fee_before_the_floor(self):
+        # the percentage path would fail identically before the floor - no
+        # point burning a second real fee on a doomed fallback attempt
+        client = FakeClient(signature="sig", should_fail_by_amount=True)
+        tracker, risk = self._make_tracker(
+            entry_ts=time.time(),  # well before MIN_SELL_DELAY_SEC
+            client=client, real_token_amount=1_500_000,
+        )
+        asyncio.run(tracker._handle_price_update("MINT", 151.0))
+
+        self.assertEqual(len(client.build_and_send_full_sell_by_amount_calls), 1)
+        self.assertEqual(client.sell_calls, [])  # no fallback attempt yet
+        self.assertIn("MINT", tracker._pending)  # still open, will retry
+
+    def test_exit_attempt_allowed_bypasses_the_floor_once_amount_is_known(self):
+        client = FakeClient(signature="sig")
+        tracker, risk = self._make_tracker(
+            entry_ts=time.time(), client=client, real_token_amount=1_500_000,
+        )
+        info = tracker._pending["MINT"]
+        self.assertTrue(tracker._exit_attempt_allowed(info))
+
+    def test_exit_attempt_allowed_still_gates_on_the_floor_without_amount(self):
+        client = FakeClient(signature="sig")
+        tracker, risk = self._make_tracker(
+            entry_ts=time.time(), client=client, real_token_amount=None,
+        )
+        info = tracker._pending["MINT"]
+        self.assertFalse(tracker._exit_attempt_allowed(info))
+
+
 class RunLoopResilienceTests(unittest.TestCase):
     """This loop manages real, live positions - a bug in any single
     connection attempt (confirmed live: a TypeError in post-exit checkpoint
@@ -1302,6 +1426,36 @@ class ScamSocialCheckExitTests(unittest.TestCase):
             asyncio.run(tracker._check_socials_and_maybe_exit("GONE_MINT", "https://example.invalid/meta.json"))
 
         self.assertEqual(client.sell_calls, [])  # nothing to sell, no crash
+
+    def test_sells_immediately_without_waiting_when_real_token_amount_is_known(self):
+        # user-requested 2026-08-25 ("how can we improve the baseline" ->
+        # "build") - real_token_amount sidesteps PumpPortal's balance
+        # index, so this force-sell shouldn't wait out MIN_SELL_DELAY_SEC
+        # at all, unlike test_sus_links_force_sells_and_untracks_the_
+        # position above (which manually rewinds entry_ts instead, since
+        # without real_token_amount the wait still applies)
+        risk = RiskManager(RiskConfig())
+        risk.register_trade_opened(0.03)
+        client = FakeClient(real_token_amount=1_500_000)
+        tracker = OutcomeTracker(ws_url="wss://example.invalid", risk=risk, client=client, dry_run=False)
+        asyncio.run(tracker.track("MINT", "Scammy", "SCAM", 100.0, trade_size_sol=0.03))
+        tracker._pending["MINT"]["real_token_amount"] = 1_500_000  # fresh entry_ts, well inside the floor
+
+        async def _fake_fetch(uri):
+            return {"twitter": "https://example.invalid/fake"}
+
+        async def _fake_evaluate(links):
+            return True, "twitter-link ziet er nep uit"
+
+        with patch("pumpfun_bot.outcome_tracker.fetch_social_links", _fake_fetch), \
+             patch("pumpfun_bot.outcome_tracker.evaluate_social_links", _fake_evaluate), \
+             patch("pumpfun_bot.outcome_tracker.record_scam_links"), \
+             patch("pumpfun_bot.outcome_tracker.asyncio.sleep") as mock_sleep:
+            asyncio.run(tracker._check_socials_and_maybe_exit("MINT", "https://example.invalid/meta.json"))
+
+        mock_sleep.assert_not_called()  # no MIN_SELL_DELAY_SEC wait
+        self.assertNotIn("MINT", tracker._pending)
+        self.assertEqual(client.build_and_send_full_sell_by_amount_calls[0][:2], ("MINT", 1_500_000))
 
 
 class DoubleExitRaceTests(unittest.TestCase):
@@ -2375,6 +2529,94 @@ class RealBuyCostBasisTests(unittest.TestCase):
         asyncio.run(tracker._handle_price_update("MINT", 151.0))
 
         self.assertAlmostEqual(risk.state.open_exposure_sol, 0.0)
+
+
+class RealTokenAmountBgTests(unittest.TestCase):
+    """User-requested 2026-08-25 ("how can we improve the baseline" ->
+    "build") - mirrors RealBuyCostBasisTests' own tests exactly:
+    _fetch_real_token_amount_bg fetches the buy's exact on-chain token
+    amount in the background right after a real buy, populating
+    real_token_amount so a later exit can skip MIN_SELL_DELAY_SEC (see
+    AbsoluteAmountSellTests)."""
+
+    def _make_tracker(self, *, client, entry_ref=100.0, trade_size_sol=0.05):
+        risk = RiskManager(RiskConfig())
+        risk.register_trade_opened(trade_size_sol)
+        tracker = OutcomeTracker(
+            ws_url="wss://example.invalid", risk=risk, client=client, dry_run=False,
+            take_profit_pct=50.0,
+        )
+        tracker._pending["MINT"] = {
+            "entry_ts": time.time() - 100, "entry_ref": entry_ref, "last_ref": entry_ref,
+            "peak_ref": entry_ref, "name": "Test", "symbol": "TEST", "trade_size_sol": trade_size_sol,
+            "hit": set(), "has_real_update": False, "real_token_amount": None,
+        }
+        return tracker, risk
+
+    def test_fetch_real_token_amount_bg_populates_the_pending_position(self):
+        client = FakeClient(real_token_amount=1_500_000)
+        tracker, _ = self._make_tracker(client=client)
+
+        asyncio.run(tracker._fetch_real_token_amount_bg("MINT", "buy_sig"))
+
+        self.assertEqual(tracker._pending["MINT"]["real_token_amount"], 1_500_000)
+
+    def test_fetch_real_token_amount_bg_ignores_a_none_or_zero_amount(self):
+        for bad_amount in (None, 0):
+            with self.subTest(bad_amount=bad_amount):
+                client = FakeClient(real_token_amount=bad_amount)
+                tracker, _ = self._make_tracker(client=client)
+
+                asyncio.run(tracker._fetch_real_token_amount_bg("MINT", "buy_sig"))
+
+                self.assertIsNone(tracker._pending["MINT"]["real_token_amount"])
+
+    def test_fetch_real_token_amount_bg_is_a_no_op_if_the_position_already_closed(self):
+        client = FakeClient(real_token_amount=1_500_000)
+        tracker, _ = self._make_tracker(client=client)
+        del tracker._pending["MINT"]  # simulates a fast in-and-out trade
+
+        asyncio.run(tracker._fetch_real_token_amount_bg("MINT", "buy_sig"))  # must not raise
+
+        self.assertNotIn("MINT", tracker._pending)
+
+    def test_track_schedules_the_background_fetch_for_a_real_buy(self):
+        client = FakeClient()
+        risk = RiskManager(RiskConfig())
+        tracker = OutcomeTracker(ws_url="wss://example.invalid", risk=risk, client=client, dry_run=False)
+
+        with patch.object(tracker, "_fetch_real_token_amount_bg") as mock_fetch:
+            async def _noop(*args, **kwargs):
+                return None
+            mock_fetch.side_effect = _noop
+            asyncio.run(tracker.track(
+                "MINT", "Test", "TEST", entry_ref=100.0, trade_size_sol=0.05,
+                buy_tx_signature="buy_sig",
+            ))
+        mock_fetch.assert_called_once_with("MINT", "buy_sig")
+
+    def test_track_does_not_schedule_the_fetch_in_dry_run(self):
+        client = FakeClient()
+        risk = RiskManager(RiskConfig())
+        tracker = OutcomeTracker(ws_url="wss://example.invalid", risk=risk, client=client, dry_run=True)
+
+        with patch.object(tracker, "_fetch_real_token_amount_bg") as mock_fetch:
+            asyncio.run(tracker.track(
+                "MINT", "Test", "TEST", entry_ref=100.0, trade_size_sol=0.05,
+                buy_tx_signature="buy_sig",
+            ))
+        mock_fetch.assert_not_called()
+
+    def test_track_does_not_schedule_the_fetch_without_a_signature(self):
+        client = FakeClient()
+        risk = RiskManager(RiskConfig())
+        tracker = OutcomeTracker(ws_url="wss://example.invalid", risk=risk, client=client, dry_run=False)
+
+        with patch.object(tracker, "_fetch_real_token_amount_bg") as mock_fetch:
+            asyncio.run(tracker.track(
+                "MINT", "Test", "TEST", entry_ref=100.0, trade_size_sol=0.05,
+            ))
+        mock_fetch.assert_not_called()
 
 
 class SellFailurePauseTests(unittest.TestCase):

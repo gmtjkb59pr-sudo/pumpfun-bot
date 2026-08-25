@@ -318,6 +318,181 @@ class FetchRealSolDeltaTests(unittest.TestCase):
         self.assertIsNone(delta)
 
 
+class FetchRealTokenAmountTests(unittest.TestCase):
+    """User-requested 2026-08-25 ("how can we improve the baseline" ->
+    "build") - real 8h live data found take_profit (previously the ONE
+    proven exit reason) had flipped to -23.2%/trade, traced to
+    MIN_SELL_DELAY_SEC forcing a ~15-18s blind hold on every position
+    while PumpPortal's balance index catches up for a percentage-based
+    sell. This fetches the EXACT token amount a buy actually received
+    on-chain, so a later sell can specify that amount directly instead
+    - see build_and_send_full_sell_by_amount's docstring."""
+
+    def _make_client(self):
+        return PumpPortalClient(
+            ws_url="wss://example.invalid",
+            trade_api_url="https://example.invalid/trade-local",
+            rpc_http_url="https://example.invalid/rpc",
+            keypair=Keypair(),
+        )
+
+    def test_computes_the_wallets_own_token_balance_delta(self):
+        client = self._make_client()
+        our_key = str(client.keypair.pubkey())
+        response = {
+            "result": {
+                "meta": {
+                    "preTokenBalances": [],
+                    "postTokenBalances": [
+                        {"owner": our_key, "mint": "MINT123", "uiTokenAmount": {"amount": "1500000"}},
+                    ],
+                },
+            },
+        }
+        session = _FakeSession([response])
+        with patch("pumpfun_bot.pumpportal_client.aiohttp.ClientSession", return_value=session):
+            amount = asyncio.run(client._fetch_real_token_amount("SIG", "MINT123"))
+        self.assertEqual(amount, 1_500_000)
+
+    def test_subtracts_any_preexisting_balance_of_the_same_mint(self):
+        client = self._make_client()
+        our_key = str(client.keypair.pubkey())
+        response = {
+            "result": {
+                "meta": {
+                    "preTokenBalances": [
+                        {"owner": our_key, "mint": "MINT123", "uiTokenAmount": {"amount": "200000"}},
+                    ],
+                    "postTokenBalances": [
+                        {"owner": our_key, "mint": "MINT123", "uiTokenAmount": {"amount": "1700000"}},
+                    ],
+                },
+            },
+        }
+        session = _FakeSession([response])
+        with patch("pumpfun_bot.pumpportal_client.aiohttp.ClientSession", return_value=session):
+            amount = asyncio.run(client._fetch_real_token_amount("SIG", "MINT123"))
+        self.assertEqual(amount, 1_500_000)
+
+    def test_ignores_other_wallets_and_other_mints(self):
+        client = self._make_client()
+        our_key = str(client.keypair.pubkey())
+        response = {
+            "result": {
+                "meta": {
+                    "preTokenBalances": [],
+                    "postTokenBalances": [
+                        {"owner": "SOME_OTHER_WALLET", "mint": "MINT123", "uiTokenAmount": {"amount": "9999999"}},
+                        {"owner": our_key, "mint": "DIFFERENT_MINT", "uiTokenAmount": {"amount": "8888888"}},
+                        {"owner": our_key, "mint": "MINT123", "uiTokenAmount": {"amount": "42"}},
+                    ],
+                },
+            },
+        }
+        session = _FakeSession([response])
+        with patch("pumpfun_bot.pumpportal_client.aiohttp.ClientSession", return_value=session):
+            amount = asyncio.run(client._fetch_real_token_amount("SIG", "MINT123"))
+        self.assertEqual(amount, 42)
+
+    def test_returns_none_when_our_account_never_appears_in_post_balances(self):
+        client = self._make_client()
+        response = {
+            "result": {
+                "meta": {"preTokenBalances": [], "postTokenBalances": []},
+            },
+        }
+        session = _FakeSession([response])
+        with patch("pumpfun_bot.pumpportal_client.aiohttp.ClientSession", return_value=session):
+            amount = asyncio.run(client._fetch_real_token_amount("SIG", "MINT123"))
+        self.assertIsNone(amount)
+
+    def test_returns_none_when_the_transaction_is_not_found(self):
+        client = self._make_client()
+        session = _FakeSession([{"result": None}])
+        with patch(
+            "pumpfun_bot.pumpportal_client.aiohttp.ClientSession", return_value=session,
+        ), patch("pumpfun_bot.pumpportal_client.asyncio.sleep", new=_fast_sleep):
+            amount = asyncio.run(client._fetch_real_token_amount("SIG", "MINT123", retry_delay_sec=0))
+        self.assertIsNone(amount)
+        self.assertEqual(session.call_count, 4)
+
+    def test_returns_none_on_fetch_exception(self):
+        client = self._make_client()
+
+        class _RaisingSession:
+            def post(self, url, json=None, timeout=None):
+                raise TimeoutError("simulated timeout")
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+        with patch("pumpfun_bot.pumpportal_client.aiohttp.ClientSession", return_value=_RaisingSession()):
+            amount = asyncio.run(client._fetch_real_token_amount("SIG", "MINT123"))
+        self.assertIsNone(amount)
+
+
+class BuildAndSendFullSellByAmountTests(unittest.TestCase):
+    """Verifies the exact request body for the absolute-amount sell path -
+    "amount" must be the raw integer token count, NOT a percentage string,
+    since the whole point is skipping PumpPortal's own balance-index
+    lookup (see build_and_send_full_sell_by_amount's docstring)."""
+
+    def _make_client(self):
+        return PumpPortalClient(
+            ws_url="wss://example.invalid",
+            trade_api_url="https://example.invalid/trade-local",
+            rpc_http_url="https://example.invalid/rpc",
+            keypair=Keypair(),
+        )
+
+    def test_sends_the_raw_integer_amount_not_a_percentage(self):
+        client = self._make_client()
+        captured = {}
+
+        async def fake_sign_and_send(body):
+            captured.update(body)
+            return "fake_signature"
+
+        client._sign_and_send = fake_sign_and_send
+        client._fetch_real_sol_delta = lambda sig: asyncio.sleep(0, result=None)
+
+        result = asyncio.run(
+            client.build_and_send_full_sell_by_amount(
+                mint="MINT123", token_amount=1_500_000, slippage_pct=10,
+            )
+        )
+
+        self.assertEqual(captured["action"], "sell")
+        self.assertEqual(captured["amount"], 1_500_000)
+        self.assertIsInstance(captured["amount"], int)
+        self.assertEqual(captured["denominatedInSol"], "false")
+        self.assertEqual(captured["mint"], "MINT123")
+        self.assertEqual(result["signature"], "fake_signature")
+        self.assertEqual(result["amount"], 1_500_000)
+
+    def test_defaults_to_pool_auto(self):
+        client = self._make_client()
+        captured = {}
+
+        async def fake_sign_and_send(body):
+            captured.update(body)
+            return "fake_signature"
+
+        client._sign_and_send = fake_sign_and_send
+        client._fetch_real_sol_delta = lambda sig: asyncio.sleep(0, result=None)
+
+        asyncio.run(
+            client.build_and_send_full_sell_by_amount(
+                mint="MINT123", token_amount=1_500_000, slippage_pct=10,
+            )
+        )
+
+        self.assertEqual(captured["pool"], "auto")
+
+
 class RealSolDeltaWiringTests(unittest.TestCase):
     """A sell's result must carry the real delta (used by outcome_tracker.py
     for ground-truth pnl); a buy must NOT trigger the extra lookup at all -
