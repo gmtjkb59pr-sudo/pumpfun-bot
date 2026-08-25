@@ -706,6 +706,145 @@ class PumpPortalClient:
         )
         return None
 
+    async def _fetch_real_token_amount(
+        self, signature: str, mint: str, max_attempts: int = 4, retry_delay_sec: float = 0.5,
+    ) -> int | None:
+        """Returns the exact number of raw base-unit tokens this wallet
+        actually received from a confirmed buy transaction (postAmount -
+        preAmount for our own token account, from meta.postTokenBalances/
+        preTokenBalances - present regardless of the "json" encoding used
+        below, same as meta.postBalances/preBalances in
+        _fetch_real_sol_delta). None if the lookup fails or our account
+        isn't present in either balance list.
+
+        User-requested 2026-08-25 ("build" - absolute-amount sell) - feeds
+        OutcomeTracker._fetch_real_token_amount_bg, which lets a later
+        exit sell this EXACT on-chain-confirmed amount (see
+        build_and_send_full_sell_by_amount) instead of a PumpPortal-index-
+        dependent percentage, sidestepping MIN_SELL_DELAY_SEC entirely.
+        Mirrors _fetch_real_sol_delta's retry/commitment reasoning
+        exactly - same "confirmed" vs "finalized" bug class is possible
+        here too."""
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getTransaction",
+            "params": [
+                signature,
+                {
+                    "encoding": "json", "maxSupportedTransactionVersion": 0,
+                    "commitment": "confirmed",
+                },
+            ],
+        }
+        our_key = str(self.keypair.pubkey())
+        for attempt in range(max_attempts):
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(self.rpc_http_url, json=payload, timeout=10) as resp:
+                        data = await resp.json()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Kon transactie %s niet ophalen voor token-amount: %s", signature, exc)
+                return None
+
+            result = data.get("result")
+            if result:
+                try:
+                    meta = result["meta"]
+                    pre_balances = meta.get("preTokenBalances") or []
+                    post_balances = meta.get("postTokenBalances") or []
+                    pre_amount = next(
+                        (
+                            int(b["uiTokenAmount"]["amount"]) for b in pre_balances
+                            if b.get("owner") == our_key and b.get("mint") == mint
+                        ),
+                        0,
+                    )
+                    post_amount = next(
+                        (
+                            int(b["uiTokenAmount"]["amount"]) for b in post_balances
+                            if b.get("owner") == our_key and b.get("mint") == mint
+                        ),
+                        None,
+                    )
+                    if post_amount is None:
+                        return None
+                    return post_amount - pre_amount
+                except (KeyError, ValueError, TypeError) as exc:
+                    logger.debug(
+                        "Kon real token-amount niet bepalen uit transactie %s: %s", signature, exc,
+                    )
+                    return None
+
+            if attempt < max_attempts - 1:
+                await asyncio.sleep(retry_delay_sec)
+
+        logger.debug(
+            "Transactie %s nog niet zichtbaar via getTransaction na %d pogingen - "
+            "real token-amount niet beschikbaar.", signature, max_attempts,
+        )
+        return None
+
+    async def build_and_send_full_sell_by_amount(
+        self,
+        mint: str,
+        token_amount: int,
+        slippage_pct: float,
+        priority_fee_sol: float = PRIORITY_FEE_SOL_PER_LEG,
+        pool: str = "auto",
+    ) -> dict:
+        """Sells an EXACT, absolute token quantity (raw base units,
+        integer) - "amount": <int> with denominatedInSol: "false", per
+        PumpPortal's Local Trading API docs
+        (https://pumpportal.fun/local-trading-api/trading-api - amount
+        accepts either a percentage string like "100%" or a raw integer
+        quantity). Unlike build_and_send_full_sell's percentage form,
+        this does NOT ask PumpPortal to resolve "what does this wallet
+        currently hold" against their OWN indexed balance -
+        MIN_SELL_DELAY_SEC (outcome_tracker.py) exists ONLY because that
+        percentage lookup reliably returns SellZeroAmount before their
+        index catches up with a real buy (confirmed live). An absolute
+        amount sourced from our OWN on-chain buy result (see
+        OutcomeTracker._fetch_real_token_amount_bg) sidesteps that
+        dependency, in principle allowing a real sell almost immediately
+        after the buy itself confirms.
+
+        User-requested 2026-08-25 ("how can we improve the baseline") -
+        real 8h live data found 76% of ALL sniper exits held for exactly
+        the 15-18s MIN_SELL_DELAY_SEC floor, by which point a fast-dying
+        pump.fun curve had usually already reversed hard - take_profit
+        itself (previously the ONE exit reason with a proven real edge,
+        +28%/trade over 87 trades) had flipped to -23.2%/trade in that
+        window, and 14 of 16 take_profit-labeled exits were actually
+        losses once the real fill landed.
+
+        NOT YET CONFIRMED to actually bypass PumpPortal's own internal
+        validation - they may still check the requested amount against
+        their own index regardless of format, in which case this fails
+        exactly like the percentage form does today. The caller
+        (OutcomeTracker._exit) must treat any failure here as "not yet
+        sellable" and fall back to the proven percentage-based
+        build_and_send_full_sell once MIN_SELL_DELAY_SEC has elapsed -
+        same "log/test before trusting" discipline as every other speed
+        change this session (see jito.py's RECOMMENDED_TIP_SOL docstring
+        for the precedent)."""
+        body = {
+            "publicKey": str(self.keypair.pubkey()),
+            "action": "sell",
+            "mint": mint,
+            "amount": token_amount,
+            "denominatedInSol": "false",
+            "slippage": slippage_pct,
+            "priorityFee": priority_fee_sol,
+            "pool": pool,
+        }
+        sig = await self._sign_and_send_with_migration_retry(body)
+        real_sol_delta = await self._fetch_real_sol_delta(sig)
+        return {
+            "signature": sig, "action": "sell", "mint": mint, "amount": token_amount,
+            "real_sol_delta": real_sol_delta,
+        }
+
     async def _send_raw_transaction(self, raw_tx: bytes) -> str:
         payload = {
             "jsonrpc": "2.0",

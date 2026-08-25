@@ -535,6 +535,12 @@ class OutcomeTracker:
                 # trade_size_sol instead" (dry-run, lookup still pending, or
                 # lookup failed), see _exit()/_partial_exit()
                 "real_cost_sol": None,
+                # populated in the background by _fetch_real_token_amount_bg
+                # once (if) the lookup succeeds - None means "no confirmed
+                # on-chain amount yet, use the normal percentage-based sell
+                # and its MIN_SELL_DELAY_SEC wait" - see that method's
+                # docstring and build_and_send_full_sell_by_amount's
+                "real_token_amount": None,
             }
             self._persist_pending()
 
@@ -542,6 +548,7 @@ class OutcomeTracker:
             asyncio.create_task(self._check_socials_and_maybe_exit(mint, metadata_uri))
         if buy_tx_signature and not self.dry_run:
             asyncio.create_task(self._fetch_real_buy_cost(mint, buy_tx_signature))
+            asyncio.create_task(self._fetch_real_token_amount_bg(mint, buy_tx_signature))
 
     async def _fetch_real_buy_cost(self, mint: str, tx_signature: str) -> None:
         """Fires in the background right after a real buy, never blocking
@@ -562,6 +569,28 @@ class OutcomeTracker:
             info = self._pending.get(mint)
             if info is not None:
                 info["real_cost_sol"] = -delta
+
+    async def _fetch_real_token_amount_bg(self, mint: str, tx_signature: str) -> None:
+        """Fires in the background right after a real buy, never blocking
+        the buy itself - same reasoning as _fetch_real_buy_cost. Fetches
+        the EXACT number of tokens this buy actually received on-chain,
+        so a later exit can sell that precise absolute amount instead of
+        a PumpPortal-index-dependent percentage - see
+        build_and_send_full_sell_by_amount's docstring for why this lets
+        an exit skip MIN_SELL_DELAY_SEC entirely once this resolves. If
+        the position has already closed by the time this resolves, or
+        the lookup itself fails/returns nothing, there's nothing to
+        update - not an error, the normal percentage-based sell path
+        (unchanged) remains the fallback either way."""
+        if self.client is None:
+            return
+        amount = await self.client._fetch_real_token_amount(tx_signature, mint)
+        if amount is None or amount <= 0:
+            return
+        async with self._lock:
+            info = self._pending.get(mint)
+            if info is not None:
+                info["real_token_amount"] = amount
 
     async def _check_socials_and_maybe_exit(self, mint: str, metadata_uri: str) -> None:
         """Background task kicked off by track() right after a real buy -
@@ -590,10 +619,15 @@ class OutcomeTracker:
             # without this wait a fast-confirmed scam would silently defer
             # its own forced exit and never actually retry it, since
             # "scam_socials" isn't a condition the normal per-tick exit
-            # evaluation loop re-checks on its own.
-            wait_sec = MIN_SELL_DELAY_SEC - (time.time() - info["entry_ts"])
-            if wait_sec > 0:
-                await asyncio.sleep(wait_sec)
+            # evaluation loop re-checks on its own. Skipped entirely once
+            # real_token_amount is already known (see
+            # build_and_send_full_sell_by_amount's docstring) - that path
+            # doesn't depend on PumpPortal's index, so there's nothing to
+            # wait for.
+            if info.get("real_token_amount") is None:
+                wait_sec = MIN_SELL_DELAY_SEC - (time.time() - info["entry_ts"])
+                if wait_sec > 0:
+                    await asyncio.sleep(wait_sec)
 
             message = f"🚩 Verdachte socials voor {info.get('symbol', mint)}: {reason} - direct verkocht."
             logger.warning(message)
@@ -1191,10 +1225,19 @@ class OutcomeTracker:
         wait out the FULL EXIT_RETRY_COOLDOWN_SEC from that deferred, never-
         actually-attempted check, instead of retrying the moment
         MIN_SELL_DELAY_SEC itself elapsed - adding up to ~10s of pure dead
-        time to a real, already-decided sell for no benefit."""
+        time to a real, already-decided sell for no benefit.
+
+        The MIN_SELL_DELAY_SEC floor itself is skipped once
+        real_token_amount is already known - see
+        build_and_send_full_sell_by_amount's docstring for why that path
+        doesn't need PumpPortal's balance index to catch up at all."""
         if info.get("sell_paused"):
             return False
-        if not self.dry_run and time.time() - info["entry_ts"] < MIN_SELL_DELAY_SEC:
+        if (
+            not self.dry_run
+            and info.get("real_token_amount") is None
+            and time.time() - info["entry_ts"] < MIN_SELL_DELAY_SEC
+        ):
             return False
         last_attempt = info.get("last_exit_attempt_ts", 0)
         if time.time() - last_attempt < EXIT_RETRY_COOLDOWN_SEC:
@@ -1307,7 +1350,8 @@ class OutcomeTracker:
                 )
                 return False
             time_since_entry = time.time() - info["entry_ts"]
-            if time_since_entry < MIN_SELL_DELAY_SEC:
+            real_token_amount = info.get("real_token_amount")
+            if real_token_amount is None and time_since_entry < MIN_SELL_DELAY_SEC:
                 # PumpPortal's own balance index needs a moment to catch up
                 # with our buy - a "sell 100%" quote built before that
                 # reliably comes back as SellZeroAmount (confirmed directly
@@ -1315,6 +1359,9 @@ class OutcomeTracker:
                 # real fee to fail. Skip the doomed attempt entirely rather
                 # than submit-and-fail; the caller's retry cooldown already
                 # means we'll try again shortly, once this floor has passed.
+                # Skipped once real_token_amount is known (see
+                # build_and_send_full_sell_by_amount's docstring) - that
+                # path is tried below regardless of this floor.
                 logger.debug(
                     "Sell voor %s uitgesteld - pas %.0fs sinds aankoop, "
                     "PumpPortal's eigen index heeft nog niet bijgewerkt (min %ds).",
@@ -1327,31 +1374,70 @@ class OutcomeTracker:
                 # above), not necessarily the original trade_size_sol if
                 # earlier ladder rungs already sold some of it
                 trade_size_sol_being_sold = info["trade_size_sol"] * remaining_fraction
-                if self._should_use_jito_bundle(reason, trade_size_sol_being_sold):
-                    # user-requested 2026-08-24 ("yes build if you think it
-                    # will make the bot better") - guarantees atomic
-                    # same-slot inclusion instead of racing other bots on
-                    # the public mempool, targeting the same real
-                    # slippage gap priority_fee_sol_for_sell above already
-                    # addresses more cheaply - see
-                    # build_and_send_full_sell_via_jito_bundle's docstring
-                    result = await self.client.build_and_send_full_sell_via_jito_bundle(
-                        mint=mint, slippage_pct=self.sell_slippage_pct,
-                        priority_fee_sol=priority_fee_sol_for_sell(reason),
-                        tip_sol=jito.RECOMMENDED_TIP_SOL,
-                        block_engine_url=self.risk.cfg.jito_block_engine_url,
-                    )
-                else:
-                    result = await self.client.build_and_send_full_sell(
-                        mint=mint, slippage_pct=self.sell_slippage_pct,
-                        # user-requested 2026-08-24 ("build 3" - faster
-                        # execution on take_profit sells) - take_profit's real
-                        # slippage gap is the worst of any exit reason, and the
-                        # mechanism is time: a bigger fee here aims to land
-                        # before the peak this exit is chasing has fully
-                        # reversed. See fees.py's priority_fee_sol_for_sell.
-                        priority_fee_sol=priority_fee_sol_for_sell(reason),
-                    )
+                result = None
+                if real_token_amount is not None:
+                    # user-requested 2026-08-25 ("how can we improve the
+                    # baseline" -> "build") - try the exact on-chain amount
+                    # first, which doesn't need PumpPortal's balance index
+                    # to have caught up (see
+                    # build_and_send_full_sell_by_amount's docstring for
+                    # the full real-data reasoning). NOT YET CONFIRMED live
+                    # to actually succeed faster than MIN_SELL_DELAY_SEC -
+                    # a failure here is caught separately from the proven
+                    # jito/percentage path below and does NOT count toward
+                    # MAX_CONSECUTIVE_SELL_FAILURES, since it's an
+                    # experimental extra attempt, not the position's real
+                    # sell attempt.
+                    try:
+                        result = await self.client.build_and_send_full_sell_by_amount(
+                            mint=mint, token_amount=real_token_amount,
+                            slippage_pct=self.sell_slippage_pct,
+                            priority_fee_sol=priority_fee_sol_for_sell(reason),
+                        )
+                    except Exception as amount_exc:  # noqa: BLE001
+                        if time_since_entry < MIN_SELL_DELAY_SEC:
+                            # only option available before the floor - the
+                            # proven percentage/jito path below would fail
+                            # the exact same way today, so defer instead of
+                            # burning a second real fee on a doomed attempt
+                            logger.debug(
+                                "Absolute-amount sell voor %s mislukt en pas %.0fs "
+                                "sinds aankoop (min %ds) - uitgesteld: %s",
+                                info["symbol"], time_since_entry, MIN_SELL_DELAY_SEC, amount_exc,
+                            )
+                            return False
+                        logger.debug(
+                            "Absolute-amount sell voor %s mislukt, val terug op "
+                            "percentage-sell (floor al gepasseerd): %s",
+                            info["symbol"], amount_exc,
+                        )
+                        result = None
+                if result is None:
+                    if self._should_use_jito_bundle(reason, trade_size_sol_being_sold):
+                        # user-requested 2026-08-24 ("yes build if you think it
+                        # will make the bot better") - guarantees atomic
+                        # same-slot inclusion instead of racing other bots on
+                        # the public mempool, targeting the same real
+                        # slippage gap priority_fee_sol_for_sell above already
+                        # addresses more cheaply - see
+                        # build_and_send_full_sell_via_jito_bundle's docstring
+                        result = await self.client.build_and_send_full_sell_via_jito_bundle(
+                            mint=mint, slippage_pct=self.sell_slippage_pct,
+                            priority_fee_sol=priority_fee_sol_for_sell(reason),
+                            tip_sol=jito.RECOMMENDED_TIP_SOL,
+                            block_engine_url=self.risk.cfg.jito_block_engine_url,
+                        )
+                    else:
+                        result = await self.client.build_and_send_full_sell(
+                            mint=mint, slippage_pct=self.sell_slippage_pct,
+                            # user-requested 2026-08-24 ("build 3" - faster
+                            # execution on take_profit sells) - take_profit's real
+                            # slippage gap is the worst of any exit reason, and the
+                            # mechanism is time: a bigger fee here aims to land
+                            # before the peak this exit is chasing has fully
+                            # reversed. See fees.py's priority_fee_sol_for_sell.
+                            priority_fee_sol=priority_fee_sol_for_sell(reason),
+                        )
                 tx_signature = result["signature"]
                 real_sol_delta = result.get("real_sol_delta")
             except Exception as exc:  # noqa: BLE001
