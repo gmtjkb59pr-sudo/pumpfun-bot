@@ -20,7 +20,6 @@ import time
 from typing import AsyncIterator, Callable
 
 import aiohttp
-import base58
 import websockets
 from solders.keypair import Keypair
 from solders.transaction import VersionedTransaction
@@ -261,28 +260,42 @@ class PumpPortalClient:
         DRY_RUN_SLIPPAGE_PENALTY_PCT_BY_REASON) showed is the dominant
         real cost on this bot's trades.
 
-        priority_fee_sol here does DOUBLE DUTY as the Jito tip (confirmed
-        against PumpPortal's own Jito-bundles docs, 2026-08-24) - not a
+        priority_fee_sol here does DOUBLE DUTY as the Jito tip - not a
         separate cost on top of the usual priority fee, but also not
         optional: an under-tipped bundle simply never gets included by any
         validator, silently losing the trade to a normal sendTransaction
         competitor instead of costing extra.
 
-        Confirmed against PumpPortal's own docs 2026-08-24: requesting a
-        JITO bundle uses the SAME /api/trade-local endpoint, just posting
-        an array of trade objects (1 here - a single-transaction "bundle"
-        is still a real bundle, tipped and atomically included) instead of
-        one. The response for array-mode is a JSON array of BASE58-encoded
-        unsigned transactions - a real, different encoding from the single-
-        object mode's raw transaction bytes (see build_and_send_trade),
-        not a redundant re-check.
+        Real bug found live 2026-08-24, hours after this shipped: initially
+        requested the unsigned tx via PumpPortal's documented array-mode
+        /api/trade-local (their own Jito-bundles docs show this - post an
+        array of trade objects instead of one, response is base58-encoded
+        instead of raw bytes). Confirmed live on 2 real trades ("80K Bull",
+        "BULL Token") this consistently 400'd - added real retry delay to
+        exactly the exits meant to be fast, before falling back to the
+        existing 99% normal-path fallback. Reproduced directly: PumpPortal's
+        array-mode endpoint 400s on action="sell" unconditionally - any
+        amount format, any pool value, a REAL held mint, even a bare 2-item
+        self-bundle - while action="buy" in array mode returns 200 fine.
+        An undocumented limitation/bug on PumpPortal's side, not fixable by
+        changing what we send them.
 
-        Raises RuntimeError if the bundle was never even accepted for
-        submission, or never confirmed within bundle_timeout_sec, or
-        landed with an on-chain error - the caller's existing retry/
-        cooldown handling (see outcome_tracker.py's _exit) already treats
-        any exception here as "sell failed, try again shortly", same as
-        every other real-sell path in this client.
+        Fixed by not needing their bundle endpoint AT ALL: Jito's sendBundle
+        only needs already-signed transactions, with zero requirement on
+        how they were built. Fetches the unsigned tx through the SAME
+        proven single-object endpoint build_and_send_full_sell already
+        uses (confirmed live: reliably 200s for sells), signs it locally
+        exactly the same way, and submits that one signed tx to Jito
+        directly as a bundle of one - PumpPortal's involvement ends at
+        "hand me an unsigned transaction," same as every other real-sell
+        path in this client.
+
+        Raises RuntimeError if PumpPortal's own build step failed, the
+        bundle was never even accepted for submission, never confirmed
+        within bundle_timeout_sec, or landed with an on-chain error - the
+        caller's existing retry/cooldown handling (see outcome_tracker.py's
+        _exit) already treats any exception here as "sell failed, try
+        again shortly", same as every other real-sell path in this client.
         """
         amount = f"{amount_pct:g}%"
         body = {
@@ -296,16 +309,13 @@ class PumpPortalClient:
             "pool": pool,
         }
         async with aiohttp.ClientSession() as session:
-            async with session.post(self.trade_api_url, json=[body], timeout=15) as resp:
+            async with session.post(self.trade_api_url, json=body, timeout=15) as resp:
                 if resp.status != 200:
                     text = await resp.text()
-                    raise RuntimeError(f"PumpPortal trade-local (bundle) fout ({resp.status}): {text}")
-                encoded_txs = await resp.json()
+                    raise RuntimeError(f"PumpPortal trade-local fout ({resp.status}): {text}")
+                raw_tx_bytes = await resp.read()
 
-        if not encoded_txs:
-            raise RuntimeError("PumpPortal gaf een lege transactie-array terug voor de Jito-bundle.")
-
-        tx = VersionedTransaction.from_bytes(base58.b58decode(encoded_txs[0]))
+        tx = VersionedTransaction.from_bytes(raw_tx_bytes)
         signed_tx = VersionedTransaction(tx.message, [self.keypair])
         sig = str(signed_tx.signatures[0])
 
