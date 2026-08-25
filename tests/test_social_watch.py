@@ -911,6 +911,37 @@ class PriceTrackerLifecycleTests(unittest.TestCase):
         self.assertNotIn("price_change_2m_pct", meta)
 
 
+class QualityMetaTests(unittest.TestCase):
+    def test_logs_top10_concentration_and_market_cap_already_fetched_for_the_buy_gate(self):
+        # user-requested 2026-08-24 ("build" a social_watch win-probability
+        # model) - these were already fetched to gate the buy decision but
+        # never actually logged anywhere until this fix
+        client = FakeClient(trade_events=[{"marketCapSol": 30.0}])
+        strategy, _ = _make_strategy(client, dry_run=True)
+
+        async def _fake_fetch_top10_concentration_pct(mint, rpc_http_url):
+            return 12.5
+
+        async def _fake_fetch_market_cap_usd(mint):
+            return 250_000.0
+
+        with patch(
+            "pumpfun_bot.strategies.social_watch.fetch_top10_concentration_pct",
+            _fake_fetch_top10_concentration_pct,
+        ), patch(
+            "pumpfun_bot.strategies.social_watch.fetch_market_cap_usd", _fake_fetch_market_cap_usd,
+        ):
+            asyncio.run(strategy._buy("MINT", {
+                "mint": "MINT", "name": "Test", "symbol": "TEST", "vSolInBondingCurve": 30.0,
+            }, time.time()))
+
+        with open(activity_log.DATA_LOG_PATH, encoding="utf-8") as f:
+            trades = [json.loads(line) for line in f if json.loads(line).get("type") == "trade"]
+        meta = trades[-1]["meta"]
+        self.assertAlmostEqual(meta["top10_concentration_pct"], 12.5)
+        self.assertAlmostEqual(meta["market_cap_usd"], 250_000.0)
+
+
 class BundleDetectionMetaTests(unittest.TestCase):
     def test_logs_the_slot_clustering_stats_from_bundle_detection(self):
         client = FakeClient(trade_events=[{"marketCapSol": 30.0}])

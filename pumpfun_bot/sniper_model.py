@@ -58,9 +58,10 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 from collections import defaultdict
 from pathlib import Path
+
+from . import logistic_regression as _lr
 
 logger = logging.getLogger("pumpfun_bot.sniper_model")
 
@@ -322,49 +323,16 @@ def extract_features(meta: dict, creator_win_rates: dict[str, float]) -> list[fl
     ]
 
 
-def _sigmoid(z: float) -> float:
-    if z < -700:  # avoid math.exp overflow on a very negative z
-        return 0.0
-    return 1.0 / (1.0 + math.exp(-z))
-
-
+# user-requested 2026-08-24 (building social_watch_model.py, a second
+# per-strategy win-probability model): the actual training/scoring math
+# below was 100% generic already - extracted to logistic_regression.py
+# rather than duplicating it a second time. These stay as thin wrappers so
+# every existing call site/test in THIS module keeps working unchanged
+# (sniper-specific defaults - FEATURES, MODEL_PATH - filled in here).
 def train_logistic_regression(
     features: list[list[float]], labels: list[int], epochs: int = 500, lr: float = 0.1,
 ) -> dict:
-    """Plain-gradient-descent logistic regression, standardizing each
-    feature first (mean 0, std 1) so a large-scale feature like
-    liquidity_sol doesn't dominate the gradient purely from its units."""
-    n = len(features)
-    if n == 0:
-        raise ValueError("Geen trainingsdata.")
-    n_features = len(features[0])
-
-    means = [sum(row[j] for row in features) / n for j in range(n_features)]
-    stds = []
-    for j in range(n_features):
-        variance = sum((row[j] - means[j]) ** 2 for row in features) / n
-        stds.append(math.sqrt(variance) or 1.0)  # avoid divide-by-zero for a constant feature
-
-    normalized = [
-        [(row[j] - means[j]) / stds[j] for j in range(n_features)]
-        for row in features
-    ]
-
-    weights = [0.0] * n_features
-    bias = 0.0
-    for _ in range(epochs):
-        grad_w = [0.0] * n_features
-        grad_b = 0.0
-        for row, label in zip(normalized, labels):
-            z = sum(w * x for w, x in zip(weights, row)) + bias
-            error = _sigmoid(z) - label
-            for j in range(n_features):
-                grad_w[j] += error * row[j]
-            grad_b += error
-        weights = [w - lr * (g / n) for w, g in zip(weights, grad_w)]
-        bias -= lr * (grad_b / n)
-
-    return {"weights": weights, "bias": bias, "means": means, "stds": stds, "features": list(FEATURES)}
+    return _lr.train_logistic_regression(features, labels, list(FEATURES), epochs=epochs, lr=lr)
 
 
 def save_model(model: dict, path: Path | None = None) -> None:
@@ -372,29 +340,16 @@ def save_model(model: dict, path: Path | None = None) -> None:
     # is bound ONCE at function-definition time, so patching the module-
     # level MODEL_PATH afterward (as tests do) would silently have no
     # effect on it otherwise
-    path = path if path is not None else MODEL_PATH
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(model, indent=2))
+    _lr.save_model(model, path if path is not None else MODEL_PATH)
 
 
 def load_model(path: Path | None = None) -> dict | None:
-    path = path if path is not None else MODEL_PATH
-    if not path.exists():
-        return None
-    try:
-        return json.loads(path.read_text())
-    except Exception:  # noqa: BLE001
-        logger.debug("Kon sniper_model.json niet lezen.")
-        return None
+    return _lr.load_model(path if path is not None else MODEL_PATH)
 
 
 def score_with_model(model: dict, feature_values: list[float]) -> float:
     """Returns P(real win) in [0, 1]."""
-    normalized = [
-        (x - m) / s for x, m, s in zip(feature_values, model["means"], model["stds"])
-    ]
-    z = sum(w * x for w, x in zip(model["weights"], normalized)) + model["bias"]
-    return _sigmoid(z)
+    return _lr.score_with_model(model, feature_values)
 
 
 def score(meta: dict, creator_win_rates: dict[str, float], model: dict | None = None) -> float | None:
