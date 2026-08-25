@@ -1394,19 +1394,28 @@ class OutcomeTracker:
                             slippage_pct=self.sell_slippage_pct,
                             priority_fee_sol=priority_fee_sol_for_sell(reason),
                         )
+                        # user-requested 2026-08-25 ("check") - visible at
+                        # INFO (not debug) specifically so this new path's
+                        # real hit rate can be confirmed live without
+                        # needing to bump the whole logger to DEBUG.
+                        logger.info(
+                            "Absolute-amount sell GESLAAGD voor %s (%.0fs sinds aankoop, "
+                            "amount=%d) - MIN_SELL_DELAY_SEC-wachttijd omzeild.",
+                            info["symbol"], time_since_entry, real_token_amount,
+                        )
                     except Exception as amount_exc:  # noqa: BLE001
                         if time_since_entry < MIN_SELL_DELAY_SEC:
                             # only option available before the floor - the
                             # proven percentage/jito path below would fail
                             # the exact same way today, so defer instead of
                             # burning a second real fee on a doomed attempt
-                            logger.debug(
+                            logger.info(
                                 "Absolute-amount sell voor %s mislukt en pas %.0fs "
                                 "sinds aankoop (min %ds) - uitgesteld: %s",
                                 info["symbol"], time_since_entry, MIN_SELL_DELAY_SEC, amount_exc,
                             )
                             return False
-                        logger.debug(
+                        logger.info(
                             "Absolute-amount sell voor %s mislukt, val terug op "
                             "percentage-sell (floor al gepasseerd): %s",
                             info["symbol"], amount_exc,
