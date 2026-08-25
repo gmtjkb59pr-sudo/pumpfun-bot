@@ -11,6 +11,7 @@ import logging
 import time
 from pathlib import Path
 
+from .. import jito
 from ..activity_log import DATA_LOG_PATH
 from ..alerts import Alerter
 from ..config import SniperConfig
@@ -260,6 +261,21 @@ class SniperStrategy:
             return False
         return top10_concentration_pct > self.cfg.max_top10_concentration_pct
 
+    def _should_use_jito_bundle_for_buy(self) -> bool:
+        """User-requested 2026-08-25 ("how can i execute the bot faster" ->
+        "both") - mirrors OutcomeTracker._should_use_jito_bundle's size
+        gate exactly, applied to sniper's own buy instead of a take_profit
+        sell. self.trade_size_sol is fixed per-strategy (not per-position
+        like a sell, which can vary with ladder rungs), so this can be
+        checked once per candidate rather than needing a size argument."""
+        if not getattr(self.risk.cfg, "use_jito_bundles_for_sniper_buys", False):
+            return False
+        max_tip_pct = getattr(self.risk.cfg, "max_jito_tip_pct_of_trade", 10.0)
+        if self.trade_size_sol <= 0:
+            return False
+        tip_pct_of_trade = (jito.RECOMMENDED_TIP_SOL / self.trade_size_sol) * 100
+        return tip_pct_of_trade <= max_tip_pct
+
     def _is_duplicate_name(self, name: str, symbol: str) -> bool:
         """See SEEN_LAUNCH_NAMES_PATH's docstring - a free, no-RPC-call
         check against every (name, symbol) sniper has seen in the last
@@ -459,19 +475,35 @@ class SniperStrategy:
                 continue
 
             try:
-                result = await self.client.build_and_send_trade(
-                    action="buy",
-                    mint=mint,
-                    amount_sol=self.trade_size_sol,
-                    slippage_pct=self.slippage_pct,
-                    # user-requested 2026-08-24 ("how can i make the bot
-                    # faster" -> "yes") - real gap found: this call never
-                    # overrode priority_fee_sol at all, so every real buy
-                    # used the flat, unboosted default even though
-                    # sniper's whole edge is being first. See fees.py's
-                    # SNIPER_BUY_PRIORITY_FEE_SOL_PER_LEG docstring.
-                    priority_fee_sol=SNIPER_BUY_PRIORITY_FEE_SOL_PER_LEG,
-                )
+                if self._should_use_jito_bundle_for_buy():
+                    # user-requested 2026-08-25 ("how can i execute the bot
+                    # faster" -> "both") - guarantees atomic same-slot
+                    # inclusion for the buy that IS sniper's whole edge,
+                    # instead of racing other bots on the public mempool.
+                    # See build_and_send_trade_via_jito_bundle's docstring.
+                    result = await self.client.build_and_send_trade_via_jito_bundle(
+                        action="buy",
+                        mint=mint,
+                        amount_sol=self.trade_size_sol,
+                        slippage_pct=self.slippage_pct,
+                        priority_fee_sol=SNIPER_BUY_PRIORITY_FEE_SOL_PER_LEG,
+                        tip_sol=jito.RECOMMENDED_TIP_SOL,
+                        block_engine_url=self.risk.cfg.jito_block_engine_url,
+                    )
+                else:
+                    result = await self.client.build_and_send_trade(
+                        action="buy",
+                        mint=mint,
+                        amount_sol=self.trade_size_sol,
+                        slippage_pct=self.slippage_pct,
+                        # user-requested 2026-08-24 ("how can i make the bot
+                        # faster" -> "yes") - real gap found: this call never
+                        # overrode priority_fee_sol at all, so every real buy
+                        # used the flat, unboosted default even though
+                        # sniper's whole edge is being first. See fees.py's
+                        # SNIPER_BUY_PRIORITY_FEE_SOL_PER_LEG docstring.
+                        priority_fee_sol=SNIPER_BUY_PRIORITY_FEE_SOL_PER_LEG,
+                    )
                 self.risk.register_trade_opened(self.trade_size_sol)
                 await self.risk.report_buy_result(success=True)
                 has_socials = any(event.get(k) for k in ("twitter", "telegram", "website"))

@@ -705,6 +705,7 @@ class _FakeSuccessfulBuyClient:
         self.rpc_http_url = rpc_http_url
         self._signature = signature
         self.buy_calls = []
+        self.jito_bundle_calls = []
 
     def stream_new_tokens(self):
         async def _gen():
@@ -724,6 +725,17 @@ class _FakeSuccessfulBuyClient:
             "slippage_pct": slippage_pct, "priority_fee_sol": priority_fee_sol,
         })
         return {"signature": self._signature}
+
+    async def build_and_send_trade_via_jito_bundle(
+        self, action, mint, amount_sol, slippage_pct, priority_fee_sol=None, tip_sol=None,
+        block_engine_url=None,
+    ):
+        self.jito_bundle_calls.append({
+            "action": action, "mint": mint, "amount_sol": amount_sol,
+            "slippage_pct": slippage_pct, "priority_fee_sol": priority_fee_sol,
+            "tip_sol": tip_sol, "block_engine_url": block_engine_url,
+        })
+        return {"signature": self._signature, "bundle_id": "FAKE_BUNDLE_ID"}
 
 
 class BuySpeedPriorityFeeTests(unittest.TestCase):
@@ -761,6 +773,93 @@ class BuySpeedPriorityFeeTests(unittest.TestCase):
         self.assertEqual(client.buy_calls[0]["priority_fee_sol"], SNIPER_BUY_PRIORITY_FEE_SOL_PER_LEG)
         # confirms it's a real boost, not accidentally left at the old flat default
         self.assertGreater(SNIPER_BUY_PRIORITY_FEE_SOL_PER_LEG, PRIORITY_FEE_SOL_PER_LEG)
+
+
+class JitoBuyBundleTests(unittest.TestCase):
+    """User-requested 2026-08-25 ("how can i execute the bot faster" ->
+    "both") - real buys route through Jito bundle submission instead of
+    a normal sendTransaction when risk.cfg.use_jito_bundles_for_sniper_
+    buys is set AND self.trade_size_sol is big enough that jito.
+    RECOMMENDED_TIP_SOL stays under max_jito_tip_pct_of_trade of it -
+    mirrors OutcomeTracker's identical size gate on the sell side."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._path = Path(self._tmpdir.name) / "sniper_seen_launch_names.json"
+        self._patcher = patch(
+            "pumpfun_bot.strategies.sniper.SEEN_LAUNCH_NAMES_PATH", self._path,
+        )
+        self._patcher.start()
+
+    def tearDown(self):
+        self._patcher.stop()
+        self._tmpdir.cleanup()
+
+    def _make_strategy(self, *, client, trade_size_sol, use_jito, max_jito_tip_pct_of_trade=10.0):
+        risk = RiskManager(RiskConfig(
+            use_jito_bundles_for_sniper_buys=use_jito,
+            max_jito_tip_pct_of_trade=max_jito_tip_pct_of_trade,
+            # RiskConfig()'s own default (0.05) would otherwise block a
+            # bigger test trade size before it even reaches the Jito
+            # size-gate logic being tested here
+            max_sol_per_trade=max(trade_size_sol, 0.05),
+        ))
+        return SniperStrategy(
+            client=client, cfg=SniperConfig(enabled=True), risk=risk, alerter=_FakeAlerter(),
+            trade_size_sol=trade_size_sol, slippage_pct=10, dry_run=False,
+        )
+
+    def test_uses_the_jito_bundle_path_when_enabled_and_trade_is_big_enough(self):
+        client = _FakeSuccessfulBuyClient(events=[{
+            "mint": "MINT", "name": "Fast", "symbol": "FAST",
+            "vSolInBondingCurve": 30.0, "traderPublicKey": "CREATOR",
+        }])
+        # 0.01 / 0.5 = 2%, comfortably under the default 10% cap
+        strategy = self._make_strategy(client=client, trade_size_sol=0.5, use_jito=True)
+
+        asyncio.run(strategy.run())
+
+        self.assertEqual(len(client.jito_bundle_calls), 1)
+        self.assertEqual(client.buy_calls, [])
+
+    def test_uses_the_normal_path_when_disabled(self):
+        client = _FakeSuccessfulBuyClient(events=[{
+            "mint": "MINT", "name": "Fast", "symbol": "FAST",
+            "vSolInBondingCurve": 30.0, "traderPublicKey": "CREATOR",
+        }])
+        strategy = self._make_strategy(client=client, trade_size_sol=0.5, use_jito=False)
+
+        asyncio.run(strategy.run())
+
+        self.assertEqual(client.jito_bundle_calls, [])
+        self.assertEqual(len(client.buy_calls), 1)
+
+    def test_a_real_sniper_sized_trade_is_too_small_for_jito_even_when_enabled(self):
+        # real config value this session: sniper's own trade size
+        client = _FakeSuccessfulBuyClient(events=[{
+            "mint": "MINT", "name": "Fast", "symbol": "FAST",
+            "vSolInBondingCurve": 30.0, "traderPublicKey": "CREATOR",
+        }])
+        strategy = self._make_strategy(client=client, trade_size_sol=0.012, use_jito=True)
+
+        asyncio.run(strategy.run())
+
+        self.assertEqual(client.jito_bundle_calls, [])
+        self.assertEqual(len(client.buy_calls), 1)
+
+    def test_a_looser_configured_threshold_allows_a_smaller_trade(self):
+        client = _FakeSuccessfulBuyClient(events=[{
+            "mint": "MINT", "name": "Fast", "symbol": "FAST",
+            "vSolInBondingCurve": 30.0, "traderPublicKey": "CREATOR",
+        }])
+        # 0.01 / 0.05 = 20% - fails the default 10% gate, passes a looser 25%
+        strategy = self._make_strategy(
+            client=client, trade_size_sol=0.05, use_jito=True, max_jito_tip_pct_of_trade=25.0,
+        )
+
+        asyncio.run(strategy.run())
+
+        self.assertEqual(len(client.jito_bundle_calls), 1)
 
 
 if __name__ == "__main__":
