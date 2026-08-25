@@ -326,10 +326,16 @@ async def main() -> None:
         )
         tasks.append(asyncio.create_task(auto_tuner.run()))
 
-    if cfg.sniper.enabled:
+    if cfg.sniper.enabled or cfg.social_watch.enabled:
+        # user-requested 2026-08-24 ("build" a win-probability model for
+        # social_watch too) - was gated on sniper.enabled alone, which
+        # would have silently stopped retraining BOTH models (including
+        # social_watch's) if sniper were ever disabled while social_watch
+        # stayed on
         logger.info(
-            "Model auto-retrain gestart: hertraint sniper_model.py automatisch zodra er "
-            "genoeg nieuwe echte trades bijkomen (zie pumpfun_bot/model_retrain.py)."
+            "Model auto-retrain gestart: hertraint sniper_model.py en social_watch_model.py "
+            "automatisch zodra er genoeg nieuwe echte trades bijkomen (zie "
+            "pumpfun_bot/model_retrain.py)."
         )
         tasks.append(asyncio.create_task(retrain_loop(alerter)))
 

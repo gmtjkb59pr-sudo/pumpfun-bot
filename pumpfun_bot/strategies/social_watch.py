@@ -13,6 +13,7 @@ import asyncio
 import logging
 import time
 
+from .. import social_watch_model
 from ..alerts import Alerter
 from ..bundle_detection import fetch_launch_slot_clustering
 from ..candidate_price_tracker import CandidatePriceTracker
@@ -165,6 +166,32 @@ class SocialWatchStrategy:
                 self._watching.pop(mint, None)
             if self.price_tracker is not None:
                 await self.price_tracker.unwatch(mint)
+
+    def _log_shadow_model_score(self, mint: str, symbol: str, meta: dict) -> None:
+        """User-requested 2026-08-24 ("build" a win-probability model for
+        social_watch) - same shadow-mode pattern as
+        sniper.py's identical method: computes and logs
+        social_watch_model.py's score for this real buy, WITHOUT touching
+        the buy decision itself (already made and executed by the time
+        this runs). Stays shadow-mode-only until there's enough labeled
+        real-trade history to validate it - see that module's own
+        docstring for why even a training run right now (38 real trades)
+        isn't enough to trust yet. Any failure here must never affect the
+        strategy - caught and logged, not raised."""
+        try:
+            model = social_watch_model.load_model()
+            if model is None:
+                return
+            win_probability = social_watch_model.score(meta, model=model)
+            if win_probability is None:
+                return
+            logger.info(
+                "Social-watch: model score voor %s (%s) = %.2f (schaduwmodus, "
+                "heeft geen invloed op de koopbeslissing).",
+                symbol, mint, win_probability,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Kon shadow-mode model score niet berekenen voor %s.", mint)
 
     async def _fetch_fresh_ref(self, mint: str) -> tuple[float | None, str | None]:
         """A candidate can sit on the watchlist for up to watch_window_sec -
@@ -401,6 +428,15 @@ class SocialWatchStrategy:
             "launch_distinct_slots": (slot_clustering or {}).get("distinct_slots"),
             "launch_max_txs_in_one_slot": (slot_clustering or {}).get("max_txs_in_one_slot"),
         }
+        # user-requested 2026-08-24 ("build" - a win-probability model for
+        # social_watch, using its richer feature set vs. sniper's) - both
+        # of these were already fetched above (to gate the buy itself) but
+        # never actually logged anywhere, so social_watch_model.py had no
+        # historical rows to learn from at all for either signal
+        quality_meta = {
+            "top10_concentration_pct": top10_concentration_pct,
+            "market_cap_usd": market_cap_usd,
+        }
 
         if self.dry_run:
             logger.info("[DRY RUN] Zou kopen: %s SOL van %s", self.trade_size_sol, mint)
@@ -409,7 +445,7 @@ class SocialWatchStrategy:
                 "social_watch", "buy", mint, self.trade_size_sol, dry_run=True,
                 meta={
                     "liquidity_sol": liquidity_sol, "has_socials": True, "holder_count": holder_count,
-                    **momentum_meta, **bundle_meta,
+                    **momentum_meta, **bundle_meta, **quality_meta,
                 },
             )
             if self.outcome_tracker is not None:
@@ -441,9 +477,10 @@ class SocialWatchStrategy:
                 meta={
                     "liquidity_sol": liquidity_sol, "has_socials": True,
                     "creator": creator, "holder_count": holder_count,
-                    **momentum_meta, **bundle_meta,
+                    **momentum_meta, **bundle_meta, **quality_meta,
                 },
             )
+            self._log_shadow_model_score(mint, symbol, {"holder_count": holder_count, **bundle_meta, **quality_meta})
             await self.alerter.send(f"✅ Gekocht (social-watch): {symbol} | tx: {result['signature']}")
             if self.outcome_tracker is not None:
                 await self.outcome_tracker.track(
