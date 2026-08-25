@@ -2,7 +2,9 @@ import asyncio
 import unittest
 from unittest.mock import patch
 
+import base58
 from solders.keypair import Keypair
+from solders.transaction import VersionedTransaction
 
 from pumpfun_bot.pumpportal_client import (
     OnChainTransactionError,
@@ -569,6 +571,206 @@ class MigrationRetryTests(unittest.TestCase):
 
 async def _async_none():
     return None
+
+
+def _fake_unsigned_tx_base58(signer_pubkey) -> str:
+    """A genuinely valid, empty (zero-instruction) unsigned VersionedTransaction,
+    base58-encoded - matches PumpPortal's real Jito-bundle-mode response
+    shape closely enough to exercise the real decode -> sign round trip,
+    not just a mocked call."""
+    from solders.hash import Hash
+    from solders.message import MessageV0
+
+    msg = MessageV0.try_compile(
+        payer=signer_pubkey, instructions=[], address_lookup_table_accounts=[],
+        recent_blockhash=Hash.default(),
+    )
+    unsigned_tx = VersionedTransaction.populate(msg, [])
+    return base58.b58encode(bytes(unsigned_tx)).decode("utf-8")
+
+
+class _FakeJitoResponse:
+    def __init__(self, status=200, json_data=None, text=""):
+        self.status = status
+        self._json_data = json_data
+        self._text = text
+
+    async def json(self):
+        return self._json_data
+
+    async def text(self):
+        return self._text
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+
+class _FakeJitoSession:
+    def __init__(self, response):
+        self._response = response
+        self.post_calls = []
+
+    def post(self, *args, **kwargs):
+        self.post_calls.append((args, kwargs))
+        return self._response
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+
+class BuildAndSendFullSellViaJitoBundleTests(unittest.TestCase):
+    """User-requested 2026-08-24 ("yes build if you think it will make the
+    bot better") - submits a real sell as a Jito bundle instead of a
+    normal sendTransaction, closing the trigger-to-landed-fill gap this
+    session's own real data showed dominates real trading costs. Confirmed
+    against PumpPortal's own docs: array-mode POST to the same trade-local
+    endpoint, response is base58-encoded unsigned transactions (not raw
+    bytes like single-object mode)."""
+
+    def _make_client(self):
+        return PumpPortalClient(
+            ws_url="wss://example.invalid",
+            trade_api_url="https://example.invalid/trade-local",
+            rpc_http_url="https://example.invalid/rpc",
+            keypair=Keypair(),
+        )
+
+    def test_posts_the_request_as_an_array_not_a_single_object(self):
+        client = self._make_client()
+        encoded = _fake_unsigned_tx_base58(client.keypair.pubkey())
+        trade_local_session = _FakeJitoSession(
+            _FakeJitoResponse(status=200, json_data=[encoded])
+        )
+        client._fetch_real_sol_delta = lambda sig: _async_none()
+
+        with patch(
+            "pumpfun_bot.pumpportal_client.aiohttp.ClientSession", return_value=trade_local_session,
+        ), patch(
+            "pumpfun_bot.pumpportal_client.jito.send_bundle", return_value="BUNDLE_ID",
+        ), patch(
+            "pumpfun_bot.pumpportal_client.jito.poll_bundle_until_landed",
+            return_value={"confirmation_status": "confirmed", "err": None},
+        ):
+            asyncio.run(client.build_and_send_full_sell_via_jito_bundle(mint="MINT123", slippage_pct=10))
+
+        args, kwargs = trade_local_session.post_calls[0]
+        posted_body = kwargs["json"]
+        self.assertIsInstance(posted_body, list)
+        self.assertEqual(len(posted_body), 1)
+        self.assertEqual(posted_body[0]["action"], "sell")
+        self.assertEqual(posted_body[0]["amount"], "100%")
+
+    def test_returns_the_signature_and_bundle_id_on_success(self):
+        client = self._make_client()
+        encoded = _fake_unsigned_tx_base58(client.keypair.pubkey())
+        trade_local_session = _FakeJitoSession(_FakeJitoResponse(status=200, json_data=[encoded]))
+        client._fetch_real_sol_delta = lambda sig: _async_ret(0.5)
+
+        with patch(
+            "pumpfun_bot.pumpportal_client.aiohttp.ClientSession", return_value=trade_local_session,
+        ), patch(
+            "pumpfun_bot.pumpportal_client.jito.send_bundle", return_value="BUNDLE_ID",
+        ), patch(
+            "pumpfun_bot.pumpportal_client.jito.poll_bundle_until_landed",
+            return_value={"confirmation_status": "finalized", "err": None},
+        ):
+            result = asyncio.run(
+                client.build_and_send_full_sell_via_jito_bundle(mint="MINT123", slippage_pct=10)
+            )
+
+        self.assertEqual(result["bundle_id"], "BUNDLE_ID")
+        self.assertEqual(result["real_sol_delta"], 0.5)
+        self.assertTrue(len(result["signature"]) > 0)
+
+    def test_raises_on_a_non_200_from_pumpportal(self):
+        client = self._make_client()
+        session = _FakeJitoSession(_FakeJitoResponse(status=500, text="server error"))
+        with patch("pumpfun_bot.pumpportal_client.aiohttp.ClientSession", return_value=session):
+            with self.assertRaises(RuntimeError):
+                asyncio.run(client.build_and_send_full_sell_via_jito_bundle(mint="MINT123", slippage_pct=10))
+
+    def test_raises_on_an_empty_transaction_array(self):
+        client = self._make_client()
+        session = _FakeJitoSession(_FakeJitoResponse(status=200, json_data=[]))
+        with patch("pumpfun_bot.pumpportal_client.aiohttp.ClientSession", return_value=session):
+            with self.assertRaises(RuntimeError):
+                asyncio.run(client.build_and_send_full_sell_via_jito_bundle(mint="MINT123", slippage_pct=10))
+
+    def test_raises_when_the_bundle_never_gets_a_bundle_id(self):
+        client = self._make_client()
+        encoded = _fake_unsigned_tx_base58(client.keypair.pubkey())
+        session = _FakeJitoSession(_FakeJitoResponse(status=200, json_data=[encoded]))
+        with patch(
+            "pumpfun_bot.pumpportal_client.aiohttp.ClientSession", return_value=session,
+        ), patch(
+            "pumpfun_bot.pumpportal_client.jito.send_bundle", return_value=None,
+        ):
+            with self.assertRaises(RuntimeError):
+                asyncio.run(client.build_and_send_full_sell_via_jito_bundle(mint="MINT123", slippage_pct=10))
+
+    def test_raises_when_the_bundle_never_lands_within_the_timeout(self):
+        client = self._make_client()
+        encoded = _fake_unsigned_tx_base58(client.keypair.pubkey())
+        session = _FakeJitoSession(_FakeJitoResponse(status=200, json_data=[encoded]))
+        with patch(
+            "pumpfun_bot.pumpportal_client.aiohttp.ClientSession", return_value=session,
+        ), patch(
+            "pumpfun_bot.pumpportal_client.jito.send_bundle", return_value="BUNDLE_ID",
+        ), patch(
+            "pumpfun_bot.pumpportal_client.jito.poll_bundle_until_landed", return_value=None,
+        ):
+            with self.assertRaises(RuntimeError):
+                asyncio.run(client.build_and_send_full_sell_via_jito_bundle(mint="MINT123", slippage_pct=10))
+
+    def test_raises_on_chain_transaction_error_when_the_bundle_lands_with_an_error(self):
+        client = self._make_client()
+        encoded = _fake_unsigned_tx_base58(client.keypair.pubkey())
+        session = _FakeJitoSession(_FakeJitoResponse(status=200, json_data=[encoded]))
+        landed_with_error = {
+            "confirmation_status": "confirmed",
+            "err": {"InstructionError": [4, {"Custom": 6024}]},
+        }
+        with patch(
+            "pumpfun_bot.pumpportal_client.aiohttp.ClientSession", return_value=session,
+        ), patch(
+            "pumpfun_bot.pumpportal_client.jito.send_bundle", return_value="BUNDLE_ID",
+        ), patch(
+            "pumpfun_bot.pumpportal_client.jito.poll_bundle_until_landed",
+            return_value=landed_with_error,
+        ):
+            with self.assertRaises(OnChainTransactionError) as ctx:
+                asyncio.run(client.build_and_send_full_sell_via_jito_bundle(mint="MINT123", slippage_pct=10))
+        self.assertEqual(ctx.exception.custom_error_code, 6024)
+
+    def test_amount_pct_override_is_used_in_the_request(self):
+        client = self._make_client()
+        encoded = _fake_unsigned_tx_base58(client.keypair.pubkey())
+        session = _FakeJitoSession(_FakeJitoResponse(status=200, json_data=[encoded]))
+        client._fetch_real_sol_delta = lambda sig: _async_none()
+        with patch(
+            "pumpfun_bot.pumpportal_client.aiohttp.ClientSession", return_value=session,
+        ), patch(
+            "pumpfun_bot.pumpportal_client.jito.send_bundle", return_value="BUNDLE_ID",
+        ), patch(
+            "pumpfun_bot.pumpportal_client.jito.poll_bundle_until_landed",
+            return_value={"confirmation_status": "confirmed", "err": None},
+        ):
+            result = asyncio.run(client.build_and_send_full_sell_via_jito_bundle(
+                mint="MINT123", slippage_pct=10, amount_pct=99,
+            ))
+        args, kwargs = session.post_calls[0]
+        self.assertEqual(kwargs["json"][0]["amount"], "99%")
+        self.assertEqual(result["amount"], "99%")
+
+
+async def _async_ret(value):
+    return value
 
 
 if __name__ == "__main__":

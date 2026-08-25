@@ -20,10 +20,12 @@ import time
 from typing import AsyncIterator, Callable
 
 import aiohttp
+import base58
 import websockets
 from solders.keypair import Keypair
 from solders.transaction import VersionedTransaction
 
+from . import jito
 from .fees import PRIORITY_FEE_SOL_PER_LEG
 
 logger = logging.getLogger("pumpfun_bot.pumpportal")
@@ -236,6 +238,100 @@ class PumpPortalClient:
         return {
             "signature": sig, "action": "sell", "mint": mint, "amount": amount,
             "real_sol_delta": real_sol_delta,
+        }
+
+    async def build_and_send_full_sell_via_jito_bundle(
+        self,
+        mint: str,
+        slippage_pct: float,
+        priority_fee_sol: float = PRIORITY_FEE_SOL_PER_LEG,
+        pool: str = "auto",
+        amount_pct: float = 100,
+        block_engine_url: str = jito.DEFAULT_BLOCK_ENGINE_URL,
+        bundle_timeout_sec: float = jito.BUNDLE_STATUS_TIMEOUT_SEC,
+    ) -> dict:
+        """
+        User-requested 2026-08-24 ("is there still autonomous learning" ->
+        ... -> "yes build if you think it will make the bot better") -
+        same real sell as build_and_send_full_sell, but submitted as a
+        Jito bundle instead of a normal RPC sendTransaction, so it either
+        lands atomically in the slot a validator accepts the tip for, or
+        doesn't land at all - closing the trigger-to-landed-fill gap this
+        session's own real data (see fees.py's
+        DRY_RUN_SLIPPAGE_PENALTY_PCT_BY_REASON) showed is the dominant
+        real cost on this bot's trades.
+
+        priority_fee_sol here does DOUBLE DUTY as the Jito tip (confirmed
+        against PumpPortal's own Jito-bundles docs, 2026-08-24) - not a
+        separate cost on top of the usual priority fee, but also not
+        optional: an under-tipped bundle simply never gets included by any
+        validator, silently losing the trade to a normal sendTransaction
+        competitor instead of costing extra.
+
+        Confirmed against PumpPortal's own docs 2026-08-24: requesting a
+        JITO bundle uses the SAME /api/trade-local endpoint, just posting
+        an array of trade objects (1 here - a single-transaction "bundle"
+        is still a real bundle, tipped and atomically included) instead of
+        one. The response for array-mode is a JSON array of BASE58-encoded
+        unsigned transactions - a real, different encoding from the single-
+        object mode's raw transaction bytes (see build_and_send_trade),
+        not a redundant re-check.
+
+        Raises RuntimeError if the bundle was never even accepted for
+        submission, or never confirmed within bundle_timeout_sec, or
+        landed with an on-chain error - the caller's existing retry/
+        cooldown handling (see outcome_tracker.py's _exit) already treats
+        any exception here as "sell failed, try again shortly", same as
+        every other real-sell path in this client.
+        """
+        amount = f"{amount_pct:g}%"
+        body = {
+            "publicKey": str(self.keypair.pubkey()),
+            "action": "sell",
+            "mint": mint,
+            "amount": amount,
+            "denominatedInSol": "false",
+            "slippage": slippage_pct,
+            "priorityFee": priority_fee_sol,
+            "pool": pool,
+        }
+        async with aiohttp.ClientSession() as session:
+            async with session.post(self.trade_api_url, json=[body], timeout=15) as resp:
+                if resp.status != 200:
+                    text = await resp.text()
+                    raise RuntimeError(f"PumpPortal trade-local (bundle) fout ({resp.status}): {text}")
+                encoded_txs = await resp.json()
+
+        if not encoded_txs:
+            raise RuntimeError("PumpPortal gaf een lege transactie-array terug voor de Jito-bundle.")
+
+        tx = VersionedTransaction.from_bytes(base58.b58decode(encoded_txs[0]))
+        signed_tx = VersionedTransaction(tx.message, [self.keypair])
+        sig = str(signed_tx.signatures[0])
+
+        bundle_id = await jito.send_bundle([bytes(signed_tx)], block_engine_url)
+        if bundle_id is None:
+            raise RuntimeError(f"Jito bundle-verzending mislukt voor {mint} (verkoop).")
+
+        status = await jito.poll_bundle_until_landed(
+            bundle_id, block_engine_url, timeout_sec=bundle_timeout_sec,
+        )
+        if status is None:
+            raise RuntimeError(
+                f"Jito bundle {bundle_id} niet bevestigd binnen {bundle_timeout_sec}s voor {mint} "
+                f"(verkoop) - onder-getipt, of geen validator heeft hem opgepikt."
+            )
+        err = status.get("err")
+        if err not in (None, {"Ok": None}):
+            raise OnChainTransactionError(
+                f"Jito bundle {bundle_id} is gefaald on-chain: {err}",
+                custom_error_code=_extract_custom_error_code(err),
+            )
+
+        real_sol_delta = await self._fetch_real_sol_delta(sig)
+        return {
+            "signature": sig, "action": "sell", "mint": mint, "amount": amount,
+            "real_sol_delta": real_sol_delta, "bundle_id": bundle_id,
         }
 
     async def _sign_and_send_with_migration_retry(self, body: dict) -> str:

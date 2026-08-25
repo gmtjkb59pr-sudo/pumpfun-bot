@@ -45,6 +45,22 @@ class RiskConfig:
     # (falls back to max_sol_total_exposure alone, the old fixed-cap-only
     # behavior) so existing configs without this field are unaffected.
     max_exposure_pct_of_balance: float = 0
+    # user-requested 2026-08-24 ("is there still autonomous learning" -> ...
+    # -> "yes build if you think it will make the bot better") - this
+    # session's own real, sourced data (fees.py's
+    # DRY_RUN_SLIPPAGE_PENALTY_PCT_BY_REASON) showed take_profit/
+    # take_profit_ladder have the worst real execution slippage of any
+    # exit reason, driven by TIME between trigger and landed fill on a
+    # thin, fast-reversing bonding curve - a Jito bundle guarantees
+    # atomic same-slot inclusion (or doesn't land at all) instead of
+    # racing other bots on the public mempool. Default OFF: a real,
+    # per-trade SOL cost (the tip) regardless of outcome, and its actual
+    # benefit can only be validated live, not in dry-run - see
+    # pumpportal_client.py's build_and_send_full_sell_via_jito_bundle and
+    # outcome_tracker.py's use of it, both scoped to ONLY take_profit/
+    # take_profit_ladder sells, matching exactly where the evidence points.
+    use_jito_bundles_for_take_profit: bool = False
+    jito_block_engine_url: str = "https://mainnet.block-engine.jito.wtf"
 
 
 @dataclass
@@ -508,6 +524,10 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         min_wallet_balance_usd=risk_raw.get("min_wallet_balance_usd", 0),
         max_real_loss_usd=risk_raw.get("max_real_loss_usd", 0),
         max_exposure_pct_of_balance=risk_raw.get("max_exposure_pct_of_balance", 0),
+        use_jito_bundles_for_take_profit=risk_raw.get("use_jito_bundles_for_take_profit", False),
+        jito_block_engine_url=risk_raw.get(
+            "jito_block_engine_url", "https://mainnet.block-engine.jito.wtf",
+        ),
     )
 
     strat_raw = raw.get("strategies", {})
