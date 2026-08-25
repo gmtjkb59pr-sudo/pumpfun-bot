@@ -19,6 +19,7 @@ from ..bundle_detection import fetch_launch_slot_clustering
 from ..candidate_price_tracker import CandidatePriceTracker
 from ..config import SocialWatchConfig
 from ..dexscreener import fetch_price_changes_pct
+from ..genuine_interest import fetch_genuine_interest_stats
 from ..holder_concentration import SETTLING_DELAY_SEC as CONCENTRATION_SETTLING_DELAY_SEC
 from ..holder_concentration import fetch_top10_concentration_pct
 from ..holder_count import INDEXING_DELAY_SEC as HOLDER_COUNT_INDEXING_DELAY_SEC
@@ -297,7 +298,7 @@ class SocialWatchStrategy:
         # the decision point, instead of a delayed best-effort background log
         (
             (entry_ref, price_ref_field), holder_count, market_cap_usd, top10_concentration_pct,
-            price_changes_pct, slot_clustering,
+            price_changes_pct, slot_clustering, genuine_interest,
         ) = await asyncio.gather(
             self._fetch_fresh_ref(mint),
             fetch_holder_count(mint, self.client.rpc_http_url),
@@ -315,6 +316,17 @@ class SocialWatchStrategy:
             # (watch_window_sec caps it) for one RPC call to capture its
             # whole early history reliably.
             fetch_launch_slot_clustering(mint, self.client.rpc_http_url),
+            # user-requested 2026-08-25 ("okay how can i make the bot
+            # profitable" -> "build") - the free, scoped-down version of
+            # the shelved "own on-chain infrastructure" plan's genuine-
+            # interest half: reuses the RPC budget already being paid for
+            # instead of a paid Geyser subscription, per-candidate instead
+            # of continuous streaming. See genuine_interest.py's module
+            # docstring. Meaningfully more RPC calls than every other
+            # check here (1 + up to 30, not 1-2) - kept in this same
+            # gather() to stay parallel rather than adding to wall-clock
+            # latency. Log-only, same precedent as everything else above.
+            fetch_genuine_interest_stats(mint, self.client.rpc_http_url),
         )
         # only m5 gates the buy decision (user-requested, see dexscreener.py) -
         # h1/h6/h24 are logged below with the trade but not enforced yet
@@ -437,6 +449,13 @@ class SocialWatchStrategy:
             "top10_concentration_pct": top10_concentration_pct,
             "market_cap_usd": market_cap_usd,
         }
+        # user-requested 2026-08-25 ("okay how can i make the bot
+        # profitable" -> "build") - see genuine_interest.py's module
+        # docstring
+        genuine_interest_meta = {
+            "launch_unique_buyer_ratio": (genuine_interest or {}).get("unique_buyer_ratio"),
+            "launch_wash_ratio": (genuine_interest or {}).get("wash_ratio"),
+        }
 
         if self.dry_run:
             logger.info("[DRY RUN] Zou kopen: %s SOL van %s", self.trade_size_sol, mint)
@@ -445,7 +464,7 @@ class SocialWatchStrategy:
                 "social_watch", "buy", mint, self.trade_size_sol, dry_run=True,
                 meta={
                     "liquidity_sol": liquidity_sol, "has_socials": True, "holder_count": holder_count,
-                    **momentum_meta, **bundle_meta, **quality_meta,
+                    **momentum_meta, **bundle_meta, **quality_meta, **genuine_interest_meta,
                 },
             )
             if self.outcome_tracker is not None:
@@ -477,7 +496,7 @@ class SocialWatchStrategy:
                 meta={
                     "liquidity_sol": liquidity_sol, "has_socials": True,
                     "creator": creator, "holder_count": holder_count,
-                    **momentum_meta, **bundle_meta, **quality_meta,
+                    **momentum_meta, **bundle_meta, **quality_meta, **genuine_interest_meta,
                 },
             )
             self._log_shadow_model_score(mint, symbol, {"holder_count": holder_count, **bundle_meta, **quality_meta})
