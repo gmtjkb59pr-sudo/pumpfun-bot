@@ -400,6 +400,16 @@ class ConfirmTransactionTests(unittest.TestCase):
             keypair=Keypair(),
         )
 
+    def test_default_poll_interval_is_150ms(self):
+        # user-requested 2026-08-24 ("how can it be even faster" -> "yes") -
+        # real Trade timing logs showed confirmation polling dominating
+        # total trade time at the old 500ms interval; lowered to 150ms,
+        # a real behavior change worth a direct regression guard against
+        # someone reverting it back up unintentionally
+        import inspect
+        sig = inspect.signature(PumpPortalClient._confirm_transaction)
+        self.assertAlmostEqual(sig.parameters["poll_interval_sec"].default, 0.15)
+
     def test_succeeds_when_confirmed_with_no_error(self):
         client = self._make_client()
         session = _FakeSession([_status_response(err=None, confirmation_status="confirmed")])

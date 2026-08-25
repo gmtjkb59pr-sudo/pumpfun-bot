@@ -465,7 +465,7 @@ class PumpPortalClient:
             return None
 
     async def _confirm_transaction(
-        self, signature: str, timeout_sec: float = 15.0, poll_interval_sec: float = 0.5
+        self, signature: str, timeout_sec: float = 15.0, poll_interval_sec: float = 0.15
     ) -> None:
         """Polls until the transaction actually lands (or definitively
         failed) on-chain. Raises RuntimeError if it reverted, or if it never
@@ -480,7 +480,24 @@ class PumpPortalClient:
         real) now gets classified "failed" and retried sooner, risking a
         duplicate attempt/fee for something that may have actually landed -
         acceptable given the user explicitly chose faster reaction over
-        that small extra margin."""
+        that small extra margin.
+
+        poll_interval_sec lowered 0.5 -> 0.15, user-requested 2026-08-24
+        ("how can it be even faster" -> "yes"): the bot's own real Trade
+        timing logs showed the post-send confirmation-polling phase
+        ("rest") dominating total trade time (~760-800ms of a ~1100-1300ms
+        total, 65-70%) - far more than fetching the unsigned tx from
+        PumpPortal (~300-500ms) or the blockhash check (~40-116ms). Solana's
+        own block time is ~400-600ms, so at the old 500ms interval a
+        transaction that landed on the very next block still waited out
+        most of a full poll cycle before the bot even checked again.
+        Tightening this doesn't change what gets submitted or add any real
+        cost (unlike the priority-fee/Jito levers) - only how often an
+        already-sent transaction's status gets checked. Real trade-off:
+        more getSignatureStatuses RPC calls per trade, cheap but not free.
+        Not lowered further than this - below Solana's own block time,
+        extra polling just burns RPC calls without a matching chance of a
+        new status existing yet."""
         payload = {
             "jsonrpc": "2.0",
             "id": 1,
