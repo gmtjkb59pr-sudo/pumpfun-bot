@@ -1457,6 +1457,41 @@ class ScamSocialCheckExitTests(unittest.TestCase):
         self.assertNotIn("MINT", tracker._pending)
         self.assertEqual(client.build_and_send_full_sell_by_amount_calls[0][:2], ("MINT", "1.500000"))
 
+    def test_no_op_if_a_different_exit_path_already_closed_the_position(self):
+        # real race found live 2026-08-25 ("check" -> "fix"): a faster,
+        # independent exit path (e.g. a price-tick stop_loss, now landing
+        # in seconds thanks to the absolute-amount sell) can close this
+        # SAME position while this check is off fetching metadata/
+        # evaluating links - the info captured at the top of this method
+        # goes stale. Confirmed live: LameDuck closed via stop_loss in
+        # 9s, then this check's stale copy still thought it was open 5s
+        # later and burned a real priority fee on a doomed sell against
+        # an already-empty wallet. Simulates that by deleting the
+        # position from _pending mid-flight (inside the fake evaluate
+        # callback, standing in for "closed while we were awaiting the
+        # network calls above").
+        tracker, risk, client = self._make_tracker()
+        asyncio.run(tracker.track("MINT", "Scammy", "SCAM", 100.0, trade_size_sol=0.03))
+        tracker._pending["MINT"]["entry_ts"] -= 100  # past MIN_SELL_DELAY_SEC already
+
+        async def _fake_fetch(uri):
+            return {"twitter": "https://example.invalid/fake"}
+
+        async def _fake_evaluate(links):
+            # simulates a different, faster exit path closing the
+            # position while this check was still awaiting the network
+            del tracker._pending["MINT"]
+            return True, "twitter-link ziet er nep uit"
+
+        with patch("pumpfun_bot.outcome_tracker.fetch_social_links", _fake_fetch), \
+             patch("pumpfun_bot.outcome_tracker.evaluate_social_links", _fake_evaluate), \
+             patch("pumpfun_bot.outcome_tracker.record_scam_links") as mock_record:
+            asyncio.run(tracker._check_socials_and_maybe_exit("MINT", "https://example.invalid/meta.json"))
+
+        self.assertEqual(client.sell_calls, [])  # no doomed sell attempt
+        self.assertEqual(client.build_and_send_full_sell_by_amount_calls, [])
+        mock_record.assert_not_called()  # no-op entirely, not even the scam-link record
+
 
 class DoubleExitRaceTests(unittest.TestCase):
     """Real bug found live 2026-08-23: the normal per-tick price

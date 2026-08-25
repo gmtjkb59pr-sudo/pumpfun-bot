@@ -645,6 +645,24 @@ class OutcomeTracker:
                 if wait_sec > 0:
                     await asyncio.sleep(wait_sec)
 
+            # Real race found live 2026-08-25 ("fix" - user asked after
+            # spotting it during a "check"): a DIFFERENT exit path (e.g. a
+            # price-tick stop_loss) can close this same position while
+            # this check was off fetching metadata/waiting above - using
+            # the `info` captured before that gap is stale. Confirmed
+            # live: LameDuck closed via stop_loss in 9s (the absolute-
+            # amount sell path), then this check's stale copy still
+            # thought it was open 5s later and burned a real priority fee
+            # on a doomed sell against an already-empty wallet (a real
+            # on-chain revert, Custom 6023 - no stuck position, no
+            # double-counted pnl, just one wasted fee). Making the FIRST
+            # exit path faster exposed this more often - re-fetch fresh
+            # right before committing, and bail if it's gone.
+            async with self._lock:
+                info = self._pending.get(mint)
+            if info is None:
+                return  # already closed via a different exit path in the meantime
+
             message = f"🚩 Verdachte socials voor {info.get('symbol', mint)}: {reason} - direct verkocht."
             logger.warning(message)
             if self.alerter is not None:
