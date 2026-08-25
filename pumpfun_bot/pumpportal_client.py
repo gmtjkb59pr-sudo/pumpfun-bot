@@ -17,6 +17,7 @@ import base64
 import json
 import logging
 import time
+from decimal import Decimal
 from typing import AsyncIterator, Callable
 
 import aiohttp
@@ -708,20 +709,41 @@ class PumpPortalClient:
 
     async def _fetch_real_token_amount(
         self, signature: str, mint: str, max_attempts: int = 4, retry_delay_sec: float = 0.5,
-    ) -> int | None:
-        """Returns the exact number of raw base-unit tokens this wallet
-        actually received from a confirmed buy transaction (postAmount -
-        preAmount for our own token account, from meta.postTokenBalances/
-        preTokenBalances - present regardless of the "json" encoding used
-        below, same as meta.postBalances/preBalances in
-        _fetch_real_sol_delta). None if the lookup fails or our account
-        isn't present in either balance list.
+    ) -> str | None:
+        """Returns the exact number of tokens this wallet actually received
+        from a confirmed buy transaction, as a UI-decimal string (e.g.
+        "427653.965632") - postAmount - preAmount for our own token
+        account, computed in raw base units first (exact integer
+        arithmetic, from meta.postTokenBalances/preTokenBalances - present
+        regardless of the "json" encoding used below, same as
+        meta.postBalances/preBalances in _fetch_real_sol_delta) then
+        shifted to UI-decimal via Decimal.scaleb (exact, no float
+        rounding - shifting a decimal point never loses precision). None
+        if the lookup fails or our account isn't present in either
+        balance list.
 
         User-requested 2026-08-25 ("build" - absolute-amount sell) - feeds
         OutcomeTracker._fetch_real_token_amount_bg, which lets a later
         exit sell this EXACT on-chain-confirmed amount (see
         build_and_send_full_sell_by_amount) instead of a PumpPortal-index-
         dependent percentage, sidestepping MIN_SELL_DELAY_SEC entirely.
+
+        Real bug found live 2026-08-25: this originally returned the RAW
+        base-unit integer (e.g. 427653965632) and sent that straight as
+        "amount" - PumpPortal's own docs never actually show a working
+        non-percentage SELL example (only a numeric amount on a BUY,
+        which is always SOL-denominated, a different case entirely), so
+        this was never really verified before shipping. The very first
+        real exit got a flat 400 Bad Request. Confirmed directly (safe,
+        no money at risk - PumpPortal's trade-local endpoint validates
+        and returns unsigned tx bytes WITHOUT ever signing/submitting
+        anything): raw base units (int OR string) both 400; the
+        UI-decimal quantity (i.e. what uiTokenAmount.uiAmountString
+        already gives you, same scale as the percentage-based sell
+        actually resolves to) returns 200 with real unsigned tx bytes,
+        as either a number or a string. A string is used here (not
+        uiAmount, a float) to avoid float-precision drift on large
+        balances - see build_and_send_full_sell_by_amount's docstring.
         Mirrors _fetch_real_sol_delta's retry/commitment reasoning
         exactly - same "confirmed" vs "finalized" bug class is possible
         here too."""
@@ -760,16 +782,19 @@ class PumpPortalClient:
                         ),
                         0,
                     )
-                    post_amount = next(
+                    post_entry = next(
                         (
-                            int(b["uiTokenAmount"]["amount"]) for b in post_balances
+                            b for b in post_balances
                             if b.get("owner") == our_key and b.get("mint") == mint
                         ),
                         None,
                     )
-                    if post_amount is None:
+                    if post_entry is None:
                         return None
-                    return post_amount - pre_amount
+                    post_amount = int(post_entry["uiTokenAmount"]["amount"])
+                    decimals = int(post_entry["uiTokenAmount"]["decimals"])
+                    delta_raw = post_amount - pre_amount
+                    return str(Decimal(delta_raw).scaleb(-decimals))
                 except (KeyError, ValueError, TypeError) as exc:
                     logger.debug(
                         "Kon real token-amount niet bepalen uit transactie %s: %s", signature, exc,
@@ -788,23 +813,21 @@ class PumpPortalClient:
     async def build_and_send_full_sell_by_amount(
         self,
         mint: str,
-        token_amount: int,
+        token_amount: str,
         slippage_pct: float,
         priority_fee_sol: float = PRIORITY_FEE_SOL_PER_LEG,
         pool: str = "auto",
     ) -> dict:
-        """Sells an EXACT, absolute token quantity (raw base units,
-        integer) - "amount": <int> with denominatedInSol: "false", per
-        PumpPortal's Local Trading API docs
-        (https://pumpportal.fun/local-trading-api/trading-api - amount
-        accepts either a percentage string like "100%" or a raw integer
-        quantity). Unlike build_and_send_full_sell's percentage form,
-        this does NOT ask PumpPortal to resolve "what does this wallet
-        currently hold" against their OWN indexed balance -
-        MIN_SELL_DELAY_SEC (outcome_tracker.py) exists ONLY because that
-        percentage lookup reliably returns SellZeroAmount before their
-        index catches up with a real buy (confirmed live). An absolute
-        amount sourced from our OWN on-chain buy result (see
+        """Sells an EXACT, absolute token quantity - "amount": "<ui-decimal
+        string>" with denominatedInSol: "false" (e.g. "427653.965632",
+        NOT the raw base-unit integer 427653965632). Unlike
+        build_and_send_full_sell's percentage form, this does NOT ask
+        PumpPortal to resolve "what does this wallet currently hold"
+        against their OWN indexed balance - MIN_SELL_DELAY_SEC
+        (outcome_tracker.py) exists ONLY because that percentage lookup
+        reliably returns SellZeroAmount before their index catches up
+        with a real buy (confirmed live). An absolute amount sourced
+        from our OWN on-chain buy result (see
         OutcomeTracker._fetch_real_token_amount_bg) sidesteps that
         dependency, in principle allowing a real sell almost immediately
         after the buy itself confirms.
@@ -818,10 +841,26 @@ class PumpPortalClient:
         window, and 14 of 16 take_profit-labeled exits were actually
         losses once the real fill landed.
 
-        NOT YET CONFIRMED to actually bypass PumpPortal's own internal
-        validation - they may still check the requested amount against
-        their own index regardless of format, in which case this fails
-        exactly like the percentage form does today. The caller
+        Real bug found live 2026-08-25, same day this shipped: the first
+        version took token_amount as a raw base-unit integer (PumpPortal's
+        docs never actually show a working non-percentage SELL example,
+        only a numeric amount on a BUY - always SOL-denominated, a
+        different case) and the very first real exit got a flat 400 Bad
+        Request. Confirmed directly, safely (no money at risk - the
+        trade-local endpoint validates and returns unsigned tx bytes
+        WITHOUT ever signing/submitting anything): raw base units (int
+        or string) both 400; the UI-decimal quantity as a STRING (this
+        signature's contract now) returns 200 with real unsigned tx
+        bytes. String, not float, to avoid float-precision drift ever
+        requesting fractionally more than what's actually held - see
+        _fetch_real_token_amount's docstring for how the caller computes
+        this exactly (Decimal.scaleb, never float division).
+
+        Still NOT confirmed that a SIGNED, SUBMITTED transaction using
+        this format lands on-chain (only that PumpPortal's server-side
+        validation accepts the request shape) - gated behind
+        RiskConfig.use_absolute_amount_sell, watch the next few real
+        exits before trusting this broadly. The caller
         (OutcomeTracker._exit) must treat any failure here as "not yet
         sellable" and fall back to the proven percentage-based
         build_and_send_full_sell once MIN_SELL_DELAY_SEC has elapsed -

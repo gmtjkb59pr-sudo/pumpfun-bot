@@ -336,7 +336,13 @@ class FetchRealTokenAmountTests(unittest.TestCase):
             keypair=Keypair(),
         )
 
-    def test_computes_the_wallets_own_token_balance_delta(self):
+    def test_computes_the_wallets_own_token_balance_delta_as_a_ui_decimal_string(self):
+        # real bug found live 2026-08-25: this used to return the raw
+        # base-unit integer (1500000) and PumpPortal 400'd on it - the
+        # correct format, confirmed via a safe (no money at risk)
+        # empirical test against their trade-local endpoint, is the
+        # UI-decimal quantity as a string ("1.500000" for 1_500_000 raw units
+        # at 6 decimals, PumpPortal tokens' standard decimals)
         client = self._make_client()
         our_key = str(client.keypair.pubkey())
         response = {
@@ -344,7 +350,10 @@ class FetchRealTokenAmountTests(unittest.TestCase):
                 "meta": {
                     "preTokenBalances": [],
                     "postTokenBalances": [
-                        {"owner": our_key, "mint": "MINT123", "uiTokenAmount": {"amount": "1500000"}},
+                        {
+                            "owner": our_key, "mint": "MINT123",
+                            "uiTokenAmount": {"amount": "1500000", "decimals": 6},
+                        },
                     ],
                 },
             },
@@ -352,7 +361,7 @@ class FetchRealTokenAmountTests(unittest.TestCase):
         session = _FakeSession([response])
         with patch("pumpfun_bot.pumpportal_client.aiohttp.ClientSession", return_value=session):
             amount = asyncio.run(client._fetch_real_token_amount("SIG", "MINT123"))
-        self.assertEqual(amount, 1_500_000)
+        self.assertEqual(amount, "1.500000")
 
     def test_subtracts_any_preexisting_balance_of_the_same_mint(self):
         client = self._make_client()
@@ -361,10 +370,16 @@ class FetchRealTokenAmountTests(unittest.TestCase):
             "result": {
                 "meta": {
                     "preTokenBalances": [
-                        {"owner": our_key, "mint": "MINT123", "uiTokenAmount": {"amount": "200000"}},
+                        {
+                            "owner": our_key, "mint": "MINT123",
+                            "uiTokenAmount": {"amount": "200000", "decimals": 6},
+                        },
                     ],
                     "postTokenBalances": [
-                        {"owner": our_key, "mint": "MINT123", "uiTokenAmount": {"amount": "1700000"}},
+                        {
+                            "owner": our_key, "mint": "MINT123",
+                            "uiTokenAmount": {"amount": "1700000", "decimals": 6},
+                        },
                     ],
                 },
             },
@@ -372,7 +387,31 @@ class FetchRealTokenAmountTests(unittest.TestCase):
         session = _FakeSession([response])
         with patch("pumpfun_bot.pumpportal_client.aiohttp.ClientSession", return_value=session):
             amount = asyncio.run(client._fetch_real_token_amount("SIG", "MINT123"))
-        self.assertEqual(amount, 1_500_000)
+        self.assertEqual(amount, "1.500000")
+
+    def test_uses_exact_decimal_arithmetic_not_float_on_large_balances(self):
+        # real pump.fun balances are routinely in the hundreds of
+        # thousands to millions of tokens - float division could drift a
+        # requested sell amount fractionally above the real balance
+        client = self._make_client()
+        our_key = str(client.keypair.pubkey())
+        response = {
+            "result": {
+                "meta": {
+                    "preTokenBalances": [],
+                    "postTokenBalances": [
+                        {
+                            "owner": our_key, "mint": "MINT123",
+                            "uiTokenAmount": {"amount": "427653965632", "decimals": 6},
+                        },
+                    ],
+                },
+            },
+        }
+        session = _FakeSession([response])
+        with patch("pumpfun_bot.pumpportal_client.aiohttp.ClientSession", return_value=session):
+            amount = asyncio.run(client._fetch_real_token_amount("SIG", "MINT123"))
+        self.assertEqual(amount, "427653.965632")
 
     def test_ignores_other_wallets_and_other_mints(self):
         client = self._make_client()
@@ -382,9 +421,18 @@ class FetchRealTokenAmountTests(unittest.TestCase):
                 "meta": {
                     "preTokenBalances": [],
                     "postTokenBalances": [
-                        {"owner": "SOME_OTHER_WALLET", "mint": "MINT123", "uiTokenAmount": {"amount": "9999999"}},
-                        {"owner": our_key, "mint": "DIFFERENT_MINT", "uiTokenAmount": {"amount": "8888888"}},
-                        {"owner": our_key, "mint": "MINT123", "uiTokenAmount": {"amount": "42"}},
+                        {
+                            "owner": "SOME_OTHER_WALLET", "mint": "MINT123",
+                            "uiTokenAmount": {"amount": "9999999", "decimals": 6},
+                        },
+                        {
+                            "owner": our_key, "mint": "DIFFERENT_MINT",
+                            "uiTokenAmount": {"amount": "8888888", "decimals": 6},
+                        },
+                        {
+                            "owner": our_key, "mint": "MINT123",
+                            "uiTokenAmount": {"amount": "42", "decimals": 6},
+                        },
                     ],
                 },
             },
@@ -392,7 +440,7 @@ class FetchRealTokenAmountTests(unittest.TestCase):
         session = _FakeSession([response])
         with patch("pumpfun_bot.pumpportal_client.aiohttp.ClientSession", return_value=session):
             amount = asyncio.run(client._fetch_real_token_amount("SIG", "MINT123"))
-        self.assertEqual(amount, 42)
+        self.assertEqual(amount, "0.000042")
 
     def test_returns_none_when_our_account_never_appears_in_post_balances(self):
         client = self._make_client()
@@ -436,9 +484,13 @@ class FetchRealTokenAmountTests(unittest.TestCase):
 
 class BuildAndSendFullSellByAmountTests(unittest.TestCase):
     """Verifies the exact request body for the absolute-amount sell path -
-    "amount" must be the raw integer token count, NOT a percentage string,
-    since the whole point is skipping PumpPortal's own balance-index
-    lookup (see build_and_send_full_sell_by_amount's docstring)."""
+    "amount" must be a UI-decimal STRING (e.g. "427653.965632"), NOT a
+    percentage string and NOT a raw base-unit integer. Real bug found
+    live 2026-08-25: the raw-base-unit version got a flat 400 from
+    PumpPortal on the very first real exit; confirmed via a safe (no
+    money at risk) empirical test against their trade-local endpoint
+    that the UI-decimal string is what they actually accept - see
+    build_and_send_full_sell_by_amount's docstring."""
 
     def _make_client(self):
         return PumpPortalClient(
@@ -448,7 +500,7 @@ class BuildAndSendFullSellByAmountTests(unittest.TestCase):
             keypair=Keypair(),
         )
 
-    def test_sends_the_raw_integer_amount_not_a_percentage(self):
+    def test_sends_the_ui_decimal_string_amount_not_raw_base_units(self):
         client = self._make_client()
         captured = {}
 
@@ -461,17 +513,17 @@ class BuildAndSendFullSellByAmountTests(unittest.TestCase):
 
         result = asyncio.run(
             client.build_and_send_full_sell_by_amount(
-                mint="MINT123", token_amount=1_500_000, slippage_pct=10,
+                mint="MINT123", token_amount="427653.965632", slippage_pct=10,
             )
         )
 
         self.assertEqual(captured["action"], "sell")
-        self.assertEqual(captured["amount"], 1_500_000)
-        self.assertIsInstance(captured["amount"], int)
+        self.assertEqual(captured["amount"], "427653.965632")
+        self.assertIsInstance(captured["amount"], str)
         self.assertEqual(captured["denominatedInSol"], "false")
         self.assertEqual(captured["mint"], "MINT123")
         self.assertEqual(result["signature"], "fake_signature")
-        self.assertEqual(result["amount"], 1_500_000)
+        self.assertEqual(result["amount"], "427653.965632")
 
     def test_defaults_to_pool_auto(self):
         client = self._make_client()
@@ -486,7 +538,7 @@ class BuildAndSendFullSellByAmountTests(unittest.TestCase):
 
         asyncio.run(
             client.build_and_send_full_sell_by_amount(
-                mint="MINT123", token_amount=1_500_000, slippage_pct=10,
+                mint="MINT123", token_amount="1.500000", slippage_pct=10,
             )
         )
 
