@@ -345,6 +345,20 @@ class SniperStrategy:
         if not self.cfg.enabled:
             return
         logger.info("Sniper strategie gestart (dry_run=%s).", self.dry_run)
+        # user-requested 2026-08-24 ("check last data... already make
+        # improvement") - real bug found live: self.blocked_wallets started
+        # empty on EVERY restart and was only ever populated by
+        # _refresh_background_state_loop, which sleeps WALLET_BLOCKLIST_
+        # REFRESH_SEC (60s) BEFORE its first check - unlike the model-gate
+        # init just below, which already loads synchronously here. With
+        # 168 real wallets blocked as of this session, that's a real 60s
+        # window on every single restart where sniper would buy from a
+        # launcher already known to repeatedly produce losers. Load
+        # synchronously here too, same as the model gate already does.
+        try:
+            self.blocked_wallets = blocked_wallets(DATA_LOG_PATH)
+        except Exception:  # noqa: BLE001
+            logger.exception("Kon wallet-blocklist niet initieel laden.")
         if self.cfg.model_score_min_to_buy > 0:
             try:
                 self._creator_win_rates = sniper_model.build_creator_win_rates(DATA_LOG_PATH)
