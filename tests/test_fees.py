@@ -4,6 +4,7 @@ from pumpfun_bot.fees import (
     DRY_RUN_SLIPPAGE_PENALTY_PCT_BY_REASON,
     FEE_PCT_PER_LEG,
     PRIORITY_FEE_SOL_PER_LEG,
+    SNIPER_BUY_PRIORITY_FEE_SOL_PER_LEG,
     TAKE_PROFIT_PRIORITY_FEE_SOL_PER_LEG,
     apply_dry_run_slippage_penalty,
     net_pct_change_after_fees,
@@ -91,6 +92,21 @@ class PrioritySellFeeTests(unittest.TestCase):
     def test_round_trip_fee_for_stop_loss_is_the_flat_default(self):
         expected = PRIORITY_FEE_SOL_PER_LEG * 2
         self.assertAlmostEqual(round_trip_priority_fee_sol_for_reason("stop_loss"), expected)
+
+
+class SniperBuyPriorityFeeTests(unittest.TestCase):
+    """User-requested 2026-08-24 ("how can i make the bot faster" -> "yes")
+    - real gap found: sniper's real buy call never overrode
+    priority_fee_sol at all, even though sniper's whole edge is speed."""
+
+    def test_the_boost_is_meaningfully_bigger_than_the_default(self):
+        self.assertGreater(SNIPER_BUY_PRIORITY_FEE_SOL_PER_LEG, PRIORITY_FEE_SOL_PER_LEG)
+
+    def test_the_buy_boost_is_smaller_than_the_take_profit_sell_boost(self):
+        # deliberate: a buy fee is paid on every candidate, win or lose;
+        # take_profit only fires on an already-winning position - the same
+        # multiplier compounds far more often on the buy side
+        self.assertLess(SNIPER_BUY_PRIORITY_FEE_SOL_PER_LEG, TAKE_PROFIT_PRIORITY_FEE_SOL_PER_LEG)
 
 
 if __name__ == "__main__":

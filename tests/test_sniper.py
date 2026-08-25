@@ -631,7 +631,7 @@ class _FakeOnChainFailClient:
             yield {}  # pragma: no cover - never reached, keeps this an async generator
         return _stream()
 
-    async def build_and_send_trade(self, action, mint, amount_sol, slippage_pct):
+    async def build_and_send_trade(self, action, mint, amount_sol, slippage_pct, priority_fee_sol=None):
         raise self._error
 
 
@@ -654,7 +654,7 @@ class FailedBuyFeeAccountingTests(unittest.TestCase):
         self._tmpdir.cleanup()
 
     def test_an_onchain_buy_failure_registers_a_real_fee_loss(self):
-        from pumpfun_bot.fees import PRIORITY_FEE_SOL_PER_LEG
+        from pumpfun_bot.fees import SNIPER_BUY_PRIORITY_FEE_SOL_PER_LEG
         from pumpfun_bot.pumpportal_client import OnChainTransactionError
 
         error = OnChainTransactionError("Transactie X is gefaald on-chain: ...", custom_error_code=6002)
@@ -671,7 +671,9 @@ class FailedBuyFeeAccountingTests(unittest.TestCase):
 
         asyncio.run(strategy.run())
 
-        self.assertAlmostEqual(strategy.risk.state.realized_pnl_sol, -PRIORITY_FEE_SOL_PER_LEG, places=6)
+        self.assertAlmostEqual(
+            strategy.risk.state.realized_pnl_sol, -SNIPER_BUY_PRIORITY_FEE_SOL_PER_LEG, places=6,
+        )
         self.assertAlmostEqual(strategy.risk.state.open_exposure_sol, 0.0)  # never registered as opened
 
     def test_a_non_onchain_failure_does_not_register_a_fee_loss(self):
@@ -691,6 +693,74 @@ class FailedBuyFeeAccountingTests(unittest.TestCase):
         asyncio.run(strategy.run())
 
         self.assertAlmostEqual(strategy.risk.state.realized_pnl_sol, 0.0)
+
+
+class _FakeSuccessfulBuyClient:
+    """Records the kwargs a real buy was called with, then succeeds -
+    for asserting on priority_fee_sol specifically, unlike
+    _FakeOnChainFailClient (which only ever raises)."""
+
+    def __init__(self, events, rpc_http_url="https://example.invalid/rpc", signature="sig"):
+        self._events = events
+        self.rpc_http_url = rpc_http_url
+        self._signature = signature
+        self.buy_calls = []
+
+    def stream_new_tokens(self):
+        async def _gen():
+            for event in self._events:
+                yield event
+        return _gen()
+
+    def stream_token_trades(self, mints):
+        async def _stream():
+            await asyncio.sleep(3600)
+            yield {}  # pragma: no cover
+        return _stream()
+
+    async def build_and_send_trade(self, action, mint, amount_sol, slippage_pct, priority_fee_sol=None):
+        self.buy_calls.append({
+            "action": action, "mint": mint, "amount_sol": amount_sol,
+            "slippage_pct": slippage_pct, "priority_fee_sol": priority_fee_sol,
+        })
+        return {"signature": self._signature}
+
+
+class BuySpeedPriorityFeeTests(unittest.TestCase):
+    """User-requested 2026-08-24 ("how can i make the bot faster" -> "yes")
+    - real gap found: sniper's real buy call never overrode priority_fee_sol
+    at all, so every real buy used the flat, unboosted default even though
+    sniper's whole documented edge is being first."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._path = Path(self._tmpdir.name) / "sniper_seen_launch_names.json"
+        self._patcher = patch(
+            "pumpfun_bot.strategies.sniper.SEEN_LAUNCH_NAMES_PATH", self._path,
+        )
+        self._patcher.start()
+
+    def tearDown(self):
+        self._patcher.stop()
+        self._tmpdir.cleanup()
+
+    def test_a_real_buy_uses_the_boosted_sniper_priority_fee(self):
+        from pumpfun_bot.fees import PRIORITY_FEE_SOL_PER_LEG, SNIPER_BUY_PRIORITY_FEE_SOL_PER_LEG
+
+        client = _FakeSuccessfulBuyClient(events=[{
+            "mint": "MINT", "name": "Fast", "symbol": "FAST",
+            "vSolInBondingCurve": 30.0, "traderPublicKey": "CREATOR",
+        }])
+        strategy = _make_strategy(
+            cfg=SniperConfig(enabled=True), client=client, alerter=_FakeAlerter(), dry_run=False,
+        )
+
+        asyncio.run(strategy.run())
+
+        self.assertEqual(len(client.buy_calls), 1)
+        self.assertEqual(client.buy_calls[0]["priority_fee_sol"], SNIPER_BUY_PRIORITY_FEE_SOL_PER_LEG)
+        # confirms it's a real boost, not accidentally left at the old flat default
+        self.assertGreater(SNIPER_BUY_PRIORITY_FEE_SOL_PER_LEG, PRIORITY_FEE_SOL_PER_LEG)
 
 
 if __name__ == "__main__":

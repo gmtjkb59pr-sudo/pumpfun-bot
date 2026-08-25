@@ -64,6 +64,21 @@ ROUND_TRIP_PRIORITY_FEE_SOL = PRIORITY_FEE_SOL_PER_LEG * 2
 TAKE_PROFIT_PRIORITY_FEE_SOL_PER_LEG = PRIORITY_FEE_SOL_PER_LEG * 5
 _BOOSTED_SELL_PRIORITY_FEE_REASONS = frozenset({"take_profit", "take_profit_ladder"})
 
+# user-requested 2026-08-24 ("how can i make the bot faster" -> "yes"):
+# sniper's own buy call never overrode priority_fee_sol at all, so every
+# real buy used the flat default below - a real, unaddressed gap given
+# sniper's whole documented edge is being first. Same "provisional
+# placeholder" epistemic status as TAKE_PROFIT_PRIORITY_FEE_SOL_PER_LEG
+# above - no real landing-time-vs-fee data exists for buys yet either.
+# Deliberately a SMALLER multiplier (3x, not 5x) than the take_profit
+# boost: a buy fee is paid on EVERY candidate sniper attempts, win or
+# lose, while take_profit only fires on an already-winning position - the
+# same multiplier compounds far more often here, so start more
+# conservative and revisit with real data. Scoped to sniper only:
+# social_watch already tolerates real delay by design (its watch_window_
+# sec), speed isn't its edge the way it is sniper's.
+SNIPER_BUY_PRIORITY_FEE_SOL_PER_LEG = PRIORITY_FEE_SOL_PER_LEG * 3
+
 
 def priority_fee_sol_for_sell(reason: str) -> float:
     """The priority fee to attach to a real sell transaction for this exit

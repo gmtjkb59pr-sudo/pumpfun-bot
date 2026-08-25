@@ -14,7 +14,7 @@ from pathlib import Path
 from ..activity_log import DATA_LOG_PATH
 from ..alerts import Alerter
 from ..config import SniperConfig
-from ..fees import PRIORITY_FEE_SOL_PER_LEG
+from ..fees import SNIPER_BUY_PRIORITY_FEE_SOL_PER_LEG
 from ..holder_concentration import fetch_top10_concentration_pct
 from ..holder_count import record_holder_count
 from ..outcome_tracker import OutcomeTracker
@@ -464,6 +464,13 @@ class SniperStrategy:
                     mint=mint,
                     amount_sol=self.trade_size_sol,
                     slippage_pct=self.slippage_pct,
+                    # user-requested 2026-08-24 ("how can i make the bot
+                    # faster" -> "yes") - real gap found: this call never
+                    # overrode priority_fee_sol at all, so every real buy
+                    # used the flat, unboosted default even though
+                    # sniper's whole edge is being first. See fees.py's
+                    # SNIPER_BUY_PRIORITY_FEE_SOL_PER_LEG docstring.
+                    priority_fee_sol=SNIPER_BUY_PRIORITY_FEE_SOL_PER_LEG,
                 )
                 self.risk.register_trade_opened(self.trade_size_sol)
                 await self.risk.report_buy_result(success=True)
@@ -511,6 +518,12 @@ class SniperStrategy:
                     # exact on-chain fee - avoids an extra RPC round-trip on
                     # the failure path) - realized_pnl_sol never accounted
                     # for this at all before, looking better than reality by
-                    # the sum of every failed buy's fee.
-                    self.risk.register_trade_closed(0.0, -PRIORITY_FEE_SOL_PER_LEG)
+                    # the sum of every failed buy's fee. Uses the SAME
+                    # boosted fee actually submitted with the buy (see
+                    # SNIPER_BUY_PRIORITY_FEE_SOL_PER_LEG above) - a real
+                    # bug found live 2026-08-24 while boosting buy speed:
+                    # this line still hardcoded the OLD flat default, which
+                    # would have understated every failed-buy loss by the
+                    # difference once the boost shipped.
+                    self.risk.register_trade_closed(0.0, -SNIPER_BUY_PRIORITY_FEE_SOL_PER_LEG)
                 await self.alerter.send(f"❌ Snipe mislukt voor {symbol}: {exc}")
