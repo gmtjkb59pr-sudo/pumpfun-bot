@@ -73,6 +73,19 @@ class RiskConfig:
     # switch above toggled off, and activates automatically if sizes ever
     # grow enough to make the fixed tip cost proportionate again.
     max_jito_tip_pct_of_trade: float = 10.0
+    # user-requested 2026-08-25 ("how can i execute the bot faster" ->
+    # "both") - same Jito-bundle mechanism as take_profit sells, applied
+    # to sniper's real buys: guarantees atomic same-slot inclusion instead
+    # of racing other bots on the public mempool for the buy that IS
+    # sniper's whole edge. Same max_jito_tip_pct_of_trade size gate above
+    # applies - at sniper's real trade_size_sol (~0.012 SOL) a 0.01 SOL
+    # tip is ~83% of the trade, so this stays naturally dormant unless
+    # trade sizes grow, same self-limiting design as the sell-side flag.
+    # Default OFF, separate from use_jito_bundles_for_take_profit - a buy
+    # fee/tip is paid on every candidate attempted, win or lose, not just
+    # an already-winning position, so this gets its own explicit opt-in
+    # rather than being silently bundled into the sell-side flag.
+    use_jito_bundles_for_sniper_buys: bool = False
 
 
 @dataclass
@@ -541,6 +554,7 @@ def load_config(path: str = "config.yaml") -> AppConfig:
             "jito_block_engine_url", "https://mainnet.block-engine.jito.wtf",
         ),
         max_jito_tip_pct_of_trade=risk_raw.get("max_jito_tip_pct_of_trade", 10.0),
+        use_jito_bundles_for_sniper_buys=risk_raw.get("use_jito_bundles_for_sniper_buys", False),
     )
 
     strat_raw = raw.get("strategies", {})

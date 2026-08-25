@@ -813,6 +813,145 @@ class BuildAndSendFullSellViaJitoBundleTests(unittest.TestCase):
         self.assertEqual(result["amount"], "99%")
 
 
+class BuildAndSendTradeViaJitoBundleTests(unittest.TestCase):
+    """User-requested 2026-08-25 ("how can i execute the bot faster" ->
+    "both") - same real buy as build_and_send_trade, submitted as a Jito
+    bundle. Mirrors BuildAndSendFullSellViaJitoBundleTests exactly - same
+    single-object-endpoint-plus-independent-tip-tx approach, applied to
+    the buy side this time."""
+
+    def _make_client(self):
+        return PumpPortalClient(
+            ws_url="wss://example.invalid",
+            trade_api_url="https://example.invalid/trade-local",
+            rpc_http_url="https://example.invalid/rpc",
+            keypair=Keypair(),
+        )
+
+    def test_posts_a_single_object_with_sol_denominated_amount(self):
+        client = self._make_client()
+        raw = _fake_unsigned_tx_raw_bytes(client.keypair.pubkey())
+        session = _FakeJitoSession(_FakeJitoResponse(status=200, raw_bytes=raw))
+
+        with patch(
+            "pumpfun_bot.pumpportal_client.aiohttp.ClientSession", return_value=session,
+        ), patch(
+            "pumpfun_bot.pumpportal_client.jito.send_bundle", return_value="BUNDLE_ID",
+        ), patch(
+            "pumpfun_bot.pumpportal_client.jito.poll_bundle_until_landed",
+            return_value={"confirmation_status": "confirmed", "err": None},
+        ):
+            asyncio.run(client.build_and_send_trade_via_jito_bundle(
+                action="buy", mint="MINT123", amount_sol=0.05, slippage_pct=10,
+            ))
+
+        args, kwargs = session.post_calls[0]
+        posted_body = kwargs["json"]
+        self.assertIsInstance(posted_body, dict)
+        self.assertEqual(posted_body["action"], "buy")
+        self.assertEqual(posted_body["amount"], 0.05)
+        self.assertEqual(posted_body["denominatedInSol"], "true")
+
+    def test_submits_a_two_transaction_bundle_including_a_real_tip_account(self):
+        from pumpfun_bot.jito import TIP_ACCOUNTS
+
+        client = self._make_client()
+        raw = _fake_unsigned_tx_raw_bytes(client.keypair.pubkey())
+        session = _FakeJitoSession(_FakeJitoResponse(status=200, raw_bytes=raw))
+        captured = {}
+
+        async def _fake_send_bundle(signed_txs, block_engine_url=None):
+            captured["signed_txs"] = signed_txs
+            return "BUNDLE_ID"
+
+        with patch(
+            "pumpfun_bot.pumpportal_client.aiohttp.ClientSession", return_value=session,
+        ), patch(
+            "pumpfun_bot.pumpportal_client.jito.send_bundle", side_effect=_fake_send_bundle,
+        ), patch(
+            "pumpfun_bot.pumpportal_client.jito.poll_bundle_until_landed",
+            return_value={"confirmation_status": "confirmed", "err": None},
+        ):
+            asyncio.run(client.build_and_send_trade_via_jito_bundle(
+                action="buy", mint="MINT123", amount_sol=0.05, slippage_pct=10,
+            ))
+
+        signed_txs = captured["signed_txs"]
+        self.assertEqual(len(signed_txs), 2)
+        tip_tx = VersionedTransaction.from_bytes(signed_txs[1])
+        tip_account_keys = {str(k) for k in tip_tx.message.account_keys}
+        self.assertTrue(tip_account_keys & set(TIP_ACCOUNTS))
+
+    def test_never_fetches_real_sol_delta_for_a_buy(self):
+        # matches build_and_send_trade's own existing behavior - a buy is
+        # speed-critical and doesn't need the real-delta lookup
+        client = self._make_client()
+        raw = _fake_unsigned_tx_raw_bytes(client.keypair.pubkey())
+        session = _FakeJitoSession(_FakeJitoResponse(status=200, raw_bytes=raw))
+
+        async def _fail_if_called(sig):
+            raise AssertionError("must not fetch real_sol_delta for a buy")
+        client._fetch_real_sol_delta = _fail_if_called
+
+        with patch(
+            "pumpfun_bot.pumpportal_client.aiohttp.ClientSession", return_value=session,
+        ), patch(
+            "pumpfun_bot.pumpportal_client.jito.send_bundle", return_value="BUNDLE_ID",
+        ), patch(
+            "pumpfun_bot.pumpportal_client.jito.poll_bundle_until_landed",
+            return_value={"confirmation_status": "confirmed", "err": None},
+        ):
+            result = asyncio.run(client.build_and_send_trade_via_jito_bundle(
+                action="buy", mint="MINT123", amount_sol=0.05, slippage_pct=10,
+            ))
+        self.assertIsNone(result["real_sol_delta"])
+
+    def test_raises_on_a_non_200_from_pumpportal(self):
+        client = self._make_client()
+        session = _FakeJitoSession(_FakeJitoResponse(status=500, text="server error"))
+        with patch("pumpfun_bot.pumpportal_client.aiohttp.ClientSession", return_value=session):
+            with self.assertRaises(RuntimeError):
+                asyncio.run(client.build_and_send_trade_via_jito_bundle(
+                    action="buy", mint="MINT123", amount_sol=0.05, slippage_pct=10,
+                ))
+
+    def test_raises_when_the_bundle_never_gets_a_bundle_id(self):
+        client = self._make_client()
+        raw = _fake_unsigned_tx_raw_bytes(client.keypair.pubkey())
+        session = _FakeJitoSession(_FakeJitoResponse(status=200, raw_bytes=raw))
+        with patch(
+            "pumpfun_bot.pumpportal_client.aiohttp.ClientSession", return_value=session,
+        ), patch(
+            "pumpfun_bot.pumpportal_client.jito.send_bundle", return_value=None,
+        ):
+            with self.assertRaises(RuntimeError):
+                asyncio.run(client.build_and_send_trade_via_jito_bundle(
+                    action="buy", mint="MINT123", amount_sol=0.05, slippage_pct=10,
+                ))
+
+    def test_raises_on_chain_transaction_error_when_the_bundle_lands_with_an_error(self):
+        client = self._make_client()
+        raw = _fake_unsigned_tx_raw_bytes(client.keypair.pubkey())
+        session = _FakeJitoSession(_FakeJitoResponse(status=200, raw_bytes=raw))
+        landed_with_error = {
+            "confirmation_status": "confirmed",
+            "err": {"InstructionError": [3, {"Custom": 6002}]},
+        }
+        with patch(
+            "pumpfun_bot.pumpportal_client.aiohttp.ClientSession", return_value=session,
+        ), patch(
+            "pumpfun_bot.pumpportal_client.jito.send_bundle", return_value="BUNDLE_ID",
+        ), patch(
+            "pumpfun_bot.pumpportal_client.jito.poll_bundle_until_landed",
+            return_value=landed_with_error,
+        ):
+            with self.assertRaises(OnChainTransactionError) as ctx:
+                asyncio.run(client.build_and_send_trade_via_jito_bundle(
+                    action="buy", mint="MINT123", amount_sol=0.05, slippage_pct=10,
+                ))
+        self.assertEqual(ctx.exception.custom_error_code, 6002)
+
+
 async def _async_ret(value):
     return value
 

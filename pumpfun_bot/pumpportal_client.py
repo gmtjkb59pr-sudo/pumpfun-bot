@@ -187,6 +187,92 @@ class PumpPortalClient:
             "real_sol_delta": real_sol_delta,
         }
 
+    async def build_and_send_trade_via_jito_bundle(
+        self,
+        action: str,
+        mint: str,
+        amount_sol: float,
+        slippage_pct: float,
+        priority_fee_sol: float = PRIORITY_FEE_SOL_PER_LEG,
+        tip_sol: float = jito.RECOMMENDED_TIP_SOL,
+        pool: str = "auto",
+        block_engine_url: str = jito.DEFAULT_BLOCK_ENGINE_URL,
+        bundle_timeout_sec: float = jito.BUNDLE_STATUS_TIMEOUT_SEC,
+    ) -> dict:
+        """
+        User-requested 2026-08-25 ("how can i execute the bot faster" ->
+        "both") - same real trade as build_and_send_trade, but submitted
+        as a Jito bundle. Mirrors build_and_send_full_sell_via_jito_bundle
+        exactly (see that method's docstring for the full story of how
+        this bundle-submission approach was arrived at - PumpPortal's own
+        array-mode endpoint 400s on real trades, so this fetches the
+        unsigned tx through the SAME proven single-object endpoint
+        build_and_send_trade already uses, signs it locally, and submits
+        it alongside a second, independent tip-only transaction built by
+        jito.build_tip_transaction - never touching or modifying
+        PumpPortal's own transaction).
+
+        tip_sol is a real, separate cost from priority_fee_sol, paid only
+        when this path is used - see priority_fee_sol_for_sell's sibling
+        reasoning in fees.py. Sized the same as the sell-side default
+        (jito.RECOMMENDED_TIP_SOL, empirically found live to actually
+        land a bundle) since the tip requirement is a Jito protocol
+        behavior, not specific to which side of a trade it's attached to.
+
+        Raises RuntimeError/OnChainTransactionError on any failure, same
+        contract as build_and_send_full_sell_via_jito_bundle - the
+        caller's existing retry/failure handling treats this the same as
+        any other failed buy attempt.
+        """
+        body = {
+            "publicKey": str(self.keypair.pubkey()),
+            "action": action,
+            "mint": mint,
+            "amount": amount_sol,
+            "denominatedInSol": "true",
+            "slippage": slippage_pct,
+            "priorityFee": priority_fee_sol,
+            "pool": pool,
+        }
+        async with aiohttp.ClientSession() as session:
+            async with session.post(self.trade_api_url, json=body, timeout=15) as resp:
+                if resp.status != 200:
+                    text = await resp.text()
+                    raise RuntimeError(f"PumpPortal trade-local fout ({resp.status}): {text}")
+                raw_tx_bytes = await resp.read()
+
+        tx = VersionedTransaction.from_bytes(raw_tx_bytes)
+        signed_tx = VersionedTransaction(tx.message, [self.keypair])
+        sig = str(signed_tx.signatures[0])
+
+        tip_lamports = round(tip_sol * 1_000_000_000)
+        tip_tx = jito.build_tip_transaction(self.keypair, tip_lamports, tx.message.recent_blockhash)
+
+        bundle_id = await jito.send_bundle([bytes(signed_tx), bytes(tip_tx)], block_engine_url)
+        if bundle_id is None:
+            raise RuntimeError(f"Jito bundle-verzending mislukt voor {mint} ({action}).")
+
+        status = await jito.poll_bundle_until_landed(
+            bundle_id, block_engine_url, timeout_sec=bundle_timeout_sec,
+        )
+        if status is None:
+            raise RuntimeError(
+                f"Jito bundle {bundle_id} niet bevestigd binnen {bundle_timeout_sec}s voor {mint} "
+                f"({action}) - onder-getipt, of geen validator heeft hem opgepikt."
+            )
+        err = status.get("err")
+        if err not in (None, {"Ok": None}):
+            raise OnChainTransactionError(
+                f"Jito bundle {bundle_id} is gefaald on-chain: {err}",
+                custom_error_code=_extract_custom_error_code(err),
+            )
+
+        real_sol_delta = await self._fetch_real_sol_delta(sig) if action == "sell" else None
+        return {
+            "signature": sig, "action": action, "mint": mint, "amount_sol": amount_sol,
+            "real_sol_delta": real_sol_delta, "bundle_id": bundle_id,
+        }
+
     async def build_and_send_full_sell(
         self,
         mint: str,
