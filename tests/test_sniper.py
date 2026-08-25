@@ -562,6 +562,55 @@ class PreBuyModelScoreGateTests(unittest.TestCase):
             strategy._log_shadow_model_score("MINT", "TEST", {})  # must not raise
 
 
+class WalletBlocklistStartupLoadTests(unittest.TestCase):
+    """User-requested 2026-08-24 ("check last data... already make
+    improvement") - real bug found live: self.blocked_wallets started
+    empty on every restart, only ever populated by
+    _refresh_background_state_loop which sleeps WALLET_BLOCKLIST_
+    REFRESH_SEC (60s) BEFORE its first check. With 168 real wallets
+    blocked as of this session, that's a real 60s window on every restart
+    where sniper would blindly buy from an already-known-bad launcher."""
+
+    def test_run_loads_the_full_blocklist_before_processing_the_first_candidate(self):
+        cfg = SniperConfig(enabled=True)
+        client = FakeTokenTradeStreamClient(events=[])
+        strategy = _make_strategy(cfg=cfg, client=client, alerter=_FakeAlerter())
+
+        async def _fake_stream_new_tokens():
+            yield {
+                "mint": "MINT", "name": "Bad Launcher", "symbol": "BAD",
+                "vSolInBondingCurve": 30.0, "traderPublicKey": "KNOWN_BAD_WALLET",
+            }
+        client.stream_new_tokens = _fake_stream_new_tokens
+
+        with patch(
+            "pumpfun_bot.strategies.sniper.blocked_wallets", return_value={"KNOWN_BAD_WALLET"},
+        ):
+            with self.assertLogs("pumpfun_bot.sniper", level="INFO") as ctx:
+                asyncio.run(strategy.run())
+        # rejected by _passes_filters on the very first (and only) event -
+        # never reached "Zou kopen", proving the blocklist was already
+        # populated before the buy loop started, not after a 60s wait
+        self.assertFalse(any("Zou kopen" in m for m in ctx.output))
+        self.assertEqual(strategy.blocked_wallets, {"KNOWN_BAD_WALLET"})
+
+    def test_a_failed_initial_load_is_caught_not_raised(self):
+        cfg = SniperConfig(enabled=True)
+        client = FakeTokenTradeStreamClient(events=[])
+        strategy = _make_strategy(cfg=cfg, client=client, alerter=_FakeAlerter())
+
+        async def _fake_stream_new_tokens():
+            return
+            yield  # pragma: no cover - makes this an async generator with zero events
+        client.stream_new_tokens = _fake_stream_new_tokens
+
+        with patch(
+            "pumpfun_bot.strategies.sniper.blocked_wallets", side_effect=RuntimeError("boom"),
+        ):
+            asyncio.run(strategy.run())  # must not raise
+        self.assertEqual(strategy.blocked_wallets, set())
+
+
 class _FakeOnChainFailClient:
     """A live buy that fails ON-CHAIN (e.g. Custom 6002 TooMuchSolRequired,
     a real, common buy-side slippage failure) - still pays a real priority
