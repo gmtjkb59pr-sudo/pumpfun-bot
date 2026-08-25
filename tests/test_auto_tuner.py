@@ -1,7 +1,9 @@
 import asyncio
+import json
+import tempfile
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from pumpfun_bot.auto_tuner import (
     EXIT_MIN_SAMPLES,
@@ -9,7 +11,20 @@ from pumpfun_bot.auto_tuner import (
     AutoTuner,
     decide_adjustments,
     decide_exit_adjustments,
+    load_persisted_changes,
 )
+
+
+def _write_log(records: list[dict]) -> str:
+    f = tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False)
+    for record in records:
+        f.write(json.dumps(record) + "\n")
+    f.close()
+    return f.name
+
+
+def _autotune_change(ts, field, from_, to, reason="test"):
+    return {"type": "autotune_change", "ts": ts, "field": field, "from": from_, "to": to, "reason": reason}
 
 
 def make_bucket(count, median_pct_change):
@@ -208,6 +223,148 @@ class ApplyTests(unittest.TestCase):
         }))
         # no exception, no alert sent - unroutable change is dropped, not applied blindly
         tuner.alerter.send.assert_not_called()
+
+
+class LoadPersistedChangesTests(unittest.TestCase):
+    """User-requested 2026-08-25 ("fix" the restart-wipes-tuning gap):
+    every applied change was always durably logged as an "autotune_change"
+    record (for the dashboard feed) even before this existed - this reads
+    that history back so AutoTuner can restore its own prior tightening
+    across a restart instead of starting over from config.yaml every time."""
+
+    def test_returns_the_latest_change_per_field(self):
+        log_path = _write_log([
+            _autotune_change(100, "min_liquidity_sol", 5.0, 20.0),
+            _autotune_change(200, "require_socials", False, True),
+            _autotune_change(300, "min_liquidity_sol", 20.0, 25.0),  # tightened again, later
+        ])
+        result = load_persisted_changes(log_path)
+        self.assertEqual(result["min_liquidity_sol"]["to"], 25.0)
+        self.assertEqual(result["require_socials"]["to"], True)
+
+    def test_ignores_unrelated_activity_log_records(self):
+        log_path = _write_log([
+            {"type": "trade", "action": "buy", "mint": "MINT"},
+            {"type": "exit", "mint": "MINT", "pct_change": 10.0},
+            _autotune_change(100, "min_liquidity_sol", 5.0, 20.0),
+        ])
+        result = load_persisted_changes(log_path)
+        self.assertEqual(list(result.keys()), ["min_liquidity_sol"])
+
+    def test_missing_log_file_returns_empty_not_an_error(self):
+        result = load_persisted_changes("/tmp/definitely-does-not-exist-auto-tuner.jsonl")
+        self.assertEqual(result, {})
+
+    def test_empty_log_returns_empty(self):
+        log_path = _write_log([])
+        result = load_persisted_changes(log_path)
+        self.assertEqual(result, {})
+
+
+class RestorePersistedChangesTests(unittest.TestCase):
+    """Real bug found live 2026-08-25: this live-trading bot restarted
+    every ~5-20 minutes all session (once per shipped fix) - AutoTuner's
+    own 60s check interval likely fired plenty, but _apply() only ever
+    mutated the running process's in-memory config, never anything
+    durable, so every restart silently discarded whatever it had learned.
+    restore_persisted_changes replays the SAME "autotune_change" history
+    _apply() already logs, once at startup, before the live tuning loop
+    begins - see AutoTuner.run()."""
+
+    def test_restores_a_tightened_liquidity_threshold(self):
+        log_path = _write_log([_autotune_change(100, "min_liquidity_sol", 5.0, 20.0)])
+        risk = MagicMock(cfg=SimpleNamespace(min_liquidity_sol=5.0))
+        tuner = _make_tuner(risk=risk, log_path=log_path)
+
+        asyncio.run(tuner.restore_persisted_changes())
+
+        self.assertEqual(risk.cfg.min_liquidity_sol, 20.0)
+
+    def test_restores_require_socials(self):
+        log_path = _write_log([_autotune_change(100, "require_socials", False, True)])
+        sniper_cfg = SimpleNamespace(require_socials=False)
+        tuner = _make_tuner(sniper_cfg=sniper_cfg, log_path=log_path)
+
+        asyncio.run(tuner.restore_persisted_changes())
+
+        self.assertTrue(sniper_cfg.require_socials)
+
+    def test_restores_take_profit_pct_downward(self):
+        log_path = _write_log([_autotune_change(100, "take_profit_pct", 50.0, 20.0)])
+        outcome_tracker = SimpleNamespace(take_profit_pct=50.0)
+        tuner = _make_tuner(outcome_tracker=outcome_tracker, log_path=log_path)
+
+        asyncio.run(tuner.restore_persisted_changes())
+
+        self.assertEqual(outcome_tracker.take_profit_pct, 20.0)
+
+    def test_restores_min_holder_count_for_social_watch_and_birdeye_separately(self):
+        log_path = _write_log([
+            _autotune_change(100, "min_holder_count", 1, 50),
+            _autotune_change(100, "birdeye_movers_min_holder_count", 1, 75),
+        ])
+        social_cfg = SimpleNamespace(min_holder_count=1)
+        birdeye_cfg = SimpleNamespace(min_holder_count=1)
+        tuner = _make_tuner(social_watch_cfg=social_cfg, birdeye_movers_cfg=birdeye_cfg, log_path=log_path)
+
+        asyncio.run(tuner.restore_persisted_changes())
+
+        self.assertEqual(social_cfg.min_holder_count, 50)
+        self.assertEqual(birdeye_cfg.min_holder_count, 75)
+
+    def test_never_loosens_when_the_current_config_is_already_stricter(self):
+        # e.g. the user hand-edited config.yaml since the persisted change
+        # was made - config.yaml's own value must win, never get relaxed
+        # back down to an older, looser persisted value
+        log_path = _write_log([_autotune_change(100, "min_liquidity_sol", 5.0, 10.0)])
+        risk = MagicMock(cfg=SimpleNamespace(min_liquidity_sol=25.0))
+        tuner = _make_tuner(risk=risk, log_path=log_path)
+
+        asyncio.run(tuner.restore_persisted_changes())
+
+        self.assertEqual(risk.cfg.min_liquidity_sol, 25.0)
+
+    def test_restoring_never_sends_an_alert_or_re_logs_a_change(self):
+        # this is a silent replay of a decision already announced when it
+        # first happened, not a new one
+        log_path = _write_log([_autotune_change(100, "min_liquidity_sol", 5.0, 20.0)])
+        risk = MagicMock(cfg=SimpleNamespace(min_liquidity_sol=5.0))
+        tuner = _make_tuner(risk=risk, log_path=log_path)
+
+        asyncio.run(tuner.restore_persisted_changes())
+
+        tuner.alerter.send.assert_not_called()
+
+    def test_no_persisted_history_is_a_clean_no_op(self):
+        log_path = _write_log([])
+        risk = MagicMock(cfg=SimpleNamespace(min_liquidity_sol=5.0))
+        tuner = _make_tuner(risk=risk, log_path=log_path)
+
+        asyncio.run(tuner.restore_persisted_changes())  # must not raise
+
+        self.assertEqual(risk.cfg.min_liquidity_sol, 5.0)
+        tuner.alerter.send.assert_not_called()
+
+    def test_run_restores_before_entering_the_live_tuning_loop(self):
+        # confirms the wiring in run() itself, not just the method in
+        # isolation - patches asyncio.sleep to raise after the first call
+        # so the test doesn't actually wait, and to prove restore ran
+        # BEFORE that first sleep
+        log_path = _write_log([_autotune_change(100, "min_liquidity_sol", 5.0, 20.0)])
+        risk = MagicMock(cfg=SimpleNamespace(min_liquidity_sol=5.0))
+        tuner = _make_tuner(risk=risk, log_path=log_path)
+
+        class _StopLoop(Exception):
+            pass
+
+        async def _fake_sleep(_seconds):
+            raise _StopLoop
+
+        with patch("pumpfun_bot.auto_tuner.asyncio.sleep", new=_fake_sleep):
+            with self.assertRaises(_StopLoop):
+                asyncio.run(tuner.run())
+
+        self.assertEqual(risk.cfg.min_liquidity_sol, 20.0)
 
 
 if __name__ == "__main__":

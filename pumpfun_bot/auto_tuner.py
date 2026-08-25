@@ -13,12 +13,23 @@ Deliberately conservative:
 - Every change is logged both to the persistent activity log and as a
   regular alert (so it shows up in the dashboard's live feed like anything
   else the bot does) - nothing changes silently.
-- Changes only live in the running process's config objects, never written
-  back to config.yaml - a restart reverts to your own configured values.
+- Changes only ever live in the running process's config objects, never
+  written back to config.yaml - a restart reverts to your OWN configured
+  values there, so hand-editing config.yaml always stays authoritative.
+  A restart no longer means starting over from scratch, though: every
+  applied change was always durably logged (the "autotune_change" record
+  below) even before this existed - AutoTuner now replays that history at
+  startup (see restore_persisted_changes) before resuming live tuning, so
+  real evidence-based tightening survives a restart instead of silently
+  reverting every time. Real gap found live 2026-08-25: a live-trading
+  session restarted every ~5-20 minutes (once per shipped fix) meant this
+  module's own 60s check interval likely fired plenty, but nothing it
+  learned ever survived past the next restart.
 """
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 
@@ -46,6 +57,37 @@ LIQUIDITY_BUCKET_THRESHOLDS = {
 EXIT_MIN_SAMPLES = 15
 EXIT_MARGIN_PCT = 10.0
 MIN_TAKE_PROFIT_PCT = 10.0  # sanity floor - never auto-tune below this
+
+
+def load_persisted_changes(log_path=DATA_LOG_PATH) -> dict[str, dict]:
+    """Returns the LATEST "autotune_change" record per field from the
+    persistent activity log - every change _apply() ever made was already
+    durably logged there (for the dashboard's live feed), this just reads
+    that history back so a restart can replay it instead of starting over.
+    Fails open (empty dict) on a missing/unreadable log - never treat "no
+    history yet" as anything other than "nothing to restore"."""
+    latest: dict[str, dict] = {}
+    try:
+        with open(log_path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except (ValueError, TypeError):
+                    continue
+                if record.get("type") != "autotune_change":
+                    continue
+                field = record.get("field")
+                if not field:
+                    continue
+                existing = latest.get(field)
+                if existing is None or record.get("ts", 0) >= existing.get("ts", 0):
+                    latest[field] = record
+    except FileNotFoundError:
+        pass
+    return latest
 
 
 def decide_exit_adjustments(stats: dict, current_take_profit_pct: float) -> list[dict]:
@@ -182,6 +224,7 @@ class AutoTuner:
         self.checkpoint_sec = checkpoint_sec
 
     async def run(self) -> None:
+        await self.restore_persisted_changes()
         while True:
             await asyncio.sleep(self.interval_sec)
             stats = compute_stats(self.log_path)
@@ -234,3 +277,62 @@ class AutoTuner:
         logger.warning(message)
         append_jsonl({"type": "autotune_change", "ts": time.time(), **change})
         await self.alerter.send(message)
+
+    async def restore_persisted_changes(self) -> None:
+        """Re-applies whatever a PREVIOUS run already tightened, read back
+        from the persistent activity log (see load_persisted_changes) -
+        called once at startup, before the periodic tuning loop begins.
+        User-requested 2026-08-25 ("fix" the restart-wipes-tuning gap).
+
+        Deliberately silent (no re-alert, no re-log of an "autotune_change"
+        record) - this is a restore of a decision already announced when
+        it first happened, not a new one. Uses _apply_restored (not
+        _apply) so it can never LOOSEN anything: if config.yaml's own
+        current value is already at or past what was persisted (the user
+        edited it directly since then, or a fresh RiskConfig/SniperConfig
+        default happens to already be stricter), that current value wins -
+        same "only ever tighten" invariant this whole module already
+        guarantees for a live decision."""
+        persisted = load_persisted_changes(self.log_path)
+        for field, change in persisted.items():
+            to_value = change.get("to")
+            if to_value is None:
+                continue
+            restored_from = self._apply_restored(field, to_value)
+            if restored_from is not None:
+                logger.info(
+                    "Auto-tune hersteld van vorige run: %s %s -> %s (%s)",
+                    field, restored_from, to_value, change.get("reason", ""),
+                )
+
+    def _apply_restored(self, field: str, to_value):
+        """Same field mapping as _apply(), but only ever moves a value
+        TOWARD to_value if that's actually tighter than what's already
+        configured right now - returns the previous value if it changed
+        anything, None if to_value wasn't actually an improvement (already
+        at or past it) or the field/target isn't wired up for this run."""
+        if field == "require_socials":
+            if to_value and not self.sniper_cfg.require_socials:
+                self.sniper_cfg.require_socials = True
+                return False
+        elif field == "min_liquidity_sol":
+            if to_value > self.risk.cfg.min_liquidity_sol:
+                previous = self.risk.cfg.min_liquidity_sol
+                self.risk.cfg.min_liquidity_sol = to_value
+                return previous
+        elif field == "take_profit_pct" and self.outcome_tracker is not None:
+            if to_value < self.outcome_tracker.take_profit_pct:
+                previous = self.outcome_tracker.take_profit_pct
+                self.outcome_tracker.take_profit_pct = to_value
+                return previous
+        elif field == "min_holder_count" and self.social_watch_cfg is not None:
+            if to_value > self.social_watch_cfg.min_holder_count:
+                previous = self.social_watch_cfg.min_holder_count
+                self.social_watch_cfg.min_holder_count = to_value
+                return previous
+        elif field == "birdeye_movers_min_holder_count" and self.birdeye_movers_cfg is not None:
+            if to_value > self.birdeye_movers_cfg.min_holder_count:
+                previous = self.birdeye_movers_cfg.min_holder_count
+                self.birdeye_movers_cfg.min_holder_count = to_value
+                return previous
+        return None
