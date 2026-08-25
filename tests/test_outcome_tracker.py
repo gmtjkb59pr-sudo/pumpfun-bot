@@ -102,6 +102,7 @@ class FakeClient:
         self.signature = signature
         self.sell_calls = []
         self.sell_priority_fees = []
+        self.jito_bundle_calls = []
         self.keypair = _FakeKeypair()
         self.rpc_http_url = "https://example.invalid/rpc"
         # user-requested: simulates PumpPortalClient._fetch_real_sol_delta's
@@ -121,6 +122,17 @@ class FakeClient:
         return {
             "signature": self.signature, "action": "sell", "mint": mint, "amount": f"{amount_pct}%",
             "real_sol_delta": self.real_sol_delta,
+        }
+
+    async def build_and_send_full_sell_via_jito_bundle(
+        self, mint, slippage_pct, amount_pct=100, priority_fee_sol=None, block_engine_url=None,
+    ):
+        self.jito_bundle_calls.append((mint, slippage_pct, amount_pct, priority_fee_sol, block_engine_url))
+        if self.should_fail:
+            raise RuntimeError("simulated Jito bundle failure")
+        return {
+            "signature": self.signature, "action": "sell", "mint": mint, "amount": f"{amount_pct}%",
+            "real_sol_delta": self.real_sol_delta, "bundle_id": "FAKE_BUNDLE_ID",
         }
 
     async def build_and_send_trade(self, action, mint, amount_sol, slippage_pct):
@@ -1946,6 +1958,86 @@ class LiveExitTests(unittest.TestCase):
         self.assertEqual(client.sell_calls, [])
         self.assertNotIn("MINT", tracker._pending)
         self.assertAlmostEqual(risk.state.realized_pnl_sol, (_net_pnl_sol_slipped(0.05, 51.0, "take_profit") - round_trip_priority_fee_sol_for_reason("take_profit")), places=4)
+
+
+class JitoBundleExitTests(unittest.TestCase):
+    """User-requested 2026-08-24 ("yes build if you think it will make
+    the bot better") - take_profit/take_profit_ladder real sells route
+    through Jito bundle submission instead of a normal sendTransaction
+    when risk.cfg.use_jito_bundles_for_take_profit is set, matching
+    exactly where the slippage-calibration evidence points. Off by
+    default (RiskConfig()) - every OTHER exit-path test in this file
+    already exercises that default without touching Jito at all."""
+
+    def _make_tracker(self, *, client, use_jito, entry_ref=100.0, take_profit_pct=50.0, stop_loss_pct=25.0):
+        risk = RiskManager(RiskConfig(use_jito_bundles_for_take_profit=use_jito))
+        risk.register_trade_opened(0.05)
+        tracker = OutcomeTracker(
+            ws_url="wss://example.invalid", risk=risk, client=client, dry_run=False,
+            take_profit_pct=take_profit_pct, stop_loss_pct=stop_loss_pct,
+        )
+        tracker._pending["MINT"] = {
+            "entry_ts": time.time() - MIN_SELL_DELAY_SEC - 1,
+            "entry_ref": entry_ref, "last_ref": entry_ref, "peak_ref": entry_ref,
+            "name": "Test Token", "symbol": "TEST", "trade_size_sol": 0.05,
+            "hit": set(), "has_real_update": False,
+        }
+        return tracker, risk
+
+    def test_take_profit_uses_the_jito_bundle_path_when_enabled(self):
+        client = FakeClient(signature="sig")
+        tracker, _risk = self._make_tracker(client=client, use_jito=True)
+
+        asyncio.run(tracker._handle_price_update("MINT", 151.0))  # +51%, crosses TP
+
+        self.assertEqual(len(client.jito_bundle_calls), 1)
+        self.assertEqual(client.sell_calls, [])  # normal path never called
+        self.assertEqual(client.jito_bundle_calls[0][0], "MINT")
+
+    def test_take_profit_uses_the_normal_path_when_disabled(self):
+        client = FakeClient(signature="sig")
+        tracker, _risk = self._make_tracker(client=client, use_jito=False)
+
+        asyncio.run(tracker._handle_price_update("MINT", 151.0))  # +51%, crosses TP
+
+        self.assertEqual(client.jito_bundle_calls, [])
+        self.assertEqual(len(client.sell_calls), 1)
+
+    def test_stop_loss_never_uses_the_jito_bundle_path_even_when_enabled(self):
+        # evidence-scoped: only take_profit/take_profit_ladder have the
+        # bad-enough real slippage gap to justify this - stop_loss's own
+        # gap is the smallest of any reason (see fees.py), no case for it
+        client = FakeClient(signature="sig")
+        tracker, _risk = self._make_tracker(client=client, use_jito=True)
+
+        asyncio.run(tracker._handle_price_update("MINT", 70.0))  # -30%, crosses SL
+
+        self.assertEqual(client.jito_bundle_calls, [])
+        self.assertEqual(len(client.sell_calls), 1)
+
+    def test_a_failed_bundle_leaves_the_position_open_same_as_a_normal_failed_sell(self):
+        client = FakeClient(should_fail=True)
+        tracker, risk = self._make_tracker(client=client, use_jito=True)
+
+        asyncio.run(tracker._handle_price_update("MINT", 151.0))
+
+        self.assertEqual(len(client.jito_bundle_calls), 1)
+        self.assertIn("MINT", tracker._pending)
+        self.assertAlmostEqual(risk.state.open_exposure_sol, 0.05)
+
+    def test_ladder_rung_uses_the_jito_bundle_path_when_enabled(self):
+        client = FakeClient(signature="sig")
+        tracker, _risk = self._make_tracker(
+            client=client, use_jito=True, take_profit_pct=1000,  # never fires alone
+        )
+        tracker._pending["MINT"]["take_profit_ladder"] = [{"multiplier": 2.0, "sell_pct": 30.0}]
+        tracker._pending["MINT"]["triggered_ladder_levels"] = []
+        tracker._pending["MINT"]["remaining_fraction"] = 1.0
+
+        asyncio.run(tracker._handle_price_update("MINT", 200.0))  # 2x -> first rung
+
+        self.assertEqual(len(client.jito_bundle_calls), 1)
+        self.assertEqual(client.sell_calls, [])
 
 
 class RealSolDeltaPnlTests(unittest.TestCase):

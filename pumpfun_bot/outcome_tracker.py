@@ -1144,6 +1144,21 @@ class OutcomeTracker:
             for observer in self._price_observers:
                 await observer(mint, ref)
 
+    def _should_use_jito_bundle(self, reason: str) -> bool:
+        """User-requested 2026-08-24 ("yes build if you think it will make
+        the bot better") - only take_profit/take_profit_ladder, matching
+        exactly where this session's real slippage-calibration data (see
+        fees.py's DRY_RUN_SLIPPAGE_PENALTY_PCT_BY_REASON) points: those two
+        exit reasons have the worst real execution gap of any reason,
+        driven by time-to-land on a fast-reversing peak. Fails safe to the
+        normal sell path (False) if risk config isn't wired up at all -
+        many tests construct OutcomeTracker without a RiskManager."""
+        if reason not in ("take_profit", "take_profit_ladder"):
+            return False
+        if self.risk is None:
+            return False
+        return getattr(self.risk.cfg, "use_jito_bundles_for_take_profit", False)
+
     def _exit_attempt_allowed(self, info: dict) -> bool:
         """Marks an attempt as starting now and returns whether enough time
         has passed since the last one - keeps a failing real sell from being
@@ -1292,16 +1307,30 @@ class OutcomeTracker:
                 )
                 return False
             try:
-                result = await self.client.build_and_send_full_sell(
-                    mint=mint, slippage_pct=self.sell_slippage_pct,
-                    # user-requested 2026-08-24 ("build 3" - faster
-                    # execution on take_profit sells) - take_profit's real
-                    # slippage gap is the worst of any exit reason, and the
-                    # mechanism is time: a bigger fee here aims to land
-                    # before the peak this exit is chasing has fully
-                    # reversed. See fees.py's priority_fee_sol_for_sell.
-                    priority_fee_sol=priority_fee_sol_for_sell(reason),
-                )
+                if self._should_use_jito_bundle(reason):
+                    # user-requested 2026-08-24 ("yes build if you think it
+                    # will make the bot better") - guarantees atomic
+                    # same-slot inclusion instead of racing other bots on
+                    # the public mempool, targeting the same real
+                    # slippage gap priority_fee_sol_for_sell above already
+                    # addresses more cheaply - see
+                    # build_and_send_full_sell_via_jito_bundle's docstring
+                    result = await self.client.build_and_send_full_sell_via_jito_bundle(
+                        mint=mint, slippage_pct=self.sell_slippage_pct,
+                        priority_fee_sol=priority_fee_sol_for_sell(reason),
+                        block_engine_url=self.risk.cfg.jito_block_engine_url,
+                    )
+                else:
+                    result = await self.client.build_and_send_full_sell(
+                        mint=mint, slippage_pct=self.sell_slippage_pct,
+                        # user-requested 2026-08-24 ("build 3" - faster
+                        # execution on take_profit sells) - take_profit's real
+                        # slippage gap is the worst of any exit reason, and the
+                        # mechanism is time: a bigger fee here aims to land
+                        # before the peak this exit is chasing has fully
+                        # reversed. See fees.py's priority_fee_sol_for_sell.
+                        priority_fee_sol=priority_fee_sol_for_sell(reason),
+                    )
                 tx_signature = result["signature"]
                 real_sol_delta = result.get("real_sol_delta")
             except Exception as exc:  # noqa: BLE001
@@ -1518,15 +1547,28 @@ class OutcomeTracker:
                 )
                 return False
             try:
-                result = await self.client.build_and_send_full_sell(
-                    mint=mint, slippage_pct=self.sell_slippage_pct,
-                    amount_pct=sell_pct_of_current_holdings,
-                    # user-requested 2026-08-24 ("build 3") - see _exit()'s
-                    # identical comment; _partial_exit is only ever reached
-                    # for take_profit_ladder rungs (see this method's own
-                    # docstring), so this is always the boosted fee
-                    priority_fee_sol=priority_fee_sol_for_sell(reason),
-                )
+                # _partial_exit is only ever reached for take_profit_ladder
+                # rungs (see this method's own docstring), so reason is
+                # always eligible here - _should_use_jito_bundle still
+                # checks the config flag, not just the reason
+                if self._should_use_jito_bundle(reason):
+                    # user-requested 2026-08-24 - see _exit()'s identical comment
+                    result = await self.client.build_and_send_full_sell_via_jito_bundle(
+                        mint=mint, slippage_pct=self.sell_slippage_pct,
+                        amount_pct=sell_pct_of_current_holdings,
+                        priority_fee_sol=priority_fee_sol_for_sell(reason),
+                        block_engine_url=self.risk.cfg.jito_block_engine_url,
+                    )
+                else:
+                    result = await self.client.build_and_send_full_sell(
+                        mint=mint, slippage_pct=self.sell_slippage_pct,
+                        amount_pct=sell_pct_of_current_holdings,
+                        # user-requested 2026-08-24 ("build 3") - see _exit()'s
+                        # identical comment; _partial_exit is only ever reached
+                        # for take_profit_ladder rungs (see this method's own
+                        # docstring), so this is always the boosted fee
+                        priority_fee_sol=priority_fee_sol_for_sell(reason),
+                    )
                 tx_signature = result["signature"]
                 real_sol_delta = result.get("real_sol_delta")
             except Exception as exc:  # noqa: BLE001
