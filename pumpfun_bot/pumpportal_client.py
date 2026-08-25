@@ -244,6 +244,7 @@ class PumpPortalClient:
         mint: str,
         slippage_pct: float,
         priority_fee_sol: float = PRIORITY_FEE_SOL_PER_LEG,
+        tip_sol: float = jito.RECOMMENDED_TIP_SOL,
         pool: str = "auto",
         amount_pct: float = 100,
         block_engine_url: str = jito.DEFAULT_BLOCK_ENGINE_URL,
@@ -260,11 +261,17 @@ class PumpPortalClient:
         DRY_RUN_SLIPPAGE_PENALTY_PCT_BY_REASON) showed is the dominant
         real cost on this bot's trades.
 
-        priority_fee_sol here does DOUBLE DUTY as the Jito tip - not a
-        separate cost on top of the usual priority fee, but also not
-        optional: an under-tipped bundle simply never gets included by any
-        validator, silently losing the trade to a normal sendTransaction
-        competitor instead of costing extra.
+        tip_sol is a SEPARATE cost from priority_fee_sol (user-requested
+        2026-08-24, "try" -> "build it": originally reused priority_fee_sol
+        for both, confirmed live that a real bundle only landed at 0.01 SOL,
+        4x the normal take_profit priority fee - conflating the two would
+        have meant either overpaying the sell's own priority fee to get a
+        usable tip, or under-tipping to keep the fee normal. priority_fee_sol
+        still sets the sell transaction's own compute-budget priority fee,
+        needed regardless of Jito; tip_sol is only spent when this path is
+        actually used, and not optional - an under-tipped bundle simply
+        never gets included by any validator, silently losing the trade to
+        a normal sendTransaction competitor instead of costing extra.
 
         Real bug found live 2026-08-24, hours after this shipped: initially
         requested the unsigned tx via PumpPortal's documented array-mode
@@ -319,7 +326,18 @@ class PumpPortalClient:
         signed_tx = VersionedTransaction(tx.message, [self.keypair])
         sig = str(signed_tx.signatures[0])
 
-        bundle_id = await jito.send_bundle([bytes(signed_tx)], block_engine_url)
+        # user-requested 2026-08-24 ("built" - the real fix after Jito
+        # rejected an untipped bundle live) - a second, from-scratch
+        # transaction whose only job is paying the tip, same recent
+        # blockhash as the sell tx above, submitted together in one
+        # bundle. See jito.py's module docstring for why this doesn't
+        # touch the sell transaction itself.
+        tip_lamports = round(tip_sol * 1_000_000_000)
+        tip_tx = jito.build_tip_transaction(
+            self.keypair, tip_lamports, tx.message.recent_blockhash,
+        )
+
+        bundle_id = await jito.send_bundle([bytes(signed_tx), bytes(tip_tx)], block_engine_url)
         if bundle_id is None:
             raise RuntimeError(f"Jito bundle-verzending mislukt voor {mint} (verkoop).")
 

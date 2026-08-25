@@ -61,6 +61,18 @@ class RiskConfig:
     # take_profit_ladder sells, matching exactly where the evidence points.
     use_jito_bundles_for_take_profit: bool = False
     jito_block_engine_url: str = "https://mainnet.block-engine.jito.wtf"
+    # user-requested 2026-08-24 ("try" -> "build it" - size-gate Jito
+    # instead of leaving it a blanket on/off): real live testing found the
+    # tip needed to actually land a bundle (jito.py's RECOMMENDED_TIP_SOL,
+    # 0.01 SOL) is roughly fixed, while this bot's real trade sizes are
+    # tiny (~0.012-0.053 SOL) - at those sizes the tip alone would be
+    # 19-83% of the entire trade, an obviously bad trade-off regardless of
+    # how much slippage it saves. Only use Jito when the tip stays under
+    # this % of the trade actually being sold - self-limiting: stays
+    # naturally dormant at current trade sizes without needing the master
+    # switch above toggled off, and activates automatically if sizes ever
+    # grow enough to make the fixed tip cost proportionate again.
+    max_jito_tip_pct_of_trade: float = 10.0
 
 
 @dataclass
@@ -528,6 +540,7 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         jito_block_engine_url=risk_raw.get(
             "jito_block_engine_url", "https://mainnet.block-engine.jito.wtf",
         ),
+        max_jito_tip_pct_of_trade=risk_raw.get("max_jito_tip_pct_of_trade", 10.0),
     )
 
     strat_raw = raw.get("strategies", {})
