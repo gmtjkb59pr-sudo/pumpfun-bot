@@ -548,7 +548,17 @@ class OutcomeTracker:
             asyncio.create_task(self._check_socials_and_maybe_exit(mint, metadata_uri))
         if buy_tx_signature and not self.dry_run:
             asyncio.create_task(self._fetch_real_buy_cost(mint, buy_tx_signature))
-            asyncio.create_task(self._fetch_real_token_amount_bg(mint, buy_tx_signature))
+            # DISABLED (config-gated) 2026-08-25 the same night it shipped -
+            # see RiskConfig.use_absolute_amount_sell's docstring: the very
+            # first live exit got a 400 Bad Request from PumpPortal for the
+            # absolute-amount sell body, the expected request format still
+            # being unverified. Skipping the fetch entirely (rather than
+            # gating only the sell attempt) means real_token_amount simply
+            # stays None everywhere downstream - identical behavior to
+            # before this feature existed, no separate gate needed at each
+            # of the 3 check sites that read it.
+            if self.risk is not None and getattr(self.risk.cfg, "use_absolute_amount_sell", False):
+                asyncio.create_task(self._fetch_real_token_amount_bg(mint, buy_tx_signature))
 
     async def _fetch_real_buy_cost(self, mint: str, tx_signature: str) -> None:
         """Fires in the background right after a real buy, never blocking
