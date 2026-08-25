@@ -2581,8 +2581,12 @@ class RealTokenAmountBgTests(unittest.TestCase):
         self.assertNotIn("MINT", tracker._pending)
 
     def test_track_schedules_the_background_fetch_for_a_real_buy(self):
+        # DISABLED (config-gated) 2026-08-25 the same night it shipped - see
+        # RiskConfig.use_absolute_amount_sell's docstring: the first live
+        # exit got a 400 from PumpPortal, expected format still unverified.
+        # Must be explicitly re-enabled here to exercise the scheduling.
         client = FakeClient()
-        risk = RiskManager(RiskConfig())
+        risk = RiskManager(RiskConfig(use_absolute_amount_sell=True))
         tracker = OutcomeTracker(ws_url="wss://example.invalid", risk=risk, client=client, dry_run=False)
 
         with patch.object(tracker, "_fetch_real_token_amount_bg") as mock_fetch:
@@ -2595,9 +2599,23 @@ class RealTokenAmountBgTests(unittest.TestCase):
             ))
         mock_fetch.assert_called_once_with("MINT", "buy_sig")
 
-    def test_track_does_not_schedule_the_fetch_in_dry_run(self):
+    def test_track_does_not_schedule_the_fetch_when_the_flag_is_off(self):
+        # the actual current live state - use_absolute_amount_sell defaults
+        # to False after the 400 found on the first real exit
         client = FakeClient()
         risk = RiskManager(RiskConfig())
+        tracker = OutcomeTracker(ws_url="wss://example.invalid", risk=risk, client=client, dry_run=False)
+
+        with patch.object(tracker, "_fetch_real_token_amount_bg") as mock_fetch:
+            asyncio.run(tracker.track(
+                "MINT", "Test", "TEST", entry_ref=100.0, trade_size_sol=0.05,
+                buy_tx_signature="buy_sig",
+            ))
+        mock_fetch.assert_not_called()
+
+    def test_track_does_not_schedule_the_fetch_in_dry_run(self):
+        client = FakeClient()
+        risk = RiskManager(RiskConfig(use_absolute_amount_sell=True))
         tracker = OutcomeTracker(ws_url="wss://example.invalid", risk=risk, client=client, dry_run=True)
 
         with patch.object(tracker, "_fetch_real_token_amount_bg") as mock_fetch:
@@ -2609,7 +2627,7 @@ class RealTokenAmountBgTests(unittest.TestCase):
 
     def test_track_does_not_schedule_the_fetch_without_a_signature(self):
         client = FakeClient()
-        risk = RiskManager(RiskConfig())
+        risk = RiskManager(RiskConfig(use_absolute_amount_sell=True))
         tracker = OutcomeTracker(ws_url="wss://example.invalid", risk=risk, client=client, dry_run=False)
 
         with patch.object(tracker, "_fetch_real_token_amount_bg") as mock_fetch:

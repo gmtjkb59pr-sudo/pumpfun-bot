@@ -86,6 +86,24 @@ class RiskConfig:
     # an already-winning position, so this gets its own explicit opt-in
     # rather than being silently bundled into the sell-side flag.
     use_jito_bundles_for_sniper_buys: bool = False
+    # user-requested 2026-08-25 ("how can we improve the baseline" ->
+    # "build"), DISABLED again same night after the first live test:
+    # meant to skip MIN_SELL_DELAY_SEC by selling PumpPortal an exact
+    # absolute token amount instead of a percentage (which needs their
+    # balance index to catch up). Confirmed live 2026-08-25 the very
+    # first real exit after deploying it: PumpPortal returned a 400 Bad
+    # Request for the non-percentage sell body - their docs turned out
+    # to only show a numeric "amount" on a BUY (always SOL-denominated),
+    # never a genuine non-percentage SELL example, so the exact expected
+    # format (raw base units? UI-decimal amount? string vs number?) is
+    # still unverified. The fallback to the proven percentage-based sell
+    # caught this cleanly (no money lost), but with this left on, EVERY
+    # real exit was paying one extra guaranteed-to-fail ~300ms HTTP
+    # round-trip for zero benefit. Default OFF until the correct request
+    # format is confirmed (e.g. via a cheap, deliberate empirical test)
+    # - see outcome_tracker.py's _exit() for where this gates the
+    # absolute-amount attempt.
+    use_absolute_amount_sell: bool = False
 
 
 @dataclass
@@ -555,6 +573,7 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         ),
         max_jito_tip_pct_of_trade=risk_raw.get("max_jito_tip_pct_of_trade", 10.0),
         use_jito_bundles_for_sniper_buys=risk_raw.get("use_jito_bundles_for_sniper_buys", False),
+        use_absolute_amount_sell=risk_raw.get("use_absolute_amount_sell", False),
     )
 
     strat_raw = raw.get("strategies", {})
