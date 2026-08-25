@@ -125,9 +125,12 @@ class FakeClient:
         }
 
     async def build_and_send_full_sell_via_jito_bundle(
-        self, mint, slippage_pct, amount_pct=100, priority_fee_sol=None, block_engine_url=None,
+        self, mint, slippage_pct, amount_pct=100, priority_fee_sol=None, tip_sol=None,
+        block_engine_url=None,
     ):
-        self.jito_bundle_calls.append((mint, slippage_pct, amount_pct, priority_fee_sol, block_engine_url))
+        self.jito_bundle_calls.append(
+            (mint, slippage_pct, amount_pct, priority_fee_sol, tip_sol, block_engine_url)
+        )
         if self.should_fail:
             raise RuntimeError("simulated Jito bundle failure")
         return {
@@ -1964,14 +1967,26 @@ class JitoBundleExitTests(unittest.TestCase):
     """User-requested 2026-08-24 ("yes build if you think it will make
     the bot better") - take_profit/take_profit_ladder real sells route
     through Jito bundle submission instead of a normal sendTransaction
-    when risk.cfg.use_jito_bundles_for_take_profit is set, matching
-    exactly where the slippage-calibration evidence points. Off by
-    default (RiskConfig()) - every OTHER exit-path test in this file
-    already exercises that default without touching Jito at all."""
+    when risk.cfg.use_jito_bundles_for_take_profit is set AND the trade is
+    big enough that jito.RECOMMENDED_TIP_SOL stays under
+    max_jito_tip_pct_of_trade of it (user-requested 2026-08-24, "try" ->
+    "build it" - real live testing found the tip that actually lands is
+    roughly fixed, so it only makes sense once the trade is big enough).
+    Default trade_size_sol here (0.5 SOL) comfortably clears the default
+    10% gate (0.01 / 0.5 = 2%) so these tests exercise the FLAG's own
+    on/off behavior; SizeGateTests below exercises the size gate itself.
+    Off by default (RiskConfig()) - every OTHER exit-path test in this
+    file already exercises that default without touching Jito at all."""
 
-    def _make_tracker(self, *, client, use_jito, entry_ref=100.0, take_profit_pct=50.0, stop_loss_pct=25.0):
-        risk = RiskManager(RiskConfig(use_jito_bundles_for_take_profit=use_jito))
-        risk.register_trade_opened(0.05)
+    def _make_tracker(
+        self, *, client, use_jito, entry_ref=100.0, take_profit_pct=50.0, stop_loss_pct=25.0,
+        trade_size_sol=0.5, max_jito_tip_pct_of_trade=10.0,
+    ):
+        risk = RiskManager(RiskConfig(
+            use_jito_bundles_for_take_profit=use_jito,
+            max_jito_tip_pct_of_trade=max_jito_tip_pct_of_trade,
+        ))
+        risk.register_trade_opened(trade_size_sol)
         tracker = OutcomeTracker(
             ws_url="wss://example.invalid", risk=risk, client=client, dry_run=False,
             take_profit_pct=take_profit_pct, stop_loss_pct=stop_loss_pct,
@@ -1979,7 +1994,7 @@ class JitoBundleExitTests(unittest.TestCase):
         tracker._pending["MINT"] = {
             "entry_ts": time.time() - MIN_SELL_DELAY_SEC - 1,
             "entry_ref": entry_ref, "last_ref": entry_ref, "peak_ref": entry_ref,
-            "name": "Test Token", "symbol": "TEST", "trade_size_sol": 0.05,
+            "name": "Test Token", "symbol": "TEST", "trade_size_sol": trade_size_sol,
             "hit": set(), "has_real_update": False,
         }
         return tracker, risk
@@ -2023,7 +2038,7 @@ class JitoBundleExitTests(unittest.TestCase):
 
         self.assertEqual(len(client.jito_bundle_calls), 1)
         self.assertIn("MINT", tracker._pending)
-        self.assertAlmostEqual(risk.state.open_exposure_sol, 0.05)
+        self.assertAlmostEqual(risk.state.open_exposure_sol, 0.5)
 
     def test_ladder_rung_uses_the_jito_bundle_path_when_enabled(self):
         client = FakeClient(signature="sig")
@@ -2038,6 +2053,98 @@ class JitoBundleExitTests(unittest.TestCase):
 
         self.assertEqual(len(client.jito_bundle_calls), 1)
         self.assertEqual(client.sell_calls, [])
+
+
+class JitoSizeGateTests(unittest.TestCase):
+    """User-requested 2026-08-24 ("try" -> "build it") - real live testing
+    found the tip that actually lands a bundle is roughly fixed
+    (jito.RECOMMENDED_TIP_SOL), so it only makes economic sense once the
+    trade being sold is big enough. This gate is what makes the Jito path
+    stay naturally dormant at this bot's real, tiny trade sizes (sniper
+    ~0.012 SOL, social_watch ~0.053 SOL - both well under the amount
+    needed for a 0.01 SOL tip to be a sane fraction) without needing the
+    master switch toggled off."""
+
+    def _make_tracker(self, *, client, trade_size_sol, max_jito_tip_pct_of_trade=10.0):
+        risk = RiskManager(RiskConfig(
+            use_jito_bundles_for_take_profit=True,
+            max_jito_tip_pct_of_trade=max_jito_tip_pct_of_trade,
+        ))
+        risk.register_trade_opened(trade_size_sol)
+        tracker = OutcomeTracker(
+            ws_url="wss://example.invalid", risk=risk, client=client, dry_run=False,
+            take_profit_pct=50.0, stop_loss_pct=25.0,
+        )
+        tracker._pending["MINT"] = {
+            "entry_ts": time.time() - MIN_SELL_DELAY_SEC - 1,
+            "entry_ref": 100.0, "last_ref": 100.0, "peak_ref": 100.0,
+            "name": "Test Token", "symbol": "TEST", "trade_size_sol": trade_size_sol,
+            "hit": set(), "has_real_update": False,
+        }
+        return tracker, risk
+
+    def test_a_real_sniper_sized_trade_is_too_small_for_jito(self):
+        # real config value this session: sniper's own trade size
+        client = FakeClient(signature="sig")
+        tracker, _risk = self._make_tracker(client=client, trade_size_sol=0.012)
+
+        asyncio.run(tracker._handle_price_update("MINT", 151.0))  # +51%, crosses TP
+
+        self.assertEqual(client.jito_bundle_calls, [])
+        self.assertEqual(len(client.sell_calls), 1)
+
+    def test_a_real_social_watch_sized_trade_is_too_small_for_jito(self):
+        # real config value this session: social_watch's own trade size
+        client = FakeClient(signature="sig")
+        tracker, _risk = self._make_tracker(client=client, trade_size_sol=0.053)
+
+        asyncio.run(tracker._handle_price_update("MINT", 151.0))
+
+        self.assertEqual(client.jito_bundle_calls, [])
+        self.assertEqual(len(client.sell_calls), 1)
+
+    def test_a_large_enough_trade_clears_the_gate(self):
+        # 0.01 / 0.5 = 2%, comfortably under the default 10% cap
+        client = FakeClient(signature="sig")
+        tracker, _risk = self._make_tracker(client=client, trade_size_sol=0.5)
+
+        asyncio.run(tracker._handle_price_update("MINT", 151.0))
+
+        self.assertEqual(len(client.jito_bundle_calls), 1)
+        self.assertEqual(client.sell_calls, [])
+
+    def test_right_at_the_threshold_clears_the_gate(self):
+        # 0.01 / 0.1 = exactly 10% - the docstring says "under", but the
+        # comparison itself is <=, so exactly-at-the-cap is allowed
+        client = FakeClient(signature="sig")
+        tracker, _risk = self._make_tracker(client=client, trade_size_sol=0.1)
+
+        asyncio.run(tracker._handle_price_update("MINT", 151.0))
+
+        self.assertEqual(len(client.jito_bundle_calls), 1)
+
+    def test_just_under_the_threshold_trade_size_fails_the_gate(self):
+        # 0.01 / 0.099 ≈ 10.1% - just over the default 10% cap
+        client = FakeClient(signature="sig")
+        tracker, _risk = self._make_tracker(client=client, trade_size_sol=0.099)
+
+        asyncio.run(tracker._handle_price_update("MINT", 151.0))
+
+        self.assertEqual(client.jito_bundle_calls, [])
+        self.assertEqual(len(client.sell_calls), 1)
+
+    def test_a_looser_configured_threshold_allows_a_smaller_trade(self):
+        # real config's own social_watch trade size (0.053 SOL) fails the
+        # default 10% cap, but passes a looser 20% cap the user might
+        # configure - 0.01 / 0.053 ≈ 18.9%
+        client = FakeClient(signature="sig")
+        tracker, _risk = self._make_tracker(
+            client=client, trade_size_sol=0.053, max_jito_tip_pct_of_trade=20.0,
+        )
+
+        asyncio.run(tracker._handle_price_update("MINT", 151.0))
+
+        self.assertEqual(len(client.jito_bundle_calls), 1)
 
 
 class RealSolDeltaPnlTests(unittest.TestCase):

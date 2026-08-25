@@ -47,7 +47,7 @@ import time
 
 import websockets
 
-from . import activity_log, position_store
+from . import activity_log, jito, position_store
 from .activity_log import append_jsonl
 from .alerts import Alerter
 from .dexscreener import fetch_price_usd
@@ -1144,7 +1144,7 @@ class OutcomeTracker:
             for observer in self._price_observers:
                 await observer(mint, ref)
 
-    def _should_use_jito_bundle(self, reason: str) -> bool:
+    def _should_use_jito_bundle(self, reason: str, trade_size_sol: float) -> bool:
         """User-requested 2026-08-24 ("yes build if you think it will make
         the bot better") - only take_profit/take_profit_ladder, matching
         exactly where this session's real slippage-calibration data (see
@@ -1152,12 +1152,27 @@ class OutcomeTracker:
         exit reasons have the worst real execution gap of any reason,
         driven by time-to-land on a fast-reversing peak. Fails safe to the
         normal sell path (False) if risk config isn't wired up at all -
-        many tests construct OutcomeTracker without a RiskManager."""
+        many tests construct OutcomeTracker without a RiskManager.
+
+        Size-gated since 2026-08-24 ("try" -> "build it"): real live
+        testing found the tip needed to actually land a bundle
+        (jito.RECOMMENDED_TIP_SOL) is roughly fixed regardless of trade
+        size - only use it when that tip stays under
+        max_jito_tip_pct_of_trade of what's actually being sold, or the
+        fix costs more than the problem it's solving. trade_size_sol is
+        the SLICE being sold right now (a ladder rung's own fraction, not
+        necessarily the whole original position)."""
         if reason not in ("take_profit", "take_profit_ladder"):
             return False
         if self.risk is None:
             return False
-        return getattr(self.risk.cfg, "use_jito_bundles_for_take_profit", False)
+        if not getattr(self.risk.cfg, "use_jito_bundles_for_take_profit", False):
+            return False
+        max_tip_pct = getattr(self.risk.cfg, "max_jito_tip_pct_of_trade", 10.0)
+        if trade_size_sol <= 0:
+            return False
+        tip_pct_of_trade = (jito.RECOMMENDED_TIP_SOL / trade_size_sol) * 100
+        return tip_pct_of_trade <= max_tip_pct
 
     def _exit_attempt_allowed(self, info: dict) -> bool:
         """Marks an attempt as starting now and returns whether enough time
@@ -1307,7 +1322,12 @@ class OutcomeTracker:
                 )
                 return False
             try:
-                if self._should_use_jito_bundle(reason):
+                # what's actually being sold in THIS attempt - the full
+                # remaining position at this point (is_partial was False
+                # above), not necessarily the original trade_size_sol if
+                # earlier ladder rungs already sold some of it
+                trade_size_sol_being_sold = info["trade_size_sol"] * remaining_fraction
+                if self._should_use_jito_bundle(reason, trade_size_sol_being_sold):
                     # user-requested 2026-08-24 ("yes build if you think it
                     # will make the bot better") - guarantees atomic
                     # same-slot inclusion instead of racing other bots on
@@ -1318,6 +1338,7 @@ class OutcomeTracker:
                     result = await self.client.build_and_send_full_sell_via_jito_bundle(
                         mint=mint, slippage_pct=self.sell_slippage_pct,
                         priority_fee_sol=priority_fee_sol_for_sell(reason),
+                        tip_sol=jito.RECOMMENDED_TIP_SOL,
                         block_engine_url=self.risk.cfg.jito_block_engine_url,
                     )
                 else:
@@ -1551,12 +1572,13 @@ class OutcomeTracker:
                 # rungs (see this method's own docstring), so reason is
                 # always eligible here - _should_use_jito_bundle still
                 # checks the config flag, not just the reason
-                if self._should_use_jito_bundle(reason):
+                if self._should_use_jito_bundle(reason, slice_cost_sol_at_entry):
                     # user-requested 2026-08-24 - see _exit()'s identical comment
                     result = await self.client.build_and_send_full_sell_via_jito_bundle(
                         mint=mint, slippage_pct=self.sell_slippage_pct,
                         amount_pct=sell_pct_of_current_holdings,
                         priority_fee_sol=priority_fee_sol_for_sell(reason),
+                        tip_sol=jito.RECOMMENDED_TIP_SOL,
                         block_engine_url=self.risk.cfg.jito_block_engine_url,
                     )
                 else:

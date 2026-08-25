@@ -669,6 +669,44 @@ class BuildAndSendFullSellViaJitoBundleTests(unittest.TestCase):
         self.assertEqual(posted_body["action"], "sell")
         self.assertEqual(posted_body["amount"], "100%")
 
+    def test_submits_a_two_transaction_bundle_including_a_real_tip_account(self):
+        # real bug found live 2026-08-24: Jito rejected a bundle with only
+        # the sell tx - "Bundles must write lock at least one tip account".
+        # This is the actual fix - a second tip-only transaction, submitted
+        # alongside the untouched sell tx, in the SAME send_bundle call.
+        from pumpfun_bot.jito import TIP_ACCOUNTS
+
+        client = self._make_client()
+        raw = _fake_unsigned_tx_raw_bytes(client.keypair.pubkey())
+        trade_local_session = _FakeJitoSession(_FakeJitoResponse(status=200, raw_bytes=raw))
+        client._fetch_real_sol_delta = lambda sig: _async_none()
+        captured = {}
+
+        async def _fake_send_bundle(signed_txs, block_engine_url=None):
+            captured["signed_txs"] = signed_txs
+            return "BUNDLE_ID"
+
+        with patch(
+            "pumpfun_bot.pumpportal_client.aiohttp.ClientSession", return_value=trade_local_session,
+        ), patch(
+            "pumpfun_bot.pumpportal_client.jito.send_bundle", side_effect=_fake_send_bundle,
+        ), patch(
+            "pumpfun_bot.pumpportal_client.jito.poll_bundle_until_landed",
+            return_value={"confirmation_status": "confirmed", "err": None},
+        ):
+            asyncio.run(client.build_and_send_full_sell_via_jito_bundle(mint="MINT123", slippage_pct=10))
+
+        signed_txs = captured["signed_txs"]
+        self.assertEqual(len(signed_txs), 2)
+        # first is the real sell tx, same message content as what
+        # PumpPortal returned, now actually signed
+        sell_tx = VersionedTransaction.from_bytes(signed_txs[0])
+        self.assertEqual(bytes(sell_tx.message), bytes(VersionedTransaction.from_bytes(raw).message))
+        # second is a tip transaction paying one of the 8 real tip accounts
+        tip_tx = VersionedTransaction.from_bytes(signed_txs[1])
+        tip_account_keys = {str(k) for k in tip_tx.message.account_keys}
+        self.assertTrue(tip_account_keys & set(TIP_ACCOUNTS))
+
     def test_returns_the_signature_and_bundle_id_on_success(self):
         client = self._make_client()
         raw = _fake_unsigned_tx_raw_bytes(client.keypair.pubkey())

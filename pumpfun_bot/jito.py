@@ -31,18 +31,108 @@ unsigned tx and signs locally with the bot's own keypair; Jito mode only
 changes what happens to the already-signed bytes). This module is a thin,
 dependency-light HTTP wrapper around Jito's two RPC methods, matching this
 codebase's existing per-concern module style (holder_count.py,
-dexscreener.py, etc.).
+dexscreener.py, etc.) - PLUS build_tip_transaction below, added after a
+real live failure.
+
+Real bug found live 2026-08-24, hours after this shipped: submitting just
+the signed sell tx alone got rejected by Jito with "Bundles must write
+lock at least one tip account to be eligible for the auction." Root
+cause: PumpPortal's own bundle-mode endpoint bakes a tip-account transfer
+INTO the transaction it builds, but that endpoint 400s on every real sell
+(see pumpportal_client.py's build_and_send_full_sell_via_jito_bundle for
+that whole story) - the workaround that avoided the 400 (fetching the
+sell tx through the normal single-object endpoint instead) also silently
+lost the tip instruction, since that endpoint has no reason to include one.
+
+Fixed the RIGHT way per Jito's own docs (confirmed 2026-08-24,
+docs.jito.wtf/lowlatencytxnsend): the tip requirement is on the BUNDLE,
+not any specific transaction in it - "any instruction, top-level or CPI,
+that transfers SOL to one of the 8 tip accounts" satisfies it. Rather
+than risk manually decompiling and re-signing PumpPortal's own swap
+transaction (confirmed live it uses an address lookup table across 4
+instructions - reconstructing correct signer/writable flags for ALT-
+resolved accounts by hand is real, easy-to-get-subtly-wrong work against
+real money), build_tip_transaction below produces a second, tiny,
+from-scratch transaction that ONLY transfers SOL to a tip account -
+submitted as the second transaction in the same 2-tx bundle, alongside
+the untouched, already-proven sell transaction.
 """
 from __future__ import annotations
 
 import asyncio
 import base64
 import logging
+import random
 import time
 
 import aiohttp
+from solders.hash import Hash
+from solders.keypair import Keypair
+from solders.message import MessageV0
+from solders.pubkey import Pubkey
+from solders.system_program import TransferParams, transfer
+from solders.transaction import VersionedTransaction
 
 logger = logging.getLogger("pumpfun_bot.jito")
+
+# the 8 official Jito tip accounts, confirmed live against
+# docs.jito.wtf/lowlatencytxnsend 2026-08-24 - a tip to ANY one of these
+# satisfies a bundle's tip requirement, picked at random per bundle to
+# spread load rather than hammering the same one every time
+TIP_ACCOUNTS = (
+    "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5",
+    "HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucfZ2bU7gRe",
+    "Cw8CFyM9FkoMi7K7Crf6HNQqf4uEMzpKw6QNghXLvLkY",
+    "ADaUMid9yfUytqMBgopwjb2DTLSokTSzL1zt6iGPaS49",
+    "DfXygSm4jCyNCybVYYK6DwvWqjKee8pbDmJGcLWNDXjh",
+    "ADuUkR4vqLUMWXxW9gh6D6L8pMSawimctcNZ5pGwDcEt",
+    "DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL",
+    "3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT",
+)
+# confirmed live 2026-08-24: "Jito enforces a minimum tip of 1000 lamports
+# for bundles" - a tip below this gets rejected outright, same failure
+# mode as no tip at all. This is Jito's own PROTOCOL floor, not a
+# recommendation - see RECOMMENDED_TIP_SOL below for what actually gets a
+# bundle included in practice, a much bigger real number.
+MIN_TIP_LAMPORTS = 1000
+
+# user-requested 2026-08-24 ("try" -> "build it" - size-gating the whole
+# feature after finding the tip cost doesn't fit small trades) - real,
+# sourced from live testing against this bot's actual real trading wallet:
+# a 0.0025 SOL tip (this bot's normal take_profit priority fee, reused
+# naively as the tip in the first version of this fix) failed to land
+# TWICE across two different attempts (global AND the NY regional block
+# engine, 25s and 30s timeouts) - the bundle was accepted but no validator
+# ever included it. A 0.01 SOL tip landed on the first try. n=1 success,
+# n=2 failure at the smaller size - a real but thin sample, not a
+# rigorously-tuned number; revisit if real trades show this is
+# consistently too low (or unnecessarily high) once more data exists.
+# Deliberately kept SEPARATE from priority_fee_sol_for_sell's boosted fee
+# (fees.py) - that's the sell transaction's OWN compute-budget priority
+# fee, needed regardless of Jito; this is an independent cost only paid
+# when the Jito path is actually used.
+RECOMMENDED_TIP_SOL = 0.01
+
+
+def build_tip_transaction(
+    payer: Keypair, tip_lamports: int, recent_blockhash: Hash,
+) -> VersionedTransaction:
+    """A minimal, single-instruction, from-scratch transaction that only
+    transfers tip_lamports (floored at MIN_TIP_LAMPORTS) to a randomly-
+    picked Jito tip account - deliberately NOT touching or modifying any
+    other transaction (see module docstring for why). Uses the SAME
+    recent_blockhash as whatever real transaction it's bundled with, so
+    both land in the same slot's validity window."""
+    tip_lamports = max(tip_lamports, MIN_TIP_LAMPORTS)
+    tip_account = Pubkey.from_string(random.choice(TIP_ACCOUNTS))
+    ix = transfer(TransferParams(
+        from_pubkey=payer.pubkey(), to_pubkey=tip_account, lamports=tip_lamports,
+    ))
+    message = MessageV0.try_compile(
+        payer=payer.pubkey(), instructions=[ix], address_lookup_table_accounts=[],
+        recent_blockhash=recent_blockhash,
+    )
+    return VersionedTransaction(message, [payer])
 
 # "Global" - Jito's own recommended default when no specific region is
 # known to be closer; regional endpoints exist (Frankfurt, Tokyo, NY, ...)
