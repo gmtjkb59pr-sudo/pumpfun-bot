@@ -842,11 +842,11 @@ class AbsoluteAmountSellTests(unittest.TestCase):
     def test_sells_immediately_when_real_token_amount_is_already_known(self):
         client = FakeClient(signature="sig")
         tracker, risk = self._make_tracker(
-            entry_ts=time.time(), client=client, real_token_amount=1_500_000,
+            entry_ts=time.time(), client=client, real_token_amount="1.500000",
         )
         asyncio.run(tracker._handle_price_update("MINT", 151.0))  # +51%, crosses TP
 
-        self.assertEqual(client.build_and_send_full_sell_by_amount_calls, [("MINT", 1_500_000, 10.0)])
+        self.assertEqual(client.build_and_send_full_sell_by_amount_calls, [("MINT", "1.500000", 10.0)])
         self.assertEqual(client.sell_calls, [])  # percentage path never touched
         self.assertNotIn("MINT", tracker._pending)  # closed, not deferred
 
@@ -867,7 +867,7 @@ class AbsoluteAmountSellTests(unittest.TestCase):
         client = FakeClient(signature="sig", should_fail_by_amount=True)
         tracker, risk = self._make_tracker(
             entry_ts=time.time() - MIN_SELL_DELAY_SEC - 1,  # floor already passed
-            client=client, real_token_amount=1_500_000,
+            client=client, real_token_amount="1.500000",
         )
         asyncio.run(tracker._handle_price_update("MINT", 151.0))
 
@@ -881,7 +881,7 @@ class AbsoluteAmountSellTests(unittest.TestCase):
         client = FakeClient(signature="sig", should_fail_by_amount=True)
         tracker, risk = self._make_tracker(
             entry_ts=time.time(),  # well before MIN_SELL_DELAY_SEC
-            client=client, real_token_amount=1_500_000,
+            client=client, real_token_amount="1.500000",
         )
         asyncio.run(tracker._handle_price_update("MINT", 151.0))
 
@@ -892,7 +892,7 @@ class AbsoluteAmountSellTests(unittest.TestCase):
     def test_exit_attempt_allowed_bypasses_the_floor_once_amount_is_known(self):
         client = FakeClient(signature="sig")
         tracker, risk = self._make_tracker(
-            entry_ts=time.time(), client=client, real_token_amount=1_500_000,
+            entry_ts=time.time(), client=client, real_token_amount="1.500000",
         )
         info = tracker._pending["MINT"]
         self.assertTrue(tracker._exit_attempt_allowed(info))
@@ -1436,10 +1436,10 @@ class ScamSocialCheckExitTests(unittest.TestCase):
         # without real_token_amount the wait still applies)
         risk = RiskManager(RiskConfig())
         risk.register_trade_opened(0.03)
-        client = FakeClient(real_token_amount=1_500_000)
+        client = FakeClient(real_token_amount="1.500000")
         tracker = OutcomeTracker(ws_url="wss://example.invalid", risk=risk, client=client, dry_run=False)
         asyncio.run(tracker.track("MINT", "Scammy", "SCAM", 100.0, trade_size_sol=0.03))
-        tracker._pending["MINT"]["real_token_amount"] = 1_500_000  # fresh entry_ts, well inside the floor
+        tracker._pending["MINT"]["real_token_amount"] = "1.500000"  # fresh entry_ts, well inside the floor
 
         async def _fake_fetch(uri):
             return {"twitter": "https://example.invalid/fake"}
@@ -1455,7 +1455,7 @@ class ScamSocialCheckExitTests(unittest.TestCase):
 
         mock_sleep.assert_not_called()  # no MIN_SELL_DELAY_SEC wait
         self.assertNotIn("MINT", tracker._pending)
-        self.assertEqual(client.build_and_send_full_sell_by_amount_calls[0][:2], ("MINT", 1_500_000))
+        self.assertEqual(client.build_and_send_full_sell_by_amount_calls[0][:2], ("MINT", "1.500000"))
 
 
 class DoubleExitRaceTests(unittest.TestCase):
@@ -2554,12 +2554,12 @@ class RealTokenAmountBgTests(unittest.TestCase):
         return tracker, risk
 
     def test_fetch_real_token_amount_bg_populates_the_pending_position(self):
-        client = FakeClient(real_token_amount=1_500_000)
+        client = FakeClient(real_token_amount="1.500000")
         tracker, _ = self._make_tracker(client=client)
 
         asyncio.run(tracker._fetch_real_token_amount_bg("MINT", "buy_sig"))
 
-        self.assertEqual(tracker._pending["MINT"]["real_token_amount"], 1_500_000)
+        self.assertEqual(tracker._pending["MINT"]["real_token_amount"], "1.500000")
 
     def test_fetch_real_token_amount_bg_ignores_a_none_or_zero_amount(self):
         for bad_amount in (None, 0):
@@ -2572,7 +2572,7 @@ class RealTokenAmountBgTests(unittest.TestCase):
                 self.assertIsNone(tracker._pending["MINT"]["real_token_amount"])
 
     def test_fetch_real_token_amount_bg_is_a_no_op_if_the_position_already_closed(self):
-        client = FakeClient(real_token_amount=1_500_000)
+        client = FakeClient(real_token_amount="1.500000")
         tracker, _ = self._make_tracker(client=client)
         del tracker._pending["MINT"]  # simulates a fast in-and-out trade
 

@@ -87,22 +87,39 @@ class RiskConfig:
     # rather than being silently bundled into the sell-side flag.
     use_jito_bundles_for_sniper_buys: bool = False
     # user-requested 2026-08-25 ("how can we improve the baseline" ->
-    # "build"), DISABLED again same night after the first live test:
-    # meant to skip MIN_SELL_DELAY_SEC by selling PumpPortal an exact
-    # absolute token amount instead of a percentage (which needs their
-    # balance index to catch up). Confirmed live 2026-08-25 the very
-    # first real exit after deploying it: PumpPortal returned a 400 Bad
-    # Request for the non-percentage sell body - their docs turned out
-    # to only show a numeric "amount" on a BUY (always SOL-denominated),
-    # never a genuine non-percentage SELL example, so the exact expected
-    # format (raw base units? UI-decimal amount? string vs number?) is
-    # still unverified. The fallback to the proven percentage-based sell
-    # caught this cleanly (no money lost), but with this left on, EVERY
-    # real exit was paying one extra guaranteed-to-fail ~300ms HTTP
-    # round-trip for zero benefit. Default OFF until the correct request
-    # format is confirmed (e.g. via a cheap, deliberate empirical test)
-    # - see outcome_tracker.py's _exit() for where this gates the
-    # absolute-amount attempt.
+    # "build"): meant to skip MIN_SELL_DELAY_SEC by selling PumpPortal an
+    # exact absolute token amount instead of a percentage (which needs
+    # their balance index to catch up). DISABLED same night after the
+    # first live exit got a 400 Bad Request - the request had sent the
+    # RAW base-unit integer (e.g. 427653965632), and PumpPortal's docs
+    # turned out to only show a numeric "amount" on a BUY (always
+    # SOL-denominated), never a genuine non-percentage SELL example.
+    #
+    # RE-ENABLED 2026-08-25 ("test") after finding the real format via a
+    # safe, no-money-at-risk empirical test: PumpPortal's trade-local
+    # endpoint validates and returns unsigned tx bytes WITHOUT ever
+    # signing/submitting anything, so different "amount" shapes could be
+    # tried directly against a real held mint with zero risk. Confirmed:
+    # raw base units (int or string) both 400; a UI-DECIMAL quantity as
+    # a STRING (e.g. "427653.965632", matching uiTokenAmount.
+    # uiAmountString's own scale) returns 200 with real unsigned tx
+    # bytes - see pumpportal_client.py's _fetch_real_token_amount and
+    # build_and_send_full_sell_by_amount docstrings for the exact fix.
+    #
+    # Still NOT confirmed that a signed, submitted transaction in this
+    # format actually lands on-chain (only that PumpPortal's server-side
+    # validation now accepts the request shape) - watch the next few
+    # real exits (the sell success/failure is logged at INFO, see
+    # outcome_tracker.py's _exit()) before fully trusting this. The
+    # fallback to the proven percentage-based sell remains unconditional
+    # on any failure here, so worst case is unchanged from before this
+    # feature existed - never a risk to money, only ever a risk to
+    # execution SPEED reverting to today's baseline.
+    #
+    # Default stays OFF here (same convention as use_jito_bundles_for_*
+    # above) - explicitly turned on in config.yaml (gitignored, not part
+    # of this PR) once the fix was confirmed, so a config reset falls
+    # back to the conservative, fully-proven percentage-only path.
     use_absolute_amount_sell: bool = False
 
 

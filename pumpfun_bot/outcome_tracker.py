@@ -44,6 +44,7 @@ import asyncio
 import json
 import logging
 import time
+from decimal import Decimal
 
 import websockets
 
@@ -591,11 +592,16 @@ class OutcomeTracker:
         the position has already closed by the time this resolves, or
         the lookup itself fails/returns nothing, there's nothing to
         update - not an error, the normal percentage-based sell path
-        (unchanged) remains the fallback either way."""
+        (unchanged) remains the fallback either way.
+
+        amount is a UI-decimal string (e.g. "427653.965632"), not a raw
+        int - see _fetch_real_token_amount's docstring for why (real 400
+        found live on the raw-base-units version). Parsed via Decimal,
+        not float, for the same exact-arithmetic reasoning."""
         if self.client is None:
             return
         amount = await self.client._fetch_real_token_amount(tx_signature, mint)
-        if amount is None or amount <= 0:
+        if amount is None or Decimal(amount) <= 0:
             return
         async with self._lock:
             info = self._pending.get(mint)
@@ -1410,7 +1416,7 @@ class OutcomeTracker:
                         # needing to bump the whole logger to DEBUG.
                         logger.info(
                             "Absolute-amount sell GESLAAGD voor %s (%.0fs sinds aankoop, "
-                            "amount=%d) - MIN_SELL_DELAY_SEC-wachttijd omzeild.",
+                            "amount=%s) - MIN_SELL_DELAY_SEC-wachttijd omzeild.",
                             info["symbol"], time_since_entry, real_token_amount,
                         )
                     except Exception as amount_exc:  # noqa: BLE001
