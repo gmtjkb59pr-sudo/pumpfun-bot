@@ -20,6 +20,7 @@ _market_cap_patcher = None
 _concentration_patcher = None
 _momentum_patcher = None
 _bundle_patcher = None
+_genuine_interest_patcher = None
 
 
 def setUpModule():
@@ -28,6 +29,7 @@ def setUpModule():
     # isn't mocked, so without this every run of this module wrote fake
     # "MINT" trade records into the real, live activity_log.jsonl
     global _TEST_LOG_FILE, _market_cap_patcher, _concentration_patcher, _momentum_patcher, _bundle_patcher
+    global _genuine_interest_patcher
     _TEST_LOG_FILE = tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False)
     _TEST_LOG_FILE.close()
     activity_log.DATA_LOG_PATH = Path(_TEST_LOG_FILE.name)
@@ -82,6 +84,19 @@ def setUpModule():
     )
     _bundle_patcher.start()
 
+    # same reasoning as above, for fetch_genuine_interest_stats - default
+    # to a clean-looking result so tests that don't care about wash-
+    # trading detection never make the real (meaningfully bigger,
+    # 1 + up to 30 calls) network round trip.
+    async def _fake_fetch_genuine_interest_stats(mint, rpc_http_url):
+        return {"total_classified": 10, "unique_buyer_ratio": 1.0, "wash_ratio": 0.0}
+
+    _genuine_interest_patcher = patch(
+        "pumpfun_bot.strategies.social_watch.fetch_genuine_interest_stats",
+        _fake_fetch_genuine_interest_stats,
+    )
+    _genuine_interest_patcher.start()
+
 
 def tearDownModule():
     activity_log.DATA_LOG_PATH = _ORIGINAL_DATA_LOG_PATH
@@ -95,6 +110,8 @@ def tearDownModule():
         _momentum_patcher.stop()
     if _bundle_patcher is not None:
         _bundle_patcher.stop()
+    if _genuine_interest_patcher is not None:
+        _genuine_interest_patcher.stop()
 
 
 class FakeClient:
@@ -986,6 +1003,54 @@ class BundleDetectionMetaTests(unittest.TestCase):
         self.assertIsNone(meta["launch_total_txs"])
         self.assertIsNone(meta["launch_distinct_slots"])
         self.assertIsNone(meta["launch_max_txs_in_one_slot"])
+
+
+class GenuineInterestMetaTests(unittest.TestCase):
+    """User-requested 2026-08-25 ("okay how can i make the bot profitable"
+    -> "build") - the free, per-candidate wash-trading proxy, logged
+    (not gating) same as every other new signal this session."""
+
+    def test_logs_the_unique_buyer_and_wash_ratios(self):
+        client = FakeClient(trade_events=[{"marketCapSol": 30.0}])
+        strategy, _ = _make_strategy(client, dry_run=True)
+
+        async def _fake_fetch_genuine_interest_stats(mint, rpc_http_url):
+            return {"total_classified": 20, "unique_buyer_ratio": 0.6, "wash_ratio": 0.3}
+
+        with patch(
+            "pumpfun_bot.strategies.social_watch.fetch_genuine_interest_stats",
+            _fake_fetch_genuine_interest_stats,
+        ):
+            asyncio.run(strategy._buy("MINT", {
+                "mint": "MINT", "name": "Test", "symbol": "TEST", "vSolInBondingCurve": 30.0,
+            }, time.time()))
+
+        with open(activity_log.DATA_LOG_PATH, encoding="utf-8") as f:
+            trades = [json.loads(line) for line in f if json.loads(line).get("type") == "trade"]
+        meta = trades[-1]["meta"]
+        self.assertAlmostEqual(meta["launch_unique_buyer_ratio"], 0.6)
+        self.assertAlmostEqual(meta["launch_wash_ratio"], 0.3)
+
+    def test_a_failed_lookup_logs_none_not_a_crash(self):
+        client = FakeClient(trade_events=[{"marketCapSol": 30.0}])
+        strategy, _ = _make_strategy(client, dry_run=True)
+
+        async def _fake_fetch_genuine_interest_stats(mint, rpc_http_url):
+            return None
+
+        with patch(
+            "pumpfun_bot.strategies.social_watch.fetch_genuine_interest_stats",
+            _fake_fetch_genuine_interest_stats,
+        ):
+            asyncio.run(strategy._buy("MINT", {
+                "mint": "MINT", "name": "Test", "symbol": "TEST", "vSolInBondingCurve": 30.0,
+            }, time.time()))
+
+        with open(activity_log.DATA_LOG_PATH, encoding="utf-8") as f:
+            trades = [json.loads(line) for line in f if json.loads(line).get("type") == "trade"]
+        meta = trades[-1]["meta"]
+        self.assertIsNone(meta["launch_unique_buyer_ratio"])
+        self.assertIsNone(meta["launch_wash_ratio"])
 
 
 class ScaledExitSimulatorWiringTests(unittest.TestCase):
