@@ -213,6 +213,22 @@ class SniperConfig:
     # over blocking on an inconclusive read.
     model_score_min_to_buy: float = 0
 
+    # user-requested 2026-08-26 ("social watch off sniper on dry run") -
+    # lets sniper run fully simulated (never places a real buy or sell,
+    # never risks new money) while risk.dry_run itself STAYS FALSE, so
+    # the shared OutcomeTracker keeps placing real sell orders for
+    # already-open real positions from before this was turned on. A
+    # plain risk.dry_run: true would have simulated those real exits too,
+    # leaving real held tokens with zero protection - see main.py's
+    # wiring: when this is True, sniper gets its own SEPARATE, always-
+    # dry_run OutcomeTracker instance (position_store.path_for_mode(True)
+    # - already isolated from the real live position store by that
+    # existing helper, no new file-collision risk) instead of the real,
+    # shared one. Only meaningful when risk.dry_run is False; redundant
+    # (but harmless) if risk.dry_run is already True. Default False - no
+    # behavior change unless deliberately turned on.
+    force_simulated: bool = False
+
 
 @dataclass
 class SocialWatchConfig:
@@ -612,6 +628,7 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         bundle_check_max_buys=sniper_raw.get("bundle_check_max_buys", 5),
         min_buys_in_window=sniper_raw.get("min_buys_in_window", 0),
         model_score_min_to_buy=sniper_raw.get("model_score_min_to_buy", 0),
+        force_simulated=sniper_raw.get("force_simulated", False),
     )
 
     sw_raw = strat_raw.get("social_watch", {})

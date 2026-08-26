@@ -133,6 +133,39 @@ async def main() -> None:
     # on its first cycle and then every WALLET_RECONCILE_INTERVAL_SEC after -
     # covers the startup check this used to be, plus ongoing drift.
 
+    # user-requested 2026-08-26 ("social watch off sniper on dry run") -
+    # see SniperConfig.force_simulated's docstring for the full reasoning.
+    # Gives sniper its OWN, always-simulated OutcomeTracker (a separate
+    # instance, separate position store via position_store.path_for_mode)
+    # instead of sharing the real one above - so sniper's new positions
+    # never mix with, or risk a real sell attempt for, whatever the real
+    # tracker is still protecting from before this was turned on. No
+    # separate instance (and no behavior change at all) unless this is
+    # explicitly enabled while risk.dry_run is still False.
+    sniper_dry_run = cfg.risk.dry_run
+    sniper_outcome_tracker = outcome_tracker
+    if cfg.sniper.force_simulated and not cfg.risk.dry_run:
+        sniper_dry_run = True
+        sniper_outcome_tracker = OutcomeTracker(
+            ws_url=cfg.pumpportal_ws_url,
+            api_key=cfg.pumpportal_api_key,
+            risk=risk,
+            alerter=alerter,
+            take_profit_pct=cfg.sniper.take_profit_pct,
+            stop_loss_pct=cfg.sniper.stop_loss_pct,
+            trailing_activation_pct=cfg.sniper.trailing_activation_pct,
+            trailing_stop_pct=cfg.sniper.trailing_stop_pct,
+            client=client,
+            dry_run=True,
+            sell_slippage_pct=cfg.risk.default_slippage_pct,
+        )
+        sniper_outcome_tracker.load_pending()
+        logger.warning(
+            "Sniper draait geforceerd gesimuleerd (sniper.force_simulated) - eigen, "
+            "losstaande OutcomeTracker, plaatst nooit een echte order. De echte "
+            "OutcomeTracker hierboven blijft actief voor al open posities van eerder."
+        )
+
     sniper = SniperStrategy(
         client=PumpPortalClient(cfg.pumpportal_ws_url, cfg.pumpportal_trade_api_url,
                                  cfg.rpc_http_url, keypair, api_key=cfg.pumpportal_api_key),
@@ -141,8 +174,8 @@ async def main() -> None:
         alerter=alerter,
         trade_size_sol=cfg.risk.max_sol_per_trade,
         slippage_pct=cfg.risk.default_slippage_pct,
-        dry_run=cfg.risk.dry_run,
-        outcome_tracker=outcome_tracker,
+        dry_run=sniper_dry_run,
+        outcome_tracker=sniper_outcome_tracker,
     )
     # user-requested: real 1m/2m momentum tracked from live trade ticks,
     # shorter than anything DexScreener's API exposes (see
@@ -297,6 +330,8 @@ async def main() -> None:
         asyncio.create_task(market_maker.run()),
         asyncio.create_task(outcome_tracker.run()),
     ]
+    if sniper_outcome_tracker is not outcome_tracker:
+        tasks.append(asyncio.create_task(sniper_outcome_tracker.run()))
 
     if cfg.social_watch.enabled:
         tasks.append(asyncio.create_task(candidate_price_tracker.run()))
