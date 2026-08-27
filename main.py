@@ -133,20 +133,35 @@ async def main() -> None:
     # on its first cycle and then every WALLET_RECONCILE_INTERVAL_SEC after -
     # covers the startup check this used to be, plus ongoing drift.
 
-    # user-requested 2026-08-26 ("social watch off sniper on dry run") -
-    # see SniperConfig.force_simulated's docstring for the full reasoning.
-    # Gives sniper its OWN, always-simulated OutcomeTracker (a separate
-    # instance, separate position store via position_store.path_for_mode)
-    # instead of sharing the real one above - so sniper's new positions
-    # never mix with, or risk a real sell attempt for, whatever the real
-    # tracker is still protecting from before this was turned on. No
-    # separate instance (and no behavior change at all) unless this is
-    # explicitly enabled while risk.dry_run is still False.
+    # user-requested 2026-08-26 ("social watch off sniper on dry run", then
+    # "keep social watch on aswell lets see if it makes a trade" -> "
+    # simulated only, like sniper") - see SniperConfig.force_simulated's
+    # docstring for the full reasoning. Gives whichever strategy(-ies) have
+    # force_simulated on their OWN, always-simulated OutcomeTracker (a
+    # separate instance, separate position store via
+    # position_store.path_for_mode) instead of sharing the real one above -
+    # so their new positions never mix with, or risk a real sell attempt
+    # for, whatever the real tracker is still protecting from before this
+    # was turned on.
+    #
+    # Sniper and social_watch SHARE one shadow tracker when both are
+    # force_simulated (rather than each getting an independent instance) -
+    # position_store.path_for_mode(dry_run=True) resolves to the exact same
+    # file regardless of which strategy asks for it, so two independent
+    # instances would each load/save that SAME file with their own,
+    # out-of-sync in-memory _pending dict, each save silently clobbering
+    # whatever the other had just written. One shared instance means one
+    # consistent view, exactly like the real tracker's own single-instance-
+    # shared-by-multiple-strategies design above.
+    #
+    # No separate instance at all (and no behavior change) unless at least
+    # one of these is explicitly turned on while risk.dry_run is still False.
     sniper_dry_run = cfg.risk.dry_run
+    social_watch_dry_run = cfg.risk.dry_run
     sniper_outcome_tracker = outcome_tracker
-    if cfg.sniper.force_simulated and not cfg.risk.dry_run:
-        sniper_dry_run = True
-        sniper_outcome_tracker = OutcomeTracker(
+    social_watch_outcome_tracker = outcome_tracker
+    if (cfg.sniper.force_simulated or cfg.social_watch.force_simulated) and not cfg.risk.dry_run:
+        shadow_outcome_tracker = OutcomeTracker(
             ws_url=cfg.pumpportal_ws_url,
             api_key=cfg.pumpportal_api_key,
             risk=risk,
@@ -159,11 +174,23 @@ async def main() -> None:
             dry_run=True,
             sell_slippage_pct=cfg.risk.default_slippage_pct,
         )
-        sniper_outcome_tracker.load_pending()
+        shadow_outcome_tracker.load_pending()
+        if cfg.sniper.force_simulated:
+            sniper_dry_run = True
+            sniper_outcome_tracker = shadow_outcome_tracker
+        if cfg.social_watch.force_simulated:
+            social_watch_dry_run = True
+            social_watch_outcome_tracker = shadow_outcome_tracker
         logger.warning(
-            "Sniper draait geforceerd gesimuleerd (sniper.force_simulated) - eigen, "
-            "losstaande OutcomeTracker, plaatst nooit een echte order. De echte "
-            "OutcomeTracker hierboven blijft actief voor al open posities van eerder."
+            "Geforceerd gesimuleerd (force_simulated): %s - eigen, losstaande "
+            "OutcomeTracker, plaatst nooit een echte order. De echte OutcomeTracker "
+            "hierboven blijft actief voor al open posities van eerder.",
+            ", ".join(
+                name for name, on in (
+                    ("sniper", cfg.sniper.force_simulated),
+                    ("social_watch", cfg.social_watch.force_simulated),
+                ) if on
+            ),
         )
 
     sniper = SniperStrategy(
@@ -193,8 +220,8 @@ async def main() -> None:
         alerter=alerter,
         trade_size_sol=cfg.social_watch.trade_size_sol or cfg.risk.max_sol_per_trade,
         slippage_pct=cfg.risk.default_slippage_pct,
-        dry_run=cfg.risk.dry_run,
-        outcome_tracker=outcome_tracker,
+        dry_run=social_watch_dry_run,
+        outcome_tracker=social_watch_outcome_tracker,
         price_tracker=candidate_price_tracker,
         scaled_exit_simulator=scaled_exit_simulator,
     )
@@ -330,8 +357,12 @@ async def main() -> None:
         asyncio.create_task(market_maker.run()),
         asyncio.create_task(outcome_tracker.run()),
     ]
-    if sniper_outcome_tracker is not outcome_tracker:
-        tasks.append(asyncio.create_task(sniper_outcome_tracker.run()))
+    # sniper and social_watch may share the SAME shadow tracker instance
+    # (see the force_simulated wiring above) - a set dedupes by identity so
+    # its .run() task is only ever started once, however many strategies
+    # point at it.
+    for shadow_tracker in {sniper_outcome_tracker, social_watch_outcome_tracker} - {outcome_tracker}:
+        tasks.append(asyncio.create_task(shadow_tracker.run()))
 
     if cfg.social_watch.enabled:
         tasks.append(asyncio.create_task(candidate_price_tracker.run()))

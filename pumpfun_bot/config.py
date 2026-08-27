@@ -288,6 +288,14 @@ class SocialWatchConfig:
     # shared risk.max_sol_per_trade - 0 (default) falls back to that shared
     # value, unchanged behavior for anyone who hasn't set this explicitly
     trade_size_sol: float = 0.0
+    # user-requested 2026-08-26 ("keep social watch on aswell lets see if
+    # it makes a trade" -> "simulated only, like sniper") - mirrors
+    # SniperConfig.force_simulated exactly: lets social_watch run fully
+    # simulated (own separate, always-dry_run OutcomeTracker, never a
+    # real order) while risk.dry_run stays false, so the real, shared
+    # OutcomeTracker keeps protecting whatever real positions are already
+    # open. Default False - no behavior change unless explicitly on.
+    force_simulated: bool = False
 
 
 @dataclass
@@ -648,6 +656,7 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         max_open_positions=sw_raw.get("max_open_positions", 5),
         trade_size_sol=sw_raw.get("trade_size_sol", 0.0),
         take_profit_ladder=_parse_take_profit_ladder(sw_raw.get("take_profit_ladder")),
+        force_simulated=sw_raw.get("force_simulated", False),
     )
 
     be_raw = strat_raw.get("birdeye_movers", {})
