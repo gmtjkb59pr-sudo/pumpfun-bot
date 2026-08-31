@@ -6,9 +6,14 @@ from solders.keypair import Keypair
 from solders.transaction import VersionedTransaction
 
 from pumpfun_bot.pumpportal_client import (
+    MissingPumpPortalFieldError,
     OnChainTransactionError,
     PumpPortalClient,
+    WS_INITIAL_BACKOFF_SEC,
+    WS_MAX_BACKOFF_SEC,
     authenticated_ws_url,
+    next_ws_backoff,
+    require_event_float,
 )
 
 
@@ -1181,6 +1186,72 @@ class BuildAndSendTradeViaJitoBundleTests(unittest.TestCase):
 
 async def _async_ret(value):
     return value
+
+
+
+class RequireEventFloatTests(unittest.TestCase):
+    def test_returns_a_present_numeric_field(self):
+        self.assertEqual(require_event_float({"vSolInBondingCurve": 30}, "vSolInBondingCurve"), 30.0)
+
+    def test_missing_field_raises_not_zero(self):
+        with self.assertRaises(MissingPumpPortalFieldError):
+            require_event_float({}, "vSolInBondingCurve")
+
+    def test_none_raises(self):
+        with self.assertRaises(MissingPumpPortalFieldError):
+            require_event_float({"vSolInBondingCurve": None}, "vSolInBondingCurve")
+
+    def test_empty_string_raises(self):
+        with self.assertRaises(MissingPumpPortalFieldError):
+            require_event_float({"vSolInBondingCurve": ""}, "vSolInBondingCurve")
+
+
+class WsBackoffTests(unittest.TestCase):
+    def test_zero_current_returns_the_initial_delay(self):
+        self.assertEqual(next_ws_backoff(0), WS_INITIAL_BACKOFF_SEC)
+
+    def test_doubles_until_the_cap(self):
+        delay = WS_INITIAL_BACKOFF_SEC
+        seen = []
+        for _ in range(10):
+            delay = next_ws_backoff(delay)
+            seen.append(delay)
+        self.assertEqual(seen[0], WS_INITIAL_BACKOFF_SEC * 2)
+        self.assertEqual(seen[-1], WS_MAX_BACKOFF_SEC)
+        self.assertLessEqual(max(seen), WS_MAX_BACKOFF_SEC)
+
+
+class DryRunHardStopTests(unittest.TestCase):
+    def _make_client(self):
+        return PumpPortalClient(
+            ws_url="wss://example.invalid",
+            trade_api_url="https://example.invalid/trade-local",
+            rpc_http_url="https://example.invalid/rpc",
+            keypair=Keypair(),
+            dry_run=True,
+        )
+
+    def test_full_sell_refuses_to_sign(self):
+        client = self._make_client()
+        with self.assertRaises(RuntimeError) as ctx:
+            asyncio.run(client.build_and_send_full_sell(mint="MINT123", slippage_pct=10))
+        self.assertIn("dry_run", str(ctx.exception))
+
+    def test_buy_refuses_to_sign(self):
+        client = self._make_client()
+        with self.assertRaises(RuntimeError) as ctx:
+            asyncio.run(client.build_and_send_trade(
+                action="buy", mint="MINT123", amount_sol=0.05, slippage_pct=10,
+            ))
+        self.assertIn("dry_run", str(ctx.exception))
+
+    def test_jito_buy_refuses_to_sign(self):
+        client = self._make_client()
+        with self.assertRaises(RuntimeError) as ctx:
+            asyncio.run(client.build_and_send_trade_via_jito_bundle(
+                action="buy", mint="MINT123", amount_sol=0.05, slippage_pct=10,
+            ))
+        self.assertIn("dry_run", str(ctx.exception))
 
 
 if __name__ == "__main__":

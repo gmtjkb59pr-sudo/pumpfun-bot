@@ -70,6 +70,18 @@ class PassesFiltersTests(unittest.TestCase):
         event = {"mint": "MINT", "vSolInBondingCurve": 30.0, "traderPublicKey": "CREATOR"}
         self.assertFalse(strategy._passes_filters(event))
 
+    def test_missing_vsol_is_rejected_not_treated_as_zero(self):
+        # previously `event.get("vSolInBondingCurve") or event.get("initialBuy") or 0`
+        # skipped the min_liquidity check because 0 is falsy
+        strategy = _make_strategy()
+        event = {"mint": "MINT", "traderPublicKey": "CREATOR", "initialBuy": 500_000_000}
+        self.assertFalse(strategy._passes_filters(event))
+
+    def test_missing_social_fields_are_rejected_when_required(self):
+        strategy = _make_strategy(cfg=SniperConfig(enabled=True, require_socials=True))
+        event = {"mint": "MINT", "vSolInBondingCurve": 30.0, "traderPublicKey": "CREATOR"}
+        self.assertFalse(strategy._passes_filters(event))
+
     def test_rejects_a_mint_already_tracked_by_outcome_tracker(self):
         """Regression guard: sniper and social_watch share one
         OutcomeTracker keyed by mint alone - buying a mint that's already

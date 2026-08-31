@@ -64,6 +64,38 @@ def authenticated_ws_url(ws_url: str, api_key: str) -> str:
     return f"{ws_url}{separator}api-key={api_key}"
 
 
+class MissingPumpPortalFieldError(ValueError):
+    """A PumpPortal WS event is missing a field this bot actually needs to
+    make a decision. Callers must NOT treat the miss as zero / empty — that
+    silently disabled filters (liquidity as 0 skipped min_liquidity_sol
+    because 0 is falsy; socials as missing looked like "geen socials")."""
+
+
+def require_event_float(event: dict, field: str) -> float:
+    if field not in event or event[field] is None or event[field] == "":
+        raise MissingPumpPortalFieldError(
+            f"PumpPortal event mist verplicht veld '{field}'"
+        )
+    try:
+        return float(event[field])
+    except (TypeError, ValueError) as exc:
+        raise MissingPumpPortalFieldError(
+            f"PumpPortal veld '{field}' is geen getal: {event[field]!r}"
+        ) from exc
+
+
+WS_INITIAL_BACKOFF_SEC = 1.0
+WS_MAX_BACKOFF_SEC = 60.0
+
+
+def next_ws_backoff(current: float) -> float:
+    """Exponential backoff between WS reconnects. current<=0 returns the
+    initial delay (first reconnect after a drop). Caps at WS_MAX_BACKOFF_SEC."""
+    if current <= 0:
+        return WS_INITIAL_BACKOFF_SEC
+    return min(current * 2, WS_MAX_BACKOFF_SEC)
+
+
 class PumpPortalClient:
     def __init__(
         self,
@@ -72,12 +104,25 @@ class PumpPortalClient:
         rpc_http_url: str,
         keypair: Keypair,
         api_key: str = "",
+        dry_run: bool = False,
     ):
         self.ws_url = ws_url
         self.trade_api_url = trade_api_url
         self.rpc_http_url = rpc_http_url
         self.keypair = keypair
         self.api_key = api_key
+        # hard stop so a forgotten strategy-level dry_run check can never
+        # reach signing/sending. Default False keeps existing tests that
+        # construct a client and exercise the live send path unchanged.
+        self.dry_run = dry_run
+
+    def _assert_not_dry_run(self, action: str) -> None:
+        if self.dry_run:
+            raise RuntimeError(
+                f"dry_run is true — weiger te signen/verzenden ({action}). "
+                "Dit is een hard stop zodat een vergeten check in een strategie "
+                "nooit een echte transactie kan plaatsen."
+            )
 
     # ---------- Data feed (WebSocket) ----------
 
@@ -108,23 +153,33 @@ class PumpPortalClient:
             payload["keys"] = keys
 
         ws_url = authenticated_ws_url(self.ws_url, self.api_key)
-        async for websocket in websockets.connect(ws_url, ping_interval=20):
+        backoff = 0.0
+        while True:
             try:
-                await websocket.send(json.dumps(payload))
-                logger.info("WS verbonden en geabonneerd op %s", subscribe_method)
-                async for raw in websocket:
-                    try:
-                        data = json.loads(raw)
-                    except json.JSONDecodeError:
-                        logger.debug("Kon WS bericht niet parsen: %s", raw)
-                        continue
-                    yield data
+                async with websockets.connect(ws_url, ping_interval=20) as websocket:
+                    await websocket.send(json.dumps(payload))
+                    logger.info("WS verbonden en geabonneerd op %s", subscribe_method)
+                    backoff = 0.0  # reset after a successful connect
+                    async for raw in websocket:
+                        try:
+                            data = json.loads(raw)
+                        except json.JSONDecodeError:
+                            logger.debug("Kon WS bericht niet parsen: %s", raw)
+                            continue
+                        yield data
+            except asyncio.CancelledError:
+                raise
             except websockets.ConnectionClosed:
-                logger.warning("WebSocket verbinding verbroken, reconnect...")
-                continue
+                backoff = next_ws_backoff(backoff)
+                logger.warning(
+                    "WebSocket verbinding verbroken, reconnect in %.1fs...", backoff,
+                )
             except Exception as exc:  # noqa: BLE001
-                logger.exception("Onverwachte WS fout: %s", exc)
-                continue
+                backoff = next_ws_backoff(backoff)
+                logger.exception(
+                    "Onverwachte WS fout: %s — reconnect in %.1fs...", exc, backoff,
+                )
+            await asyncio.sleep(backoff)
 
     # ---------- Trading (Local Trading API) ----------
 
@@ -225,6 +280,7 @@ class PumpPortalClient:
         caller's existing retry/failure handling treats this the same as
         any other failed buy attempt.
         """
+        self._assert_not_dry_run(action)
         body = {
             "publicKey": str(self.keypair.pubkey()),
             "action": action,
@@ -391,6 +447,7 @@ class PumpPortalClient:
         _exit) already treats any exception here as "sell failed, try
         again shortly", same as every other real-sell path in this client.
         """
+        self._assert_not_dry_run("sell")
         amount = f"{amount_pct:g}%"
         body = {
             "publicKey": str(self.keypair.pubkey()),
@@ -481,6 +538,7 @@ class PumpPortalClient:
             return await self._sign_and_send(retry_body)
 
     async def _sign_and_send(self, body: dict) -> str:
+        self._assert_not_dry_run(body.get("action", "trade"))
         # timing + blockhash-validity diagnostics for BlockhashNotFound
         # failures: separates "PumpPortal handed us an already-stale
         # blockhash" from "it went stale during our own processing/submission"

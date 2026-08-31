@@ -165,5 +165,21 @@ class CopyTradeBuyDedupTests(unittest.TestCase):
         self.assertEqual(mock_state.log_trade.call_count, 1)
 
 
+
+class CopyTradeMissingFieldsTests(unittest.TestCase):
+    def test_missing_sol_amount_is_skipped_not_treated_as_zero(self):
+        event = {
+            "txType": "buy",
+            "mint": "M1",
+            "timestamp": time.time() * 1000,
+            "vSolInBondingCurve": 50.0,
+        }
+        strategy, client, risk = _make_strategy([event])
+        with patch("pumpfun_bot.strategies.copytrade.bot_state") as mock_state:
+            asyncio.run(strategy.run())
+        mock_state.log_trade.assert_not_called()
+        risk.can_trade.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

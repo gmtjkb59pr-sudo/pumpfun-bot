@@ -38,6 +38,7 @@ from pumpfun_bot.model_retrain import retrain_loop
 from pumpfun_bot.outcome_tracker import OutcomeTracker
 from pumpfun_bot.pumpportal_client import PumpPortalClient
 from pumpfun_bot.risk import RiskManager
+from pumpfun_bot import risk_store
 from pumpfun_bot.scaled_exit_simulator import ScaledExitSimulator
 from pumpfun_bot.state import bot_state
 from pumpfun_bot.strategies.birdeye_movers import BirdeyeMoversStrategy
@@ -89,20 +90,27 @@ async def main() -> None:
 
     logger.info("Wallet geladen: %s", keypair.pubkey())
 
-    client = PumpPortalClient(
-        ws_url=cfg.pumpportal_ws_url,
-        trade_api_url=cfg.pumpportal_trade_api_url,
-        rpc_http_url=cfg.rpc_http_url,
-        keypair=keypair,
-        api_key=cfg.pumpportal_api_key,
-    )
+    def make_client(*, dry_run: bool = cfg.risk.dry_run) -> PumpPortalClient:
+        return PumpPortalClient(
+            ws_url=cfg.pumpportal_ws_url,
+            trade_api_url=cfg.pumpportal_trade_api_url,
+            rpc_http_url=cfg.rpc_http_url,
+            keypair=keypair,
+            api_key=cfg.pumpportal_api_key,
+            dry_run=dry_run,
+        )
+
+    client = make_client()
     alerter = Alerter(
         console=cfg.alerts_console,
         telegram_enabled=cfg.telegram_enabled,
         bot_token=cfg.telegram_bot_token,
         chat_id=cfg.telegram_chat_id,
     )
-    risk = RiskManager(cfg.risk, alerter=alerter)
+    risk = RiskManager(
+        cfg.risk, alerter=alerter,
+        store_path=risk_store.path_for_mode(cfg.risk.dry_run),
+    )
 
     # user-requested "scaled exit" strategy comparison (take half off at
     # +100%, trail the remainder 25% off its peak, wider -50% stop before
@@ -126,6 +134,11 @@ async def main() -> None:
         price_observers=[scaled_exit_simulator.on_price_update],
     )
     outcome_tracker.load_pending()
+    # reconstruct open exposure from persisted positions (remaining_fraction,
+    # sell_paused+reputation_logged) so a restart cannot zero the exposure
+    # cap while still tracking real holdings. Daily-loss / trades-per-hour
+    # already came back via RiskManager's store_path load above.
+    risk.sync_open_exposure_from_positions(outcome_tracker._pending)
     # wallet<->tracked-positions reconciliation (both directions: stale
     # tracked positions the wallet no longer holds, and untracked holdings
     # the wallet has) now runs periodically inside outcome_tracker.run()
@@ -170,7 +183,7 @@ async def main() -> None:
             stop_loss_pct=cfg.sniper.stop_loss_pct,
             trailing_activation_pct=cfg.sniper.trailing_activation_pct,
             trailing_stop_pct=cfg.sniper.trailing_stop_pct,
-            client=client,
+            client=make_client(dry_run=True),
             dry_run=True,
             sell_slippage_pct=cfg.risk.default_slippage_pct,
         )
@@ -194,8 +207,7 @@ async def main() -> None:
         )
 
     sniper = SniperStrategy(
-        client=PumpPortalClient(cfg.pumpportal_ws_url, cfg.pumpportal_trade_api_url,
-                                 cfg.rpc_http_url, keypair, api_key=cfg.pumpportal_api_key),
+        client=make_client(dry_run=sniper_dry_run),
         cfg=cfg.sniper,
         risk=risk,
         alerter=alerter,
@@ -213,8 +225,7 @@ async def main() -> None:
         ws_url=cfg.pumpportal_ws_url, api_key=cfg.pumpportal_api_key,
     )
     social_watch = SocialWatchStrategy(
-        client=PumpPortalClient(cfg.pumpportal_ws_url, cfg.pumpportal_trade_api_url,
-                                 cfg.rpc_http_url, keypair, api_key=cfg.pumpportal_api_key),
+        client=make_client(dry_run=social_watch_dry_run),
         cfg=cfg.social_watch,
         risk=risk,
         alerter=alerter,
@@ -229,8 +240,7 @@ async def main() -> None:
     # price spike via Birdeye's trending API - social_watch can only ever
     # see brand-new launches, this covers the gap (see birdeye_movers.py)
     birdeye_movers = BirdeyeMoversStrategy(
-        client=PumpPortalClient(cfg.pumpportal_ws_url, cfg.pumpportal_trade_api_url,
-                                 cfg.rpc_http_url, keypair, api_key=cfg.pumpportal_api_key),
+        client=make_client(),
         cfg=cfg.birdeye_movers,
         risk=risk,
         alerter=alerter,
@@ -244,8 +254,7 @@ async def main() -> None:
     # poll every few minutes instead of every 45 and react to a genuinely
     # short momentum window (see coingecko_movers.py)
     coingecko_movers = CoinGeckoMoversStrategy(
-        client=PumpPortalClient(cfg.pumpportal_ws_url, cfg.pumpportal_trade_api_url,
-                                 cfg.rpc_http_url, keypair, api_key=cfg.pumpportal_api_key),
+        client=make_client(),
         cfg=cfg.coingecko_movers,
         risk=risk,
         alerter=alerter,
@@ -262,8 +271,7 @@ async def main() -> None:
     # reasoning, including the honest caveat that this has no proven edge
     # like social_watch's evidence-based filters).
     moonshot_hunter = MoonshotHunterStrategy(
-        client=PumpPortalClient(cfg.pumpportal_ws_url, cfg.pumpportal_trade_api_url,
-                                 cfg.rpc_http_url, keypair, api_key=cfg.pumpportal_api_key),
+        client=make_client(),
         cfg=cfg.moonshot_hunter,
         risk=risk,
         alerter=alerter,
@@ -273,8 +281,7 @@ async def main() -> None:
         outcome_tracker=outcome_tracker,
     )
     copytrade = CopyTradeStrategy(
-        client=PumpPortalClient(cfg.pumpportal_ws_url, cfg.pumpportal_trade_api_url,
-                                 cfg.rpc_http_url, keypair, api_key=cfg.pumpportal_api_key),
+        client=make_client(),
         cfg=cfg.copytrade,
         risk=risk,
         alerter=alerter,
@@ -283,8 +290,7 @@ async def main() -> None:
         dry_run=cfg.risk.dry_run,
     )
     market_maker = MarketMakerStrategy(
-        client=PumpPortalClient(cfg.pumpportal_ws_url, cfg.pumpportal_trade_api_url,
-                                 cfg.rpc_http_url, keypair, api_key=cfg.pumpportal_api_key),
+        client=make_client(),
         cfg=cfg.market_maker,
         risk=risk,
         alerter=alerter,
