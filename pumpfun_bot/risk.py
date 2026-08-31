@@ -9,6 +9,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 
+from . import risk_store
 from .config import RiskConfig
 from .state import bot_state
 
@@ -49,19 +50,26 @@ class RiskState:
 
 
 class RiskManager:
-    def __init__(self, cfg: RiskConfig, alerter=None):
+    def __init__(self, cfg: RiskConfig, alerter=None, store_path=None):
         self.cfg = cfg
         self.state = RiskState()
         # optional so tests/simple usage don't need one - only used to
         # announce circuit breaker trips/recoveries, nothing else here sends
         # alerts
         self.alerter = alerter
+        # None (default) = do not persist, so existing tests that construct
+        # a RiskManager without a path keep their in-memory-only behavior
+        # and never write into data/. main.py passes path_for_mode().
+        self.store_path = store_path
+        if store_path is not None:
+            self._load_persisted()
 
     def _reset_day_if_needed(self) -> None:
         if time.time() - self.state.day_start_ts > 86400:
             self.state.day_start_ts = time.time()
             self.state.realized_pnl_sol = 0.0
             logger.info("Dagelijkse teller gereset.")
+            self._persist()
 
     def _trades_in_last_hour(self) -> int:
         cutoff = time.time() - 3600
@@ -291,6 +299,7 @@ class RiskManager:
         self.state.open_exposure_sol += sol_amount
         self.state.trade_timestamps.append(time.time())
         self._sync_dashboard()
+        self._persist()
 
     def register_trade_closed(self, sol_amount: float, pnl_sol: float) -> None:
         self.state.open_exposure_sol = max(0.0, self.state.open_exposure_sol - sol_amount)
@@ -300,6 +309,68 @@ class RiskManager:
             pnl_sol, self.state.realized_pnl_sol, self.state.open_exposure_sol,
         )
         self._sync_dashboard()
+        self._persist()
+
+    def sync_open_exposure_from_positions(self, positions: dict) -> None:
+        """Positions are the source of truth for open exposure after a
+        restart (and after wallet reconcile drops stale ones). Daily-loss
+        and hourly trade counters come from the persisted risk file;
+        exposure is reconstructed so it cannot drift from
+        remaining_fraction / sell_paused+reputation_logged state.
+
+        A sell_paused position whose exposure was already released
+        (reputation_logged) is skipped — counting it again would re-block
+        buying with capital that's already been written off."""
+        total = 0.0
+        for info in positions.values():
+            if info.get("sell_paused") and info.get("reputation_logged"):
+                continue
+            size = float(info.get("trade_size_sol") or 0.0)
+            remaining = float(info.get("remaining_fraction") if info.get("remaining_fraction") is not None else 1.0)
+            total += size * remaining
+        self.state.open_exposure_sol = max(0.0, total)
+        self._sync_dashboard()
+        self._persist()
+
+    def _load_persisted(self) -> None:
+        raw = risk_store.load(self.store_path)
+        if not raw:
+            return
+        try:
+            self.state.realized_pnl_sol = float(raw.get("realized_pnl_sol") or 0.0)
+            self.state.day_start_ts = float(raw.get("day_start_ts") or time.time())
+            timestamps = raw.get("trade_timestamps") or []
+            self.state.trade_timestamps = [float(t) for t in timestamps]
+            # snapshot only — overwritten by sync_open_exposure_from_positions
+            # once positions are loaded. Used if that sync never runs.
+            if "open_exposure_sol" in raw:
+                self.state.open_exposure_sol = max(0.0, float(raw["open_exposure_sol"] or 0.0))
+        except (TypeError, ValueError):
+            logger.warning("Kon risk-state niet laden van %s — start leeg.", self.store_path)
+            self.state = RiskState()
+            return
+        self._reset_day_if_needed()
+        self._trades_in_last_hour()  # prune stale timestamps
+        self._sync_dashboard()
+        logger.info(
+            "Risk-tellers hersteld: dag-pnl=%.4f SOL | trades/uur=%d | exposure=%.4f SOL",
+            self.state.realized_pnl_sol,
+            len(self.state.trade_timestamps),
+            self.state.open_exposure_sol,
+        )
+
+    def _persist(self) -> None:
+        if self.store_path is None:
+            return
+        risk_store.save(
+            {
+                "realized_pnl_sol": self.state.realized_pnl_sol,
+                "day_start_ts": self.state.day_start_ts,
+                "trade_timestamps": list(self.state.trade_timestamps),
+                "open_exposure_sol": self.state.open_exposure_sol,
+            },
+            self.store_path,
+        )
 
     def _sync_dashboard(self) -> None:
         bot_state.update_risk_snapshot(

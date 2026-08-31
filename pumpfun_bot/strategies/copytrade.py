@@ -55,9 +55,15 @@ class CopyTradeStrategy:
 
             mint = event.get("mint")
             action = event.get("txType")  # "buy" of "sell"
-            source_sol = event.get("solAmount", 0)
             if not mint or action not in ("buy", "sell"):
                 continue
+            if "solAmount" not in event or event.get("solAmount") in (None, ""):
+                logger.warning(
+                    "Copytrade: event voor %s mist solAmount — skip, niet behandelen als 0.",
+                    mint,
+                )
+                continue
+            source_sol = float(event["solAmount"])
 
             if action == "sell" and mint not in self._held:
                 logger.debug(

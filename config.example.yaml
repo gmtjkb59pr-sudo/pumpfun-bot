@@ -19,12 +19,16 @@ pumpportal:
 risk:
   dry_run: true                 # true = geen echte orders, alleen loggen. Zet zelf bewust op false.
   max_sol_per_trade: 0.05       # max SOL per enkele trade
-  max_sol_total_exposure: 0.3   # max totaal aan open posities tegelijk
+  max_sol_total_exposure: 0.3   # max totaal aan open posities tegelijk (vaste cap)
   max_trades_per_hour: 10
   max_daily_loss_sol: 0.2       # bot stopt zichzelf als dit verlies bereikt is
   default_slippage_pct: 10
   min_liquidity_sol: 5          # negeer tokens met minder liquiditeit dan dit
-  max_open_positions: 1000      # bot koopt niets nieuws zolang dit aantal posities al open staat
+  # 1000 was effectief onbeperkt: een burst van buys kan de wallet leeghalen
+  # voordat TP/SL kan ingrijpen. 10 is een sane plafond; per-strategie caps
+  # (social_watch etc.) mogen strakker. Bestaande config.yaml zonder dit
+  # veld blijft 1000 (geen verrassing op een bestaande checkout).
+  max_open_positions: 10
   # hard kill-switch (niet hetzelfde als max_daily_loss_sol): stopt de HELE
   # bot zodra de echte wallet-balans (SOL omgerekend naar USD via een live
   # koers) hieronder zakt. 0 = uitgeschakeld (standaard).
@@ -33,12 +37,19 @@ risk:
   # zodra het ECHTE verlies deze sessie (echte wallet-balans, niet het
   # fee-model) dit bedrag bereikt. 0 = uitgeschakeld (standaard).
   max_real_loss_usd: 0
-  # caps total open exposure at a PERCENTAGE of the wallet's real, live SOL
-  # balance instead of (in addition to) the fixed max_sol_total_exposure
-  # above - shrinks automatically as the wallet shrinks, grows
-  # automatically after a top-up. 0 = disabled (default), relies on
-  # max_sol_total_exposure alone.
-  max_exposure_pct_of_balance: 0
+  # Incident: max_sol_total_exposure is een VASTE cap. Met
+  # max_exposure_pct_of_balance: 0 (uit) kon sniper 0.114→0.0012 SOL
+  # verbranden in ~90s omdat de vaste cap groter was dan de (gekrompen)
+  # wallet. 45% krimpt mee met de wallet en laat ruimte voor fees/Jito-tips.
+  # Bestaande config.yaml zonder dit veld blijft 0 (gedrag ongewijzigd).
+  max_exposure_pct_of_balance: 45
+  # Jito (opt-in, default uit). De tip is ~0.01 SOL — bij trades van
+  # ~0.012-0.053 SOL is dat 19-83% van de trade, dus size-gated via
+  # max_jito_tip_pct_of_trade. Zet pas aan als je trades groot genoeg zijn.
+  # use_jito_bundles_for_take_profit: false
+  # use_jito_bundles_for_sniper_buys: false
+  # max_jito_tip_pct_of_trade: 10
+  # use_absolute_amount_sell: false  # experimenteel; percentage-sell blijft fallback
 
 strategies:
   sniper:

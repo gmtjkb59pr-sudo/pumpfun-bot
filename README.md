@@ -1,12 +1,19 @@
 # Pump.fun Trading Bot (Solana)
 
-Een lokale bot voor pump.fun met drie combineerbare strategieën:
-- **Sniper** — koopt nieuwe tokens vlak na launch die door je filters komen
-- **Copy trading** — spiegelt trades van wallets die je aanwijst
-- **Market maker / grid** — plaatst grid buy/sell orders rond de laatste prijs
+Een lokale, config-gedreven bot voor pump.fun. Strategieën zijn combineerbaar
+(alles uit, tot je ze aanzet):
 
-Plus een alerting-systeem (console + optioneel Telegram) en een centrale
-risk-manager die harde limieten afdwingt over alle strategieën heen.
+- **Sniper** — koopt nieuwe tokens vlak na launch die door je filters komen
+- **Social watch** — wacht op socials in de metadata i.p.v. direct te snipe'en
+- **Birdeye movers** — bestaande tokens met een volume/prijs-spike (Birdeye API)
+- **CoinGecko movers** — zelfde niche, via CoinGecko Demo API (hoger call-budget)
+- **Moonshot hunter** — kleine, bewuste loterij-allocatie op zeldzame 100-1000x
+- **Copy trading** — spiegelt trades van wallets die je aanwijst
+- **Market maker / grid** — grid buy/sell op tokens in `target_tokens`, met
+  echte pump.fun bonding-curve prijzen (constant-product, virtual reserves)
+
+Plus: centrale RiskManager, OutcomeTracker (TP/SL/trailing/ladder), dashboard
+op localhost:8765, optioneel Telegram, optioneel Jito (size-gated).
 
 ## ⚠️ Lees dit eerst
 
@@ -17,13 +24,11 @@ risk-manager die harde limieten afdwingt over alle strategieën heen.
   API van [PumpPortal](https://pumpportal.fun/) omdat pump.fun zelf geen
   publieke trading-API aanbiedt. Endpoints/velden kunnen zonder aankondiging
   wijzigen — test altijd eerst met `dry_run: true`.
-- **Er zit geen garantie op winst in.** Filters in de sniper-strategie
-  (liquiditeit, social links) zijn basale ruis-filters, geen scam-detectie.
+- **Er zit geen garantie op winst in.** Filters zijn basale ruis-filters, geen
+  scam-detectie. Moonshot hunter heeft bewust geen bewezen edge.
 - **Zet nooit meer op je hot wallet dan je kunt missen.** Gebruik een aparte
   wallet, niet je hoofd-wallet.
-- Ik heb dit gebouwd als een werkend startpunt met code-review in gedachten —
-  niet als kant-en-klaar productiesysteem. Test grondig, begin klein, en lees
-  de code voordat je hem live zet.
+- Dit is een werkend lokaal startpunt, geen kant-en-klaar productiesysteem.
 
 ## Installatie
 
@@ -40,19 +45,22 @@ cp .env.example .env
 Vul in `.env`:
 ```
 SOLANA_PRIVATE_KEY=<je base58 private key>
-PUMPPORTAL_API_KEY=          # alleen nodig als je later de Lightning API gebruikt
-TELEGRAM_BOT_TOKEN=          # optioneel, voor Telegram alerts
+PUMPPORTAL_API_KEY=          # verplicht voor subscribeTokenTrade / outcome-tracking
+TELEGRAM_BOT_TOKEN=          # optioneel
+BIRDEYE_API_KEY=             # alleen birdeye_movers
+COINGECKO_API_KEY=           # alleen coingecko_movers
 ```
 
 **Nooit** je `.env` of `config.yaml` (met echte wallet-verwijzingen) delen of
-in git committen. Gebruik idealiter een losse, klein-gevulde wallet.
+in git committen.
 
 Pas daarna `config.yaml` aan:
-1. Zet een fatsoenlijke RPC url (public mainnet-beta RPC is traag/rate-limited;
-   overweeg Helius, QuickNode of Triton voor een snipers/copy-trading use case)
+1. Zet een fatsoenlijke RPC url (public mainnet-beta is traag/rate-limited)
 2. Zet welke strategie(ën) je `enabled: true` wilt
 3. Controleer de `risk:` sectie — dit zijn je enige bescherming tegen een bug
-   die te veel/te vaak handelt
+   die te veel/te vaak handelt. `config.example.yaml` zet
+   `max_exposure_pct_of_balance: 45` en `max_open_positions: 10`; een bestaande
+   `config.yaml` zonder die velden blijft het oude gedrag (0 / 1000).
 
 ## Starten
 
@@ -61,89 +69,116 @@ python main.py
 ```
 
 Standaard staat `risk.dry_run: true`: de bot logt en stuurt alerts over wat
-hij zou doen, zonder echte transacties te versturen. Kijk het gedrag een tijd
+hij zou doen, zonder echte transacties te signen of te versturen. De
+PumpPortal-client weigert in dry_run ook hard om te signen, zodat een
+vergeten check in een strategie nooit live kan gaan. Kijk het gedrag een tijd
 aan voordat je `dry_run: false` zet.
 
-## Dashboard (visueel volgen in de browser)
+## Dashboard
 
-Naast de terminal-logs heeft de bot een lokaal webdashboard. Zodra je
-`python main.py` start, zie je in de log een regel als:
+Zodra je `python main.py` start:
 
 ```
 Dashboard: open http://localhost:8765 in je browser om de bot te volgen.
 ```
 
-Open die URL in je browser terwijl de bot draait. Je ziet:
-- Een grote status-banner: rustig blauw bij **DRY RUN**, pulserend rood bij
-  **LIVE** — zo zie je in één oogopslag of er echt geld op het spel staat.
-- Open exposure, dag P&L, trades/uur, uptime — allemaal tegen je limieten uit
-  `config.yaml`.
-- Een live feed van alle alerts (snipe-kandidaten, aankopen, fouten).
-- Een tabel met recente trades (dry-run én echt).
+Je ziet DRY RUN vs LIVE, open exposure, dag P&L (modeled én echte wallet),
+trades/uur, alerts en recente trades. Alleen op `127.0.0.1`.
 
-Het dashboard gebruikt geen extra dependencies (alleen Python's ingebouwde
-webserver) en luistert standaard alleen op `127.0.0.1` — dus niet bereikbaar
-vanaf andere apparaten in je netwerk. Wil je het uitzetten of op een andere
-poort draaien, pas dan de `dashboard:` sectie in `config.yaml` aan.
+## Persistence (overleeft een restart)
 
-## Data-logging & "learning stats"
+Alles onder `data/` is gitignored.
 
-Elke trade en alert wordt (naast het in-memory dashboard) ook append-only
-weggeschreven naar `data/activity_log.jsonl` (gitignored), zodat je een volledige
-geschiedenis hebt die een dashboard-restart overleeft.
+- **Open posities** — `pumpfun_bot/position_store.py`, aparte files voor
+  dry-run en live (anders probeert een live sessie dry-run-spookposities te
+  verkopen). Wallet-reconciliatie gooit holdings die de wallet niet meer
+  heeft eruit (na 2 misses), en probeert untracked wallet-tokens te
+  liquideren.
+- **Risk-tellers** — dagelijks verlies, trades/uur-timestamps, en exposure.
+  Exposure wordt bij start **herberekend uit de posities** (inclusief
+  `remaining_fraction` na een ladder-rung), zodat het klopt met de wallet.
+  Zonder dit reset een restart de dag-limiet en de exposure-cap.
 
-De sniper-strategie probeert daarnaast bij te houden wat er na een simulated
-buy met de koers gebeurde (checkpoints op 60s/300s/900s), zodat je op het
-dashboard onder "Learning stats" kunt zien of bv. tokens met socials of meer
-liquiditeit het beter deden. **Belangrijk:** dit vereist PumpPortal's
-`subscribeTokenTrade` feed, wat zelf weer een **gefunde API key** vereist
-(0.02+ SOL op de wallet achter `PUMPPORTAL_API_KEY`). Zonder zo'n key wijst
-PumpPortal de subscription af en toont het dashboard duidelijk "N snipe(s)
-konden niet gevolgd worden" in plaats van foutieve 0%-cijfers te verzinnen.
-Dit raakt ook de market-maker strategie, die dezelfde feed gebruikt.
+## Exits (OutcomeTracker)
 
-Dit bouwt alleen de dataverzameling — er is geen automatische aanpassing van
-filters/strategie op basis van deze stats. Dat "echt leren" zou een aparte,
-grotere stap zijn.
+Sniper / social_watch / birdeye / coingecko / moonshot sturen hun buys naar
+één OutcomeTracker. Per positie:
+
+- **Take-profit / stop-loss** — vaste drempels, of een `take_profit_ladder`
+  (verkoop `sell_pct`% van wat er NOG over is bij elke multiplier).
+- **Trailing stop** — armed vanaf `trailing_activation_pct`, exit als prijs
+  `trailing_stop_pct` van de piek terugvalt. Werkt ook naast een ladder
+  (beschermt wat er nog vastzit, ook als de eerste rung nog niet is geraakt).
+- **Timeout / stale price** — force-exit als er te lang geen tick is, of na
+  `max_hold_sec` (moonshot heeft hier eigen, veel langere waarden).
+- **Live sells** gaan via PumpPortal Local Trading API. Een mislukte sell
+  laat de positie open (nooit "verkocht" op het dashboard terwijl de wallet
+  de tokens nog heeft). Percentage-sell (`amount: "100%"`) is de bewezen
+  path; amount-based sell (exacte UI-decimal hoeveelheid) is opt-in
+  (`use_absolute_amount_sell`) en valt altijd terug op percentage als die
+  faalt. PumpPortal's index heeft ~15s nodig na een buy voordat een
+  percentage-sell werkt (`MIN_SELL_DELAY_SEC`).
+
+## Jito (optioneel, size-gated)
+
+`use_jito_bundles_for_take_profit` / `use_jito_bundles_for_sniper_buys`
+staan default uit. De tip die live nodig was om een bundle te laten landen
+is **0.01 SOL**. Bij de echte trade-groottes van deze bot (~0.012–0.053 SOL)
+is dat 19–83% van de trade — oneconomisch. `max_jito_tip_pct_of_trade`
+(default 10) houdt Jito vanzelf uit tot trades groot genoeg zijn.
+
+## PumpPortal API key (gefund)
+
+`subscribeNewToken` is gratis. `subscribeTokenTrade` en
+`subscribeAccountTrade` vereisen een **gefunde API key** (min. 0.02 SOL op
+de wallet achter `PUMPPORTAL_API_KEY`) en zijn gemetered (0.01 SOL per
+10.000 events). Zonder key:
+
+- Outcome-tracking krijgt geen echte ticks (dashboard toont dat, i.p.v.
+  valse 0%-cijfers)
+- Market maker initialiseert nooit een grid
+- Copytrade ziet geen wallet-trades
+
+Gebruik **één** websocket-verbinding; de client reconnect met exponential
+backoff. Ontbrekende verplichte velden (`vSolInBondingCurve`, curve-reserves,
+`solAmount`) zijn een skip + warning, niet stiekem 0.
+
+## Data-logging & learning stats
+
+Trades/alerts gaan append-only naar `data/activity_log.jsonl`. De sniper
+houdt koerscheckpoints bij (60/300/900s) voor het dashboard. Er is een
+optionele auto-tuner (alleen strenger, nooit losser) en schaduw-modellen;
+die passen filters niet automatisch aan zonder bewijs.
 
 ## Structuur
 
 ```
-main.py                          - start alle enabled strategieën + dashboard
-pumpfun_bot/config.py            - laadt en valideert config.yaml + .env
-pumpfun_bot/risk.py              - centrale risicolimieten (ALLE orders gaan hierdoorheen)
-pumpfun_bot/pumpportal_client.py - WebSocket data feed + order-uitvoering
-pumpfun_bot/alerts.py            - console/Telegram meldingen
-pumpfun_bot/state.py             - gedeelde status voor het dashboard
-pumpfun_bot/dashboard_server.py  - lokale webserver (http://localhost:8765)
-pumpfun_bot/static/dashboard.html - de dashboard-pagina zelf
-pumpfun_bot/strategies/sniper.py
-pumpfun_bot/strategies/copytrade.py
-pumpfun_bot/strategies/market_maker.py
+main.py                          - start enabled strategieën + dashboard
+pumpfun_bot/config.py            - laadt config.yaml + .env
+pumpfun_bot/risk.py              - limieten; tellers persistent
+pumpfun_bot/risk_store.py        - data/risk_state_{dry_run|live}.json
+pumpfun_bot/position_store.py    - open posities op disk
+pumpfun_bot/outcome_tracker.py   - TP/SL/trailing/ladder + live sells
+pumpfun_bot/bonding_curve.py     - constant-product virtual reserves
+pumpfun_bot/pumpportal_client.py - WS feed + local trading API
+pumpfun_bot/dashboard_server.py  - http://localhost:8765
+pumpfun_bot/strategies/...
 ```
 
-## Bekende beperkingen / TODO
+## Bekende beperkingen
 
-- Sniper voert nu automatisch take-profit/stop-loss/timeout uit (zie
-  `pumpfun_bot/outcome_tracker.py`), zowel dry-run als live. In LIVE modus
-  wordt een echte sell verstuurd (100% van de holding) via PumpPortal's
-  Local Trading API; een positie wordt alleen als gesloten beschouwd als die
-  sell daadwerkelijk lukt - bij een mislukte sell blijft de positie open en
-  wordt het opnieuw geprobeerd, zodat het dashboard nooit "verkocht" toont
-  terwijl de wallet de tokens nog vasthoudt. Er is geen partial-exit (altijd
-  100%) en geen trailing stop.
-- Market maker gebruikt een vereenvoudigd prijsmodel; houdt geen rekening met
-  de exacte bonding-curve wiskunde van pump.fun.
-- Market maker (en outcome-tracking, zie hierboven) hangen af van PumpPortal's
-  `subscribeTokenTrade`/`subscribeAccountTrade` feeds, die alleen werken met
-  een **gefunde API key** (0.02+ SOL). Zonder key wijst PumpPortal de
-  subscription af en doet market maker dus niets (geen grid wordt ooit
-  geïnitialiseerd) — dit is niet eerder expliciet getest/gedocumenteerd.
-- Geen persistente opslag van posities/PnL tussen herstarts (alles zit in het
-  geheugen, dus een restart reset de risk-manager teller).
-- PumpPortal veldnamen (bv. `vSolInBondingCurve`, `txType`) zijn gebaseerd op
-  hun publieke voorbeelden; verifieer dit tegen een paar live WebSocket
-  berichten voordat je live handelt, want APIs veranderen.
+- PumpPortal veldnamen (`vSolInBondingCurve`, `txType`, …) komen uit hun
+  publieke docs; verifieer tegen live WS berichten voor je live handelt.
+- Amount-based sells zijn server-side gevalideerd (200 + unsigned tx), niet
+  gegarandeerd on-chain; percentage-sell blijft de fallback.
+- Market maker is een simpele grid op tokens die jij al target — geen
+  inventory-optimalisatie, geen post-graduation AMM-routing voorbij
+  `pool: auto`.
+- Modeled P&L (fee-model) kan groen zijn terwijl de echte wallet daalt;
+  het dashboard toont daarom ook de echte balans t.o.v. sessiestart.
+- Copytrade onthoudt "wat we deze sessie zelf kochten" alleen in memory.
+- `force_simulated` op sniper/social_watch simuleert die strategie terwijl
+  de echte tracker open live-posities blijft beschermen.
 
 ## Testen
 
@@ -151,11 +186,11 @@ pumpfun_bot/strategies/market_maker.py
 python -m unittest discover -s tests -v
 ```
 
-Dekt vooralsnog de risk-manager (`pumpfun_bot/risk.py`), omdat alle orders
-daar doorheen moeten en het de belangrijkste veiligheidslaag is.
+Geen live RPC of wallet nodig. Dekt o.a. risk-manager + persistence,
+bonding-curve market maker, exits (ladder/trailing/amount-fallback),
+PumpPortal client (dry_run hard-stop, backoff).
 
 ## Support / feedback
 
-Als iets niet werkt zoals verwacht: lees eerst de logs (ze zijn expres
-uitgebreid), en check of de PumpPortal API structuur nog matcht met wat er in
-`pumpportal_client.py` en de strategieën staat verwacht.
+Als iets niet werkt: lees eerst de logs (ze zijn expres uitgebreid) en check
+of de PumpPortal API nog matcht met `pumpportal_client.py`.

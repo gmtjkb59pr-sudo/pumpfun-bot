@@ -24,6 +24,7 @@ from pumpfun_bot.outcome_tracker import (
     OutcomeTracker,
     is_funded_key_rejection,
     load_confirmed_unsellable_mints,
+    token_amount_for_original_fraction,
 )
 from pumpfun_bot.risk import RiskManager
 
@@ -3692,6 +3693,78 @@ class TakeProfitLadderTests(unittest.TestCase):
         self.assertEqual(record["ladder_level_multiplier"], 2)
         self.assertAlmostEqual(record["remaining_fraction_after"], 0.7, places=6)
         self.assertEqual(record["reason"], "take_profit_ladder")
+
+
+class TokenAmountFractionTests(unittest.TestCase):
+    def test_scales_the_original_buy_amount(self):
+        info = {"real_token_amount": "1000.0", "remaining_fraction": 0.7}
+        self.assertEqual(token_amount_for_original_fraction(info, 0.7), "700.00")
+
+    def test_none_when_amount_unknown(self):
+        self.assertIsNone(token_amount_for_original_fraction({}, 1.0))
+
+    def test_full_remaining_keeps_the_original_string_scale(self):
+        info = {"real_token_amount": "1.500000"}
+        self.assertEqual(token_amount_for_original_fraction(info, 1.0), "1.500000")
+
+
+class AmountSellAfterPartialTests(unittest.TestCase):
+    """After a ladder rung, a later full exit must sell remaining_fraction of
+    the original on-chain token amount — not 100% of the original buy
+    (that oversells: Custom 6023 / NotEnoughTokensToSell)."""
+
+    def test_full_exit_after_a_partial_sells_the_remaining_token_amount(self):
+        client = FakeClient(real_token_amount="1000.0")
+        risk = RiskManager(RiskConfig())
+        risk.register_trade_opened(0.05)
+        tracker = OutcomeTracker(
+            ws_url="wss://example.invalid", risk=risk, client=client, dry_run=False,
+        )
+        tracker._pending["MINT"] = {
+            "entry_ts": time.time() - MIN_SELL_DELAY_SEC - 1,
+            "entry_ref": 100.0, "last_ref": 50.0, "peak_ref": 100.0,
+            "name": "Test", "symbol": "TEST", "trade_size_sol": 0.05,
+            "hit": set(), "has_real_update": True,
+            "remaining_fraction": 0.7,
+            "real_token_amount": "1000.0",
+            "stop_loss_pct": 25.0, "take_profit_pct": 50.0,
+            "trailing_activation_pct": 20.0, "trailing_stop_pct": 15.0,
+        }
+        asyncio.run(tracker._handle_price_update("MINT", 50.0))  # -50%, stop-loss
+
+        self.assertEqual(
+            client.build_and_send_full_sell_by_amount_calls,
+            [("MINT", "700.00", 10.0)],
+        )
+        self.assertEqual(client.sell_calls, [])  # percentage path unused
+        self.assertNotIn("MINT", tracker._pending)
+
+    def test_ladder_rung_uses_amount_based_slice_then_percentage_fallback(self):
+        client = FakeClient(real_token_amount="1000.0", should_fail_by_amount=True)
+        risk = RiskManager(RiskConfig())
+        risk.register_trade_opened(0.05)
+        tracker = OutcomeTracker(
+            ws_url="wss://example.invalid", risk=risk, client=client, dry_run=False,
+        )
+        tracker._pending["MINT"] = {
+            "entry_ts": time.time() - MIN_SELL_DELAY_SEC - 1,
+            "entry_ref": 100.0, "last_ref": 100.0, "peak_ref": 100.0,
+            "name": "Test", "symbol": "TEST", "trade_size_sol": 0.05,
+            "hit": set(), "has_real_update": True,
+            "take_profit_ladder": [{"multiplier": 2, "sell_pct": 30}],
+            "triggered_ladder_levels": [],
+            "remaining_fraction": 1.0,
+            "real_token_amount": "1000.0",
+            "stop_loss_pct": 25.0, "take_profit_pct": 50.0,
+            "trailing_activation_pct": 20.0, "trailing_stop_pct": 15.0,
+        }
+        asyncio.run(tracker._handle_price_update("MINT", 200.0))  # 2x, first rung
+
+        self.assertEqual(len(client.build_and_send_full_sell_by_amount_calls), 1)
+        self.assertEqual(client.build_and_send_full_sell_by_amount_calls[0][1], "300.00")
+        self.assertEqual(client.sell_calls, [("MINT", 10.0, 30.0)])  # percentage fallback
+        self.assertIn("MINT", tracker._pending)
+        self.assertAlmostEqual(tracker._pending["MINT"]["remaining_fraction"], 0.7)
 
 
 if __name__ == "__main__":

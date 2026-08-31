@@ -197,6 +197,28 @@ def load_confirmed_unsellable_mints(log_path=None) -> set[str]:
     return mints
 
 
+def token_amount_for_original_fraction(info: dict, fraction_of_original: float) -> str | None:
+    """Scales the on-chain-confirmed buy amount (real_token_amount, UI-decimal
+    string) by a fraction of the ORIGINAL position. Used so a later full
+    exit after a ladder rung sells remaining_fraction of the original
+    tokens — not the original 100% amount, which would oversell
+    (NotEnoughTokensToSell / Custom 6023). None if we never confirmed an
+    amount. format(..., 'f') avoids scientific notation PumpPortal would
+    reject."""
+    raw = info.get("real_token_amount")
+    if raw is None or fraction_of_original <= 0:
+        return None
+    # keep the original UI-decimal string when selling the full original
+    # amount — Decimal("1.500000") * Decimal("1.0") would add a trailing
+    # zero and break PumpPortal's already-accepted amount.
+    if fraction_of_original >= 0.999999:
+        return str(raw)
+    amount = Decimal(str(raw)) * Decimal(str(fraction_of_original))
+    if amount <= 0:
+        return None
+    return format(amount, "f")
+
+
 def is_funded_key_rejection(message: str) -> bool:
     """PumpPortal replies with a bare {"message": ...} for both subscribe
     confirmations ("Successfully subscribed...") and the funded-API-key
@@ -1384,8 +1406,8 @@ class OutcomeTracker:
                 )
                 return False
             time_since_entry = time.time() - info["entry_ts"]
-            real_token_amount = info.get("real_token_amount")
-            if real_token_amount is None and time_since_entry < MIN_SELL_DELAY_SEC:
+            remaining_token_amount = token_amount_for_original_fraction(info, remaining_fraction)
+            if remaining_token_amount is None and time_since_entry < MIN_SELL_DELAY_SEC:
                 # PumpPortal's own balance index needs a moment to catch up
                 # with our buy - a "sell 100%" quote built before that
                 # reliably comes back as SellZeroAmount (confirmed directly
@@ -1409,7 +1431,7 @@ class OutcomeTracker:
                 # earlier ladder rungs already sold some of it
                 trade_size_sol_being_sold = info["trade_size_sol"] * remaining_fraction
                 result = None
-                if real_token_amount is not None:
+                if remaining_token_amount is not None:
                     # user-requested 2026-08-25 ("how can we improve the
                     # baseline" -> "build") - try the exact on-chain amount
                     # first, which doesn't need PumpPortal's balance index
@@ -1422,9 +1444,13 @@ class OutcomeTracker:
                     # MAX_CONSECUTIVE_SELL_FAILURES, since it's an
                     # experimental extra attempt, not the position's real
                     # sell attempt.
+                    #
+                    # Scaled by remaining_fraction: after a ladder rung the
+                    # original real_token_amount is more than what's still
+                    # held — selling it raw oversells (Custom 6023).
                     try:
                         result = await self.client.build_and_send_full_sell_by_amount(
-                            mint=mint, token_amount=real_token_amount,
+                            mint=mint, token_amount=remaining_token_amount,
                             slippage_pct=self.sell_slippage_pct,
                             priority_fee_sol=priority_fee_sol_for_sell(reason),
                         )
@@ -1435,7 +1461,7 @@ class OutcomeTracker:
                         logger.info(
                             "Absolute-amount sell GESLAAGD voor %s (%.0fs sinds aankoop, "
                             "amount=%s) - MIN_SELL_DELAY_SEC-wachttijd omzeild.",
-                            info["symbol"], time_since_entry, real_token_amount,
+                            info["symbol"], time_since_entry, remaining_token_amount,
                         )
                     except Exception as amount_exc:  # noqa: BLE001
                         if time_since_entry < MIN_SELL_DELAY_SEC:
@@ -1690,36 +1716,69 @@ class OutcomeTracker:
                 )
                 return False
             time_since_entry = time.time() - info["entry_ts"]
-            if time_since_entry < MIN_SELL_DELAY_SEC:
+            slice_token_amount = token_amount_for_original_fraction(
+                info, sold_fraction_of_original,
+            )
+            # same floor-skip as _exit once the exact remaining token amount
+            # is known — percentage sells still need PumpPortal's index.
+            if slice_token_amount is None and time_since_entry < MIN_SELL_DELAY_SEC:
                 logger.debug(
                     "Ladder-sell voor %s uitgesteld - pas %.0fs sinds aankoop (min %ds).",
                     info["symbol"], time_since_entry, MIN_SELL_DELAY_SEC,
                 )
                 return False
             try:
-                # _partial_exit is only ever reached for take_profit_ladder
-                # rungs (see this method's own docstring), so reason is
-                # always eligible here - _should_use_jito_bundle still
-                # checks the config flag, not just the reason
-                if self._should_use_jito_bundle(reason, slice_cost_sol_at_entry):
-                    # user-requested 2026-08-24 - see _exit()'s identical comment
-                    result = await self.client.build_and_send_full_sell_via_jito_bundle(
-                        mint=mint, slippage_pct=self.sell_slippage_pct,
-                        amount_pct=sell_pct_of_current_holdings,
-                        priority_fee_sol=priority_fee_sol_for_sell(reason),
-                        tip_sol=jito.RECOMMENDED_TIP_SOL,
-                        block_engine_url=self.risk.cfg.jito_block_engine_url,
-                    )
-                else:
-                    result = await self.client.build_and_send_full_sell(
-                        mint=mint, slippage_pct=self.sell_slippage_pct,
-                        amount_pct=sell_pct_of_current_holdings,
-                        # user-requested 2026-08-24 ("build 3") - see _exit()'s
-                        # identical comment; _partial_exit is only ever reached
-                        # for take_profit_ladder rungs (see this method's own
-                        # docstring), so this is always the boosted fee
-                        priority_fee_sol=priority_fee_sol_for_sell(reason),
-                    )
+                result = None
+                if slice_token_amount is not None:
+                    try:
+                        result = await self.client.build_and_send_full_sell_by_amount(
+                            mint=mint, token_amount=slice_token_amount,
+                            slippage_pct=self.sell_slippage_pct,
+                            priority_fee_sol=priority_fee_sol_for_sell(reason),
+                        )
+                        logger.info(
+                            "Absolute-amount ladder-sell GESLAAGD voor %s "
+                            "(multiplier=%s, amount=%s).",
+                            info["symbol"], ladder_level_multiplier, slice_token_amount,
+                        )
+                    except Exception as amount_exc:  # noqa: BLE001
+                        if time_since_entry < MIN_SELL_DELAY_SEC:
+                            logger.info(
+                                "Absolute-amount ladder-sell voor %s mislukt en pas %.0fs "
+                                "sinds aankoop (min %ds) - uitgesteld: %s",
+                                info["symbol"], time_since_entry, MIN_SELL_DELAY_SEC, amount_exc,
+                            )
+                            return False
+                        logger.info(
+                            "Absolute-amount ladder-sell voor %s mislukt, val terug op "
+                            "percentage-sell: %s",
+                            info["symbol"], amount_exc,
+                        )
+                        result = None
+                if result is None:
+                    # _partial_exit is only ever reached for take_profit_ladder
+                    # rungs (see this method's own docstring), so reason is
+                    # always eligible here - _should_use_jito_bundle still
+                    # checks the config flag, not just the reason
+                    if self._should_use_jito_bundle(reason, slice_cost_sol_at_entry):
+                        # user-requested 2026-08-24 - see _exit()'s identical comment
+                        result = await self.client.build_and_send_full_sell_via_jito_bundle(
+                            mint=mint, slippage_pct=self.sell_slippage_pct,
+                            amount_pct=sell_pct_of_current_holdings,
+                            priority_fee_sol=priority_fee_sol_for_sell(reason),
+                            tip_sol=jito.RECOMMENDED_TIP_SOL,
+                            block_engine_url=self.risk.cfg.jito_block_engine_url,
+                        )
+                    else:
+                        result = await self.client.build_and_send_full_sell(
+                            mint=mint, slippage_pct=self.sell_slippage_pct,
+                            amount_pct=sell_pct_of_current_holdings,
+                            # user-requested 2026-08-24 ("build 3") - see _exit()'s
+                            # identical comment; _partial_exit is only ever reached
+                            # for take_profit_ladder rungs (see this method's own
+                            # docstring), so this is always the boosted fee
+                            priority_fee_sol=priority_fee_sol_for_sell(reason),
+                        )
                 tx_signature = result["signature"]
                 real_sol_delta = result.get("real_sol_delta")
             except Exception as exc:  # noqa: BLE001

@@ -20,7 +20,12 @@ from ..holder_concentration import fetch_top10_concentration_pct
 from ..holder_count import record_holder_count
 from ..outcome_tracker import OutcomeTracker
 from ..price_ref import extract_price_ref_with_field
-from ..pumpportal_client import OnChainTransactionError, PumpPortalClient
+from ..pumpportal_client import (
+    MissingPumpPortalFieldError,
+    OnChainTransactionError,
+    PumpPortalClient,
+    require_event_float,
+)
 from ..risk import RiskManager
 from .. import sniper_model
 from ..state import bot_state
@@ -138,12 +143,31 @@ class SniperStrategy:
         # PumpPortal new-token events bevatten o.a. mint, name, symbol, initial
         # liquidity, en (soms) social links. Veldnamen kunnen wijzigen - check dit
         # tegen een paar live events voordat je live gaat.
-        liquidity_sol = event.get("vSolInBondingCurve") or event.get("initialBuy") or 0
-        if liquidity_sol and liquidity_sol < self.risk.cfg.min_liquidity_sol:
+        try:
+            liquidity_sol = require_event_float(event, "vSolInBondingCurve")
+        except MissingPumpPortalFieldError:
+            # previously fell back to initialBuy (token amount, wrong unit)
+            # or 0, and `if liquidity_sol and ...` skipped the min-liquidity
+            # check entirely because 0 is falsy. Missing ≠ 0.
+            logger.warning(
+                "Sniper: event voor %s mist vSolInBondingCurve — skip, "
+                "niet behandelen als 0 / initialBuy.",
+                event.get("mint"),
+            )
+            return False
+        if liquidity_sol < self.risk.cfg.min_liquidity_sol:
             return False
 
         if self.cfg.require_socials:
-            has_socials = any(event.get(k) for k in ("twitter", "telegram", "website"))
+            social_keys = ("twitter", "telegram", "website")
+            if not any(k in event for k in social_keys):
+                logger.warning(
+                    "Sniper: event voor %s heeft geen social-velden "
+                    "(twitter/telegram/website) — skip, niet behandelen als leeg.",
+                    event.get("mint"),
+                )
+                return False
+            has_socials = any(event.get(k) for k in social_keys)
             if not has_socials:
                 return False
 
