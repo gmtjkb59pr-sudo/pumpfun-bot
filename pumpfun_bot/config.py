@@ -518,6 +518,18 @@ class CopyTradeConfig:
     # shared risk.max_sol_per_trade - 0 (default) falls back to that shared
     # value, unchanged behavior for anyone who hasn't set this explicitly
     max_trade_sol: float = 0.0
+    # user-requested 2026-09-07 ("wire" newly-identified wallets into
+    # copytrade, "dry-run first"). Simpler than sniper/social_watch's
+    # force_simulated: CopyTradeStrategy has no OutcomeTracker dependency
+    # at all (it only mirrors the watched wallet's own buy/sell signals,
+    # never independently decides to exit), so there's no shared-tracker
+    # collision risk to design around - main.py just overrides this
+    # strategy's own dry_run to True (and gives it a client constructed
+    # with dry_run=True too, for the same defense-in-depth hard-stop as
+    # every other strategy) regardless of risk.dry_run, so newly-watched
+    # wallets can be observed before ever risking real money. Default
+    # False - no behavior change unless explicitly turned on.
+    force_simulated: bool = False
 
 
 @dataclass
@@ -761,6 +773,7 @@ def load_config(path: str = "config.yaml") -> AppConfig:
     copytrade = CopyTradeConfig(
         enabled=ct_raw.get("enabled", False),
         watched_wallets=ct_raw.get("watched_wallets", []) or [],
+        force_simulated=ct_raw.get("force_simulated", False),
         mirror_pct=ct_raw.get("mirror_pct", 100),
         max_copy_delay_ms=ct_raw.get("max_copy_delay_ms", 3000),
         max_trade_sol=ct_raw.get("max_trade_sol", 0.0),
