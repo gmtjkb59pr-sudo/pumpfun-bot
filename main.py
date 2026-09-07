@@ -280,15 +280,27 @@ async def main() -> None:
         dry_run=cfg.risk.dry_run,
         outcome_tracker=outcome_tracker,
     )
+    # user-requested 2026-09-07 ("wire" newly-identified wallets, "dry-run
+    # first") - see CopyTradeConfig.force_simulated's docstring. No shared-
+    # tracker collision risk here (unlike sniper/social_watch) since
+    # CopyTradeStrategy has no OutcomeTracker dependency at all - just
+    # override this strategy's own dry_run and give it a dry_run client,
+    # regardless of risk.dry_run.
+    copytrade_force_simulated = cfg.copytrade.force_simulated and not cfg.risk.dry_run
     copytrade = CopyTradeStrategy(
-        client=make_client(),
+        client=make_client(dry_run=True) if copytrade_force_simulated else make_client(),
         cfg=cfg.copytrade,
         risk=risk,
         alerter=alerter,
         max_trade_sol=cfg.copytrade.max_trade_sol or cfg.risk.max_sol_per_trade,
         slippage_pct=cfg.risk.default_slippage_pct,
-        dry_run=cfg.risk.dry_run,
+        dry_run=cfg.risk.dry_run or copytrade_force_simulated,
     )
+    if copytrade_force_simulated:
+        logger.warning(
+            "Copytrade draait geforceerd gesimuleerd (copytrade.force_simulated) - "
+            "plaatst nooit een echte order."
+        )
     market_maker = MarketMakerStrategy(
         client=make_client(),
         cfg=cfg.market_maker,
